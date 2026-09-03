@@ -127,6 +127,9 @@ drm_mode_setcrtc → drm_atomic_commit → commit_tail
 - 开机持久化（`force_mode_test.sh boot`：blacklist mwv207 进 initramfs +
   `/etc/modules-load.d/jmgpu.conf` 强制加载）后 lightdm + 专有 X 驱动正常点亮桌面
 - `vainfo` 同栈报全 profile：H264 全系 / HEVC Main+Main10 / VP9 / JPEG VLD
+- **VA-API 硬解实测**（见 FIXLOG.md「修复 3」）：H264/HEVC/VP9 硬解输出与软解
+  校验和完全一致（像素正确）；4K30 x264 CPU 占用 user 1.617→0.143s（省约 91%），
+  但吞吐不及 D2000 软解，价值主要在 CPU 卸载
 
 ### 路线 A 附 2：「显示灰蒙蒙」—— 未解决（排查记录见 FIXLOG.md「问题 2」）
 

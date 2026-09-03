@@ -101,3 +101,46 @@ drm_mode_setcrtc → drm_atomic_commit → commit_tail
 - 恢复正常：mwv207 栈（deepin 内核开源驱动）
 - 回滚驱动：`git checkout` 源码后 `sync_dkms.sh` 重编译；
   回滚栈：`force_mode_test.sh boot-undo && reboot`
+
+---
+
+## 修复 3：VA-API 硬解实测 —— 功能 ✅ / 像素 ✅ / 性能受限 ⚠️
+
+### 测试环境与工具
+- jmgpu 栈开机持久化已生效（blacklist mwv207 + modules-load jmgpu）
+- `/dev/dri/renderD128`（渲染节点，权限走 ACL `+` 即可访问）
+- 环境变量 `LIBVA_DRIVER_NAME=jmgpu`（VA-API 驱动 = `jmgpu_drv_video.so`）
+- 工具：ffmpeg 6.0.16 / mpv 0.40.0
+
+### 功能与像素正确性（硬解 vs 软解输出校验和一致 = 像素级正确）
+| 编码 | 测试片 | 软解 md5 | VA-API 硬解 md5 | 结果 |
+|---|---|---|---|---|
+| H.264 | 1920x1080 30fps 5s | `81edd071…38853e` | `81edd071…38853e` | ✅ 一致 |
+| H.265/HEVC | 1920x1080 30fps 3s | `f781c5d8…07ce5` | `f781c5d8…07ce5` | ✅ 一致 |
+| VP9 | 1280x720 30fps 3s | `8fd5723b…d39d` | `8fd5723b…d39d` | ✅ 一致 |
+
+> 方法：`ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i xxx -f rawvideo -pix_fmt nv12 - | md5sum`
+> 软解为同参数去掉 `-hwaccel` 的基准。md5 完全一致 ⇒ 硬解像素输出与软解无差。
+
+### 性能（D2000 八核 NEON 软解本身很强）
+| 场景 | 软解 | VA-API 硬解 | 说明 |
+|---|---|---|---|
+| 1080p30 x264，帧留 GPU（`-hwaccel_output_format vaapi`） | 28.4x | 12.4x | 硬解慢 |
+| 4K30 x264，帧留 GPU | 8.16x | 3.82x | 硬解慢 |
+| **CPU 占用（4K30 x264）** | user 1.617s / sys 0.151s | **user 0.143s / sys 0.192s** | **硬解 CPU 省 91%** |
+
+> 结论：**功能正常、像素正确，但吞吐不及软解**（测试片为 x264 ultrafast 低复杂度，
+> 且 VA-API→CPU 存在下载/搬运开销）。**硬解的价值在 CPU 卸载**（4K 下 user 时间
+> 1.617→0.143s，约省 91%），适合 CPU 紧张或并发多路场景；追求单路最高帧率时软解
+> 反而更快。真实高码率/高复杂度片源上硬解吞吐差距会缩小。
+
+### mpv 播放器接入
+- `mpv --hwdec=auto`（x11 会话下 VA 零拷贝后端不可用，自动回落 **`h264-vaapi-copy`**，
+  日志确认 `Trying hardware decoding via h264-vaapi-copy`）
+- 命令：`LIBVA_DRIVER_NAME=jmgpu mpv --hwdec=auto /path/video.mp4`
+- ffmpeg：`ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i in.mp4 -c:v ... out.mp4`
+
+### 待补验证
+- H.264 10bit / HEVC Main10（vainfo 报了 Main10 profile，未测真实 10bit 片源）
+- 复杂/高码率真实片源的吞吐对比（当前仅为合成低复杂度片）
+- `vaapi` 零拷贝后端（`--vo=vaapi`/`vaapi-drm`）——需在无 X 或匹配 VO 下验证
