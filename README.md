@@ -3,6 +3,14 @@
 > 本仓库记录了在 **Phytium（飞腾）+ 景嘉微 JM9100 (PCI 0731:9100)** 平台上，
 > 将 GPU 驱动移植到内核 **6.6.143-arm64-desktop-hwe (Deepin 25)** 并尝试打通
 > **视频硬解 (H.264)** 的完整过程、代码修改与验证结论。
+>
+> **最终结果（2026-09）：显示点亮 + VA-API 硬解在闭源 jmgpu 栈上同时达成 ✅**
+> 此前判定的"显示输出无信号（固有问题）"实为一次内核 API 迁移遗漏，
+> 根因与修复见 §3 路线 A「显示无信号根因与修复」，结论更新见 §4/§6。
+>
+> **遗留问题**：显示画面整体灰蒙蒙（黑不黑、白不白、色相正确），
+> 属 RGB 量化范围类症状；已排除 X 层、LUT 写入、CSC 数据路径、AVI 声明等，
+> 仍在排查，完整证据链与待验证方向见 **FIXLOG.md「问题 2」**。
 
 ---
 
@@ -31,7 +39,7 @@
 
 | 内核驱动 | 来源 | 建 /dev/jmgpu | 显示 | GL | 视频硬解用户态 |
 |---|---|---|---|---|---|
-| **闭源 jmgpu.ko** | 景美闭源 1.7.0 | ✅ | ❌ 无信号 | ✅ | ✅ (H264 VLD 实测) |
+| **闭源 jmgpu.ko** | 景美闭源 1.7.0 | ✅ | ⚠️ 已点亮但偏灰 (见§3/FIXLOG 问题2) | ✅ | ✅ (H264/HEVC/VP9 VLD 实测) |
 | **deepin mwv207.ko** | 开源系 (shanjinkui) | ❌ | ✅ | 软渲染(llvmpipe) | ❌ |
 | **Icenowy mwv207-dkms** | 社区开源 | ❌ | 设计支持 | (mesa) | ❌ 无用户态 |
 | **景美官方 6.6 mwv207** | openkylin 开源 | ❌ | 设计支持 | (mesa) | ❌ 无用户态 |
@@ -75,10 +83,73 @@
 - ✅ DRM 完整初始化（2 crtc / 3 encoder / 3 connector）
 - ✅ VA-API **H264 硬解打通**：`LIBVA_DRIVER_NAME=jmgpu vainfo`
   → `H264ConstrainedBaseline VLD`（景美闭源用户态配 jmgpu 内核成功）
-- ❌ **显示输出无信号**：连 HDMI-A-1 `connected` 但 `modes` 为空，CRTC 无法 modeset
-  - modesetting Xorg：进程存活但无画面
-  - 景美专有 `mwv207_drv.so` Xorg 驱动（`10-mwv207.conf` MatchDriver jmgpu 触发）：仍无信号
-  - 判定为**景美闭源驱动显示输出固有问题**（寄存器时序/phy 未正确初始化）
+- ❌→✅ **显示输出**：初期无信号（见下节根因与修复），修复后已完全打通
+
+### 路线 A 附：「显示无信号」根因与修复（2026-09 重大突破）
+
+**误诊澄清**：早期判定"connector connected 但 modes 为空 → 寄存器时序/phy 固有问题"是
+**sysfs 误诊**——sysfs 的 `modes`/`edid` 文件为空 ≠ 内核无模式：只有 `GETCONNECTOR`
+ioctl 才触发 `fill_modes`。用 `modetest -M jmgpu -c` 枚举后发现真 EDID（DDC 正常）
+与 preferred `1920x1080@60` 模式**一直都在**。
+
+**真正根因**（`modetest -s` 强制 setcrtc 触发内核 oops，抓栈定位）：
+
+```
+drm_mode_setcrtc → drm_atomic_commit → commit_tail
+  → drm_atomic_helper_commit_modeset_enables
+    → j9_handle_j9m_principium → j9_troglodyte → hdmi_phy_config_para [jmgpu]
+      → drm_scdc_set_scrambling [drm_display_helper]   ← 调的是内核符号!
+        → i2c_transfer → el1_abort → do_page_fault      ← 内核空指针 oops
+```
+
+因果链（两个移植遗漏叠加）：
+1. HDMI connector 的 `late_register` 回调里创建了自管 i2c adapter `hdmi->ddc`，
+   但**从未同步到内核标准字段 `connector->ddc`**（永远为 NULL）；
+   EDID 读取走自己的 `hdmi->ddc` 所以一直正常，掩盖了问题。
+2. 内核 **6.5+ 把 `drm_scdc_set_scrambling/set_high_tmds_clock_ratio` 签名从
+   `(struct i2c_adapter*, bool)` 改为 `(struct drm_connector*, bool)`**；
+   厂商本地 adapter 版实现 `jmgpu_scdc_set_*` 被 `#if < KERNEL_VERSION(4,12,0)`
+   条件块排除，6.6 下调用链接到内核 connector 版 → 内部 `connector->ddc` = NULL
+   → `i2c_transfer(NULL)` → translation fault → atomic commit 未完成 → **HDMI 无信号**。
+   （"厂商私有 SCDC 函数改名"只改了 read/write，set_scrambling 一族被漏掉。）
+
+**修复**（3 处，全在 `jmgpu_nicely.c`）：
+| 修复 | 位置 |
+|---|---|
+| `hdmi->connector.ddc = hdmi->ddc;`（late_register 内，init memset 之后） | 原约 1635 行 |
+| 8 处 `drm_scdc_set_scrambling/set_high_tmds_clock_ratio(&hdmi->connector, …)` → `jmgpu_scdc_*(hdmi->ddc, …)` | `hdmi_phy_config_para`/`hdmi_set_high_tmds_clock_ratio`/SCDC work |
+| `jmgpu_scdc_set_scrambling/set_high_tmds_clock_ratio` 定义移出 `#if <4.12` 条件块 | 原约 818-867 行 |
+
+**修复后验证**：
+- `modetest -M jmgpu -s 41@35:1920x1080` → rc=0，屏幕出现彩条（显示管线全通）
+- 普通显示器（HDMI 1.4 无 SCDC）下 `jmgpu_scdc_*` 读 SCDC 寄存器 NACK（err=-6）
+  → 返回 false 无害降级，PHY 配置继续完成——这正是内核版函数做不到的
+- 开机持久化（`force_mode_test.sh boot`：blacklist mwv207 进 initramfs +
+  `/etc/modules-load.d/jmgpu.conf` 强制加载）后 lightdm + 专有 X 驱动正常点亮桌面
+- `vainfo` 同栈报全 profile：H264 全系 / HEVC Main+Main10 / VP9 / JPEG VLD
+
+### 路线 A 附 2：「显示灰蒙蒙」—— 未解决（排查记录见 FIXLOG.md「问题 2」）
+
+显示点亮后仍有画质问题：**整体低对比度，黑色发灰、白色不白，但色相完全正确**
+（照片证据见 FIXLOG 引用的两张图）；硬件鼠标光标色彩正常。
+
+**定位结论**：灰在**内核输出层**——`color_bisect.sh` 实验 A 用 modetest 绕过 X
+直出彩条，观感同为灰，X / 专有驱动 `mwv207_drv.so` 已排除。
+
+**已尝试无效**（详见 FIXLOG）：
+1. `rgb_limited_range` 条件化（full 直通 + FULL 声明）
+2. 清理 grub 残留 `video=`/`drm.edid_firmware=`（曾误入"Linux FHD"假 EDID，
+   清理后真 EDID 与 43 个模式恢复，色彩无变化）
+3. `virtual_display=0`（vdisplay 早退假设不成立）
+4. 数据恢复 CEA 默认 limited + 手写 AVI 量化范围声明 LIMITED
+
+**已排除**：X/专有驱动层、YCC 输出（输出恒 RGB888）、LUT fifo 写入超时、
+闭源 LUT 写入实现（与开源 `mwv207_va_lut_enable` 逐寄存器等价）、
+`lutdata` 初始化、reset 回调 LUT 写入路径、假 EDID。
+
+**待验证方向**（7 项，见 FIXLOG）：显示器 OSD Black Level、AVI infoframe
+是否实际发出、`HDMI_FC_GCP`、LUT 硬件实际值 dump、VP remap/stuffing、
+与 mwv207 开源栈逐寄存器对比、CSC 时钟/flow-control 是否真正 bypass。
 
 ### 路线 B：Icenowy 社区开源 mwv207-dkms
 
@@ -110,38 +181,34 @@ deepin 多媒体(VA-API)接不上；且与 deepin 自带 mwv207 同源同名，�
 | deepin 生态 | apt 源仅闭源包；ffmpeg 用 VA-API 对不上开源 mwv207 自定义 ioctl |
 | 景美开源 mesa (jemoic / everything411) | **纯 3D**，无 `create_video_codec`/vl 视频管线 |
 | bellagio (OpenMAX IL) | 标准框架无 mwv207 组件；deepin 桌面不走 OpenMAX |
-| 闭源 jmgpu VA | 唯一能 H264 硬解的，但绑死"显示坏"的闭源内核 |
+| 闭源 jmgpu VA | H264/HEVC/VP9 硬解可用；闭源内核"显示坏"已修复（§3 路线 A），现为最终采用方案 |
 
 ---
 
-## 4. 最终架构结论（不可调和的矛盾）
+## 4. 最终架构结论（矛盾已解）
+
+~~"显示"与"H264硬解"无法同时达成~~ —— **已被推翻**。
 
 ```
-                    ┌─────────────────────────────┐
-  video H264 hard   │  需要 VA 用户态 (VA-API)     │
-  decode            │  = 闭源 jmgpu_drv_video.so   │
-                    └──────────────┬──────────────┘
-                                   │ 只认 /dev/jmgpu
-                                   ▼
-                       闭源 jmgpu 内核驱动
-                     ┌──────────────┴─────────────┐
-                     │ 硬解 ✅  但 显示 ❌ 无信号   │
-                     └────────────────────────────┘
-
-  desktop display    │ 开源 mwv207 内核 (deepin/景美官方/Icenowy)
-                     │ 显示 ✅  但无 VA 解码用户态 (bellagio 未开源)
-                     └────────────────────────────┘
-
-  ※ 一个 PCI 设备只能绑一个内核驱动 ⇒ "显示"与"H264硬解"无法同时达成
+                 ┌────────────────────────────────────┐
+  单卡全功能     │  闭源 jmgpu 内核 (1.7.0 + 本仓库补丁) │
+  (修复后)       │  显示 ⚠️(点亮但偏灰) GL ✅ 硬解 ✅  │
+                 │  /dev/jmgpu + /dev/dri/card0        │
+                 └────────────────────────────────────┘
 ```
 
-**三层原因**：
-1. **单卡单驱动**物理限制：jmgpu 与 mwv207 不能同时用
-2. **景美闭源用户态绑死闭源内核**（VA 要 /dev/jmgpu），而闭源内核显示输出固有问题
-3. **景美开源系从内核到 mesa 都没给解码用户态**（bellagio 空/闭源）
+**历程复盘**：早期认为"闭源内核显示输出固有问题 + 开源系无解码用户态 ⇒ 无解"。
+实际是**闭源内核存在一处 SCDC API 迁移遗漏**（详见 §3 路线 A 修复记录），
+用 `modetest` 强制 setcrtc 抓到内核 oops 栈即定位；三行级修复后显示点亮。
+遗留的画质问题（灰蒙蒙）已定位到内核输出层，尚待根因，见 FIXLOG.md「问题 2」。
 
-**deepin 官方对景美卡支持现状**：已转向商业 UOS（deepin 社区商店驱动已下架，
-论坛确认景美卡在 deepin"无法使用"是普遍已知问题，非个例）。
+**仍然成立的客观事实**：
+1. 一个 PCI 设备只能绑一个内核驱动（jmgpu 与 mwv207 仍互斥，但已不需要共存）
+2. 景美开源系（deepin mwv207 / 官方 6.6 / Icenowy）从内核到 mesa 仍无解码用户态
+   （bellagio 空/闭源）——若要走纯开源路线，结论不变：无用户态，无解
+3. deepin 官方对景美卡的支持已转向商业 UOS（社区商店驱动已下架）
+
+**deepin 上可用方案（本仓库）**：补丁版闭源 jmgpu 栈持久化接管，显示+硬解全功能。
 
 ---
 
@@ -150,7 +217,11 @@ deepin 多媒体(VA-API)接不上；且与 deepin 自带 mwv207 同源同名，�
 | 路径/提交 | 说明 |
 |---|---|
 | git 基线 `13de34c` | 闭源 jmgpu 1.7.0 移植到 6.6.143 的完整源码 |
+| git 提交（SCDC 修复） | `jmgpu_nicely.c` 三处修复：`connector.ddc` 同步、8 处调用换 `jmgpu_scdc_*`、函数移出 `<4.12` 条件块（见 §3 路线 A） |
 | `sync_dkms.sh` | 同步源码到 DKMS 并 rebuild |
+| `force_mode_test.sh` | 方案1 强制点屏验证（live 诊断/boot 持久化/boot-undo 回滚，SSH 可控自动回退） |
+| `color_bisect.sh` | 灰蒙蒙二分实验（A: modetest 彩条判定内核输出层 / B: modesetting 独立 X 判定 X 层） |
+| `FIXLOG.md` | **修复记录**：SCDC 无信号根因修复（已解决）+ 灰蒙蒙问题排查（证据链/已尝试/待验证方向） |
 | `verify_jmgpu_probe*.sh` | 真机 probe 验证脚本（SSH 可控，自动回退） |
 | `check_jmgpu_display.sh` | DRM connector/mode/EDID 预检 |
 | `diag_jmgpu_fail.sh` | 干净 dmesg 失败诊断 |
@@ -170,9 +241,19 @@ deepin 多媒体(VA-API)接不上；且与 deepin 自带 mwv207 同源同名，�
 
 ## 6. 结论与后续建议
 
-**软件层无正解**。JM9100 视频硬解需景美提供"显示正常 + 硬解可用"的完整驱动栈。
+**软件层正解已达成**：本仓库补丁版闭源 jmgpu 1.7.0 在 Deepin 25 / 6.6.143 上
+**显示点亮 + GL + VA-API 硬解全功能可用**，无需 UOS（画质问题见下）。
 
-可行的后续（非本仓库代码可解决）：
-1. **安装 UOS**：景美卡官方完整支持（显示+硬解），社区公认最省心方案
-2. **反馈景美/deepin/飞腾整机厂**：附本 README 作为"闭源驱动显示坏" + "开源无解码用户态"的证据
-3. **维持现状**：deepin mwv207 显示 + 应用层软解优化（如 pure_live 的 720p+纹理上限方案）
+后续建议：
+0. **灰蒙蒙画质问题（当前首要）**：已定位内核输出层、排除 6 类嫌疑、试过 4 种方案，
+   下一步按 FIXLOG.md「问题 2」的 7 个待验证方向推进（首选显示器 OSD Black Level
+   验证 + AVI infoframe 是否实际发出）。不解决也不影响功能使用。
+1. **保持本仓库栈**：DKMS 已装补丁版 `jmgpu.ko`；持久化 = `force_mode_test.sh boot`
+   （blacklist mwv207 + modules-load 强制加载 jmgpu）。回滚 = `boot-undo`
+2. **向景美/deepin/飞腾反馈**：附本 README §3 路线 A 的 SCDC 根因与三处修复——
+   同源代码在 UOS 之外的所有 6.x 内核上应有同样问题，补丁可直接回给厂商
+3. **播放器接入硬解**：应用层用 `LIBVA_DRIVER_NAME=jmgpu`（VA-API 已报
+   H264/HEVC/VP9 全 profile VLD）；mpv/ffmpeg 用 `--hwdec=vaapi` +
+   `-vaapi_device /dev/dri/renderD128`
+4. （可选）若未来想走纯开源路线：Icenowy/官方 6.6 内核显示可用但解码用户态
+   仍缺失，需自写 VA driver 对接 `pipe_dec`，工作量大，现阶段无必要

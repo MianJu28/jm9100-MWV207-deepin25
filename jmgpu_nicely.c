@@ -815,6 +815,13 @@ static inline int drm_scdc_writeb(struct i2c_adapter *adapter, u8 offset,
 }
 
 
+#endif
+
+/*
+ * 6.6+ 内核的 drm_scdc_set_scrambling/set_high_tmds_clock_ratio 为 connector
+ * 签名且依赖 connector->ddc; 本模块 SCDC 一律走自管 adapter, 避免签名与
+ * 空指针耦合. (原定义位于 <4.12 条件块内, 现对所有内核版本开放)
+ */
 bool jmgpu_scdc_set_scrambling(struct i2c_adapter *adapter, bool enable)
 {
 	u8 config;
@@ -865,7 +872,6 @@ bool jmgpu_scdc_set_high_tmds_clock_ratio(struct i2c_adapter *adapter, bool set)
 	usleep_range(1000, 2000);
 	return true;
 }
-#endif
 
 static void j9_handle_j9ma_cancerweed(struct drm_encoder *encoder);
 static inline void j9_crosshatched(j9_amylo *hdmi, u32 addr, u32 val)
@@ -1325,9 +1331,9 @@ void hdmi_set_high_tmds_clock_ratio(j9_amylo *hdmi,
 
 	if (j9_handle_j9_translater(hdmi, display)) {
 		if (hdmi->cur_clk_khz > 340000)
-			drm_scdc_set_high_tmds_clock_ratio(&hdmi->connector, 1);
+			jmgpu_scdc_set_high_tmds_clock_ratio(hdmi->ddc, 1);
 		else
-			drm_scdc_set_high_tmds_clock_ratio(&hdmi->connector, 0);
+			jmgpu_scdc_set_high_tmds_clock_ratio(hdmi->ddc, 0);
 	}
 }
 
@@ -1364,8 +1370,8 @@ void hdmi_phy_config_para(struct drm_encoder *encoder, unsigned int clk_khz,
 		drm_scdc_readb(hdmi->ddc, SCDC_SINK_VERSION, &bytes);
 		drm_scdc_writeb(hdmi->ddc, SCDC_SOURCE_VERSION,
 				min_t(u8, bytes, SCDC_MIN_SOURCE_VERSION));
-		drm_scdc_set_scrambling(&hdmi->connector, 1);
-		drm_scdc_set_high_tmds_clock_ratio(&hdmi->connector, 1);
+		jmgpu_scdc_set_scrambling(hdmi->ddc, 1);
+		jmgpu_scdc_set_high_tmds_clock_ratio(hdmi->ddc, 1);
 		j9_pangolin(hdmi, (u8) ~HDMI_MC_SWRSTZ_TMDSSWRST_REQ,
 			    J9_LATICOSTATE);
 		j9_pangolin(hdmi, 1, J9_HANDLE_J_PERIOSTOMA);
@@ -1373,8 +1379,8 @@ void hdmi_phy_config_para(struct drm_encoder *encoder, unsigned int clk_khz,
 		j9_pangolin(hdmi, 0, J9_HANDLE_J_PERIOSTOMA);
 		j9_pangolin(hdmi, (u8) ~HDMI_MC_SWRSTZ_TMDSSWRST_REQ,
 			    J9_LATICOSTATE);
-		drm_scdc_set_scrambling(&hdmi->connector, 0);
-		drm_scdc_set_high_tmds_clock_ratio(&hdmi->connector, 0);
+		jmgpu_scdc_set_scrambling(hdmi->ddc, 0);
+		jmgpu_scdc_set_high_tmds_clock_ratio(hdmi->ddc, 0);
 	}
 
 
@@ -1633,6 +1639,10 @@ static int j9_handle_j9mirror_presidente(struct drm_connector *connector)
 		DRM_ERROR("Failed to create i2c adapter channel(%d)\n", i2c_ch);
 		return -EINVAL;
 	}
+	/* 同步到内核标准字段: drm_scdc_set_scrambling() 等内核 API 依赖
+	 * connector->ddc. 缺此赋值时 i2c_transfer(NULL) 会内核 oops,
+	 * 导致 modeset 挂死/无信号. (late_register 阶段 init 的 memset 已完成) */
+	hdmi->connector.ddc = hdmi->ddc;
 
 	j9_handle_attribute_traversals(connector);
 	hdmi->audio = j9mirror_affirmable(hdmi->ddev);
@@ -2287,10 +2297,7 @@ static void j9_pyroarsenite(j9_amylo *hdmi,
 			    struct drm_display_mode *mode)
 {
 	struct hdmi_avi_infoframe frame;
-	bool is_hdmi2_sink;
 	u8 val;
-
-	is_hdmi2_sink = false;
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(5, 0, 0)
 	drm_hdmi_avi_infoframe_from_display_mode(&frame, connector, mode);
@@ -2300,32 +2307,17 @@ static void j9_pyroarsenite(j9_amylo *hdmi,
 	drm_hdmi_avi_infoframe_from_display_mode(&frame, mode);
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
-	is_hdmi2_sink = connector->display_info.hdmi.scdc.supported;
-#endif
 	if (j9mirror_cloddiness(hdmi->hdmi_data.enc_out_bus_format)) {
-#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 0, 0)
-		drm_hdmi_avi_infoframe_quant_range(&frame, connector, mode,
-						   hdmi->hdmi_data.rgb_limited_range ?
-						   HDMI_QUANTIZATION_RANGE_LIMITED
-						   :
-						   HDMI_QUANTIZATION_RANGE_FULL);
-#elif LINUX_VERSION_CODE > KERNEL_VERSION(4, 14, 0)
-		drm_hdmi_avi_infoframe_quant_range(&frame, mode,
-						   hdmi->hdmi_data.rgb_limited_range ?
-						   HDMI_QUANTIZATION_RANGE_LIMITED
-						   :
-						   HDMI_QUANTIZATION_RANGE_FULL,
-						   hdmi->rgb_quant_range_selectable,
-						   is_hdmi2_sink);
-#elif LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
-		drm_hdmi_avi_infoframe_quant_range(&frame, mode,
-						   hdmi->hdmi_data.rgb_limited_range ?
-						   HDMI_QUANTIZATION_RANGE_LIMITED
-						   :
-						   HDMI_QUANTIZATION_RANGE_FULL,
-						   hdmi->rgb_quant_range_selectable);
-#endif
+		/* 手写量化范围声明, 与 CSC 数据路径(rgb_limited_range)保持一致.
+		 * 内核 drm_hdmi_avi_infoframe_quant_range 在显示器未声明
+		 * rgb_quant_range_selectable 时会把 LIMITED 改写为 FULL,
+		 * 导致"数据 limited + 声明 full"错配 -> 全屏发灰.
+		 * HDMI 规范默认 CEA 时序 RGB 按 limited 解释, 声明 LIMITED. */
+		frame.quantization_range = hdmi->hdmi_data.rgb_limited_range ?
+		    HDMI_QUANTIZATION_RANGE_LIMITED :
+		    HDMI_QUANTIZATION_RANGE_FULL;
+		frame.ycc_quantization_range =
+		    HDMI_YCC_QUANTIZATION_RANGE_LIMITED;
 	} else {
 		frame.quantization_range = HDMI_QUANTIZATION_RANGE_DEFAULT;
 		frame.ycc_quantization_range =
@@ -2650,7 +2642,7 @@ static void j9_individuating(j9_amylo *hdmi,
 					      SCDC_MIN_SOURCE_VERSION));
 
 
-			drm_scdc_set_scrambling(&hdmi->connector, 1);
+			jmgpu_scdc_set_scrambling(hdmi->ddc, 1);
 			j9_pangolin(hdmi, (u8) ~HDMI_MC_SWRSTZ_TMDSSWRST_REQ,
 				    J9_LATICOSTATE);
 			j9_pangolin(hdmi, 1, J9_HANDLE_J_PERIOSTOMA);
@@ -2658,7 +2650,7 @@ static void j9_individuating(j9_amylo *hdmi,
 			j9_pangolin(hdmi, 0, J9_HANDLE_J_PERIOSTOMA);
 			j9_pangolin(hdmi, (u8) ~HDMI_MC_SWRSTZ_TMDSSWRST_REQ,
 				    J9_LATICOSTATE);
-			drm_scdc_set_scrambling(&hdmi->connector, 0);
+			jmgpu_scdc_set_scrambling(hdmi->ddc, 0);
 		}
 	}
 
@@ -3064,6 +3056,10 @@ static void j9_handle_j9ma_cancerweed(struct drm_encoder *encoder)
 	if (hdmi->hdmi_data.enc_out_bus_format == MEDIA_BUS_FMT_FIXED)
 		hdmi->hdmi_data.enc_out_bus_format = MEDIA_BUS_FMT_RGB888_1X24;
 
+	/* HDMI 规范(CEA-861): CEA 时序的 RGB 默认按 limited(16-235) 解释,
+	 * 且多数显示器不解析 AVI infoframe 的量化范围声明. 数据必须保持
+	 * limited 才与显示器行为一致(CSC 压缩见 rgb_limited_range 引用处);
+	 * AVI 声明亦须为 LIMITED, 见下方 j9_handle_j9m_principium 配套修复 */
 	hdmi->hdmi_data.rgb_limited_range = hdmi->sink_is_hdmi &&
 	    drm_default_rgb_quant_range(target_mode) ==
 	    HDMI_QUANTIZATION_RANGE_LIMITED;
