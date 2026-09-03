@@ -73,8 +73,10 @@ if [ -e /dev/jmgpu ]; then
   dmesg | tail -40 | grep -iE "jmgpu|probe for|jm9100" >> "$LOG" 2>&1
 else
   log "!! PROBE 失败: 无 /dev/jmgpu"
-  log "    最近 dmesg (jmgpu 相关):"
-  dmesg | tail -60 | grep -iE "jmgpu|j9|platform|failed|error|probe" >> "$LOG" 2>&1 || true
+  log "    完整 dmesg 最近 200 行已存到 /var/log/jmgpu_probe_dmesg.txt"
+  log "    以下为 jmgpu 相关行:"
+  dmesg | tail -200 | grep -iE "jmgpu|jm9100|j9|gal|construct|probe|failed|error" > /var/log/jmgpu_probe_dmesg.txt 2>&1
+  dmesg | tail -200 | grep -iE "jmgpu|jm9100|j9|gal|construct|probe|failed|error" >> "$LOG" 2>&1 || true
 fi
 
 # ---------- 自动回退到 mwv207, 恢复桌面 ----------
