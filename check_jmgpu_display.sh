@@ -49,16 +49,31 @@ for c in /sys/class/drm/card*-*/; do
   log "   connector $name: status=$status"
 done
 
-log "[6] 各 connector 支持的 mode:"
+log "[6] connected connector 的 mode 与 EDID 诊断:"
 for c in /sys/class/drm/card*-*/; do
   name=$(basename "$c")
-  # 仅列出 connected 的 connector 的 mode (避免输出过长)
   st=$(cat "$c/status" 2>/dev/null)
   if [ "$st" = "connected" ]; then
-    log "   --- $name (connected) modes:"
-    head -20 "$c/modes" 2>/dev/null | while read m; do log "      $m"; done || log "      (无 modes)"
+    log "   --- $name (connected):"
+    log "      modes 文件内容:"
+    if [ -s "$c/modes" ]; then
+      cat "$c/modes" 2>/dev/null >> "$LOG"
+    else
+      log "      (modes 文件为空!)"
+    fi
+    log "      edid 是否可读:"
+    if [ -f "$c/edid" ] && [ -s "$c/edid" ]; then
+      sz=$(stat -c%s "$c/edid" 2>/dev/null)
+      log "      edid 大小=$sz 字节 (非空=读到 EDID)"
+    else
+      log "      edid 空或不存在 (未读到 EDID!)"
+    fi
+    log "      dpms 状态: $(cat "$c/dpms" 2>/dev/null)"
+    log "      enabled: $(cat "$c/enabled" 2>/dev/null)"
   fi
 done
+log "      --- dmesg EDID/HDMI 相关:"
+dmesg | tail -120 | grep -iE "edid|hdmi|hdcp|scdc|mode|connector|link" >> "$LOG" 2>&1 || true
 
 log "[7] 回退前完整 DRM 环境:"
 ls -l /sys/bus/pci/devices/$PCI/ 2>/dev/null | grep -iE "drm|driver" >>"$LOG"
