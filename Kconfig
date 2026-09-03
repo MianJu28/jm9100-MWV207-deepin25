@@ -1,0 +1,7 @@
+config GPU_JJW_MWV207
+	tristate "Jmgpu JMCore"
+	depends on DRM && SND_PCM
+	help
+	  Choose this option if you have a Jingjia graphics card. 
+          If M is selected, the module will be called jmgpu.
+

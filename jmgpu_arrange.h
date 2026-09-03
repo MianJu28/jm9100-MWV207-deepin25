@@ -1,0 +1,1171 @@
+/*
+ * JMGPU driver
+ *
+ * Copyright (c) 2020 ChangSha JingJiaMicro Electronics Co., Ltd.
+ * All rights reserved.
+ *
+ * Author:
+ *      wj <jjwgpu@jingjiamicro.com>
+ *
+ * The software and information contained herein is proprietary and
+ * confidential to JingJiaMicro Electronics. This software can only be
+ * used by JingJiaMicro Electronics Corporation. Any use, reproduction,
+ * or disclosure without the written permission of JingJiaMicro
+ * Electronics Corporation is strictly prohibited.
+ *
+ */
+
+
+#ifndef __jmgpu_hal_profiler_h_
+#define __jmgpu_hal_profiler_h_
+
+#include "jmgpu_motion.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define J9_CRENELLATION         10
+#define J9_HANDLE__FORBEARING   11
+
+#define J9_OCTANDRIOUS          20
+#define J9_HANDLE_PELTATIFID    21
+
+#define J9_FETISHIZATION        30
+#define J9_HANDLE_J_PLAYSCRIPT  31
+
+#define J9_PERPLEXINGLY         40
+#define J9_HANDLE__DIPROTODAN   41
+
+#define    J9_RECRUIT              151
+#define    J9_URINOMETRIC          (J9_RECRUIT             + 1)
+#define    J9_HANDLE__CITYNESSES   (J9_URINOMETRIC         + 1)
+#define    J9_ACUTENACULUM         (J9_HANDLE__CITYNESSES  + 1)
+#define    J9_UNVULTURINE          (J9_ACUTENACULUM        + 1)
+#define    J9MATHS_CALCULABLE      (J9_UNVULTURINE         + 1)
+
+#define    J9_JAWFEET              159
+#define    J9_ENCOUNTERED          (J9_JAWFEET             + 1)
+#define    J9_HANDLE__ANTERETHIC   (J9_ENCOUNTERED         + 1)
+#define    J9_BOMBARDMENTS         (J9_HANDLE__ANTERETHIC  + 1)
+#define    J9_BUSHFIGHTER          (J9_BOMBARDMENTS        + 1)
+#define    J9MATHS_SCORBUTIZE      (J9_BUSHFIGHTER         + 1)
+
+#define    J9_DRUPOSE              88
+#define    J9_JOBMISTRESS          (J9_DRUPOSE              + 1)
+#define    J9_HANDLE__PREPERFECT   (J9_JOBMISTRESS          + 1)
+#define    J9_RIOTOUSNESS          (J9_HANDLE__PREPERFECT   + 1)
+#define    J9_THEOTHERAPIST        (J9_RIOTOUSNESS          + 1)
+
+
+
+#define J9_HANDLE_J9_SENATORIAL    1
+#define J9_HANDLE_J9MA_DENEGATION  (J9_HANDLE_J9_SENATORIAL     + 1)
+#define J9_HANDLE_J_UNBLOODIED     (J9_HANDLE_J9MA_DENEGATION   + 1)
+#define J9_HANDLE_J9M_REAPPROVAL   (J9_HANDLE_J_UNBLOODIED      + 1)
+#define J9_HANDLE_J_ORTHOEPIES     (J9_HANDLE_J9M_REAPPROVAL    + 1)
+#define J9_HANDLE_J9M_DOGMATISED   (J9_HANDLE_J_ORTHOEPIES      + 1)
+#define J9_HANDLE__HISTOLOGIC      (J9_HANDLE_J9M_DOGMATISED    + 1)
+#define J9_HANDLE_J9_ESTAFETTED    (J9_HANDLE__HISTOLOGIC       + 1)
+#define J9_HANDLE_J_UNHELPABLE     (J9_HANDLE_J9_ESTAFETTED     + 1)
+#define J9_HANDLE_J9M_SENATORIAL   (J9_HANDLE_J_UNHELPABLE      + 1)
+#define J9_HANDLE__CORPULENCE      (J9_HANDLE_J9M_SENATORIAL    + 1)
+#define J9_HANDLE_J9_DOGMATISED    (J9_HANDLE__CORPULENCE       + 1)
+
+#define J9_TACTICS            1
+#define J9_MILLISECOND        (J9_TACTICS            + 1)
+#define J9_PEDIADONTIST       (J9_MILLISECOND        + 1)
+#define J9_INDULGENCING       (J9_PEDIADONTIST       + 1)
+#define J9_FATILOQUENT        (J9_INDULGENCING       + 1)
+
+#define J9_MORSELIZE          1
+#define J9MATHS_UNABLENESS    (J9_MORSELIZE          + 1)
+#define J9_INTERPAPILLARY     (J9MATHS_UNABLENESS    + 1)
+#define J9_HANDLE_COENOTYPIC  (J9_INTERPAPILLARY     + 1)
+#define J9_SEMIAN             (J9_HANDLE_COENOTYPIC  + 1)
+#define J9_HANDLE__UNABLENESS (J9_SEMIAN             + 1)
+#define J9_ULTRANATURAL       (J9_HANDLE__UNABLENESS + 1)
+#define J9_CHLORAMINE         (J9_ULTRANATURAL       + 1)
+#define J9_THERMOMOTIVE       (J9_CHLORAMINE         + 1)
+
+#define J9_CORRUGATE          1
+#define J9MATHS_SPEEDINESS    (J9_CORRUGATE          + 1)
+#define J9_PARAPHRASTICAL     (J9MATHS_SPEEDINESS    + 1)
+#define J9MIRROR_PREDECLINE   (J9_PARAPHRASTICAL     + 1)
+#define J9_LENDEE             (J9MIRROR_PREDECLINE   + 1)
+#define J9_HANDLE__SCOUTINGLY (J9_LENDEE             + 1)
+#define J9_DISCUSSIONAL       (J9_HANDLE__SCOUTINGLY + 1)
+#define J9_DIATHERMIA         (J9_DISCUSSIONAL       + 1)
+#define J9_PHENANTHRENE       (J9_DIATHERMIA         + 1)
+#define J9MIRROR_RHODIZONIC   (J9_PHENANTHRENE       + 1)
+
+#define J9_PREDIMINISH        1
+#define J9_APPROVINGLY        (J9_PREDIMINISH      + 1)
+#define J9_SUPERPOWERED       (J9_APPROVINGLY      + 1)
+#define J9_HYPERACUTENESS     (J9_SUPERPOWERED     + 1)
+#define J9MATHS_PEDIMENTED    (J9_HYPERACUTENESS   + 1)
+#define J9_FORCEPSES          (J9MATHS_PEDIMENTED  + 1)
+#define J9_HANDLE__PEDIMENTED (J9_FORCEPSES        + 1)
+#define J9_THINKINGPART       (J9_HANDLE__PEDIMENTED + 1)
+#define J9_MONOGRAPHY         (J9_THINKINGPART     + 1)
+#define J9_ORGANOTROPIC       (J9_MONOGRAPHY       + 1)
+
+#define J9_INNERVATIONAL        1
+#define J9_ACRONICAL            (J9_INNERVATIONAL        + 1)
+#define J9_UNCLOUDEDLY          (J9_ACRONICAL            + 1)
+#define J9_PERIEGESIS           (J9_UNCLOUDEDLY          + 1)
+#define J9_HANDLE_J9_COFFEETIME (J9_PERIEGESIS           + 1)
+#define J9_HANDLE_INSTILLING    (J9_HANDLE_J9_COFFEETIME + 1)
+#define J9_HANDLE_BRAZENNESS    (J9_HANDLE_INSTILLING    + 1)
+#define J9_CICERONIANISTS       (J9_HANDLE_BRAZENNESS    + 1)
+#define J9_HANDLE__PALMETTOES   (J9_CICERONIANISTS       + 1)
+#define J9_UROPORPHYRIN         (J9_HANDLE__PALMETTOES   + 1)
+
+#define J9_HETEROCLITOUS       1
+#define J9_CONGRATULATORY      (J9_HETEROCLITOUS      + 1)
+#define J9MIRROR_PALMETTOES    (J9_CONGRATULATORY     + 1)
+#define J9_NEUROLOGICALLY      (J9MIRROR_PALMETTOES   + 1)
+#define J9_HANDLE__CUREMASTER  (J9_NEUROLOGICALLY     + 1)
+#define J9_HANDLE__OUTSAVORED  (J9_HANDLE__CUREMASTER + 1)
+#define J9_UNEXCEEDABLE        (J9_HANDLE__OUTSAVORED + 1)
+#define J9_HANDLE__POSTLUDIUM  (J9_UNEXCEEDABLE       + 1)
+#define J9_BALLETOMANES        (J9_HANDLE__POSTLUDIUM + 1)
+#define J9_POLIOVIRUS          (J9_BALLETOMANES       + 1)
+#define J9_NONOBSESSIVE        (J9_POLIOVIRUS         + 1)
+
+#define J9_NONDEPRECATING      1
+#define J9MATHS_PALMETTOES     (J9_NONDEPRECATING      + 1)
+#define J9MIRROR_ETHEROLATE    (J9MATHS_PALMETTOES     + 1)
+#define J9_WASSAILRY           (J9MIRROR_ETHEROLATE    + 1)
+#define J9_ANTIVIOLENCE        (J9_WASSAILRY           + 1)
+#define J9MIRROR_ANTIRACISM    (J9_ANTIVIOLENCE        + 1)
+#define J9_SUPRACORALLINE      (J9MIRROR_ANTIRACISM    + 1)
+#define J9_HANDLE__OVERKEENLY  (J9_SUPRACORALLINE      + 1)
+#define J9_HANDLE_J_MISQUALITY (J9_HANDLE__OVERKEENLY  + 1)
+#define J9_HANDLE__CELIOSCOPY  (J9_HANDLE_J_MISQUALITY + 1)
+#define J9_UNREFRESHING        (J9_HANDLE__CELIOSCOPY  + 1)
+#define J9_NOTICEABLE          (J9_UNREFRESHING        + 1)
+#define J9_BROADCASTERS        (J9_NOTICEABLE          + 1)
+
+#define J9_ALBUMINATURIA      1
+#define J9_UNEXUBERANTLY      (J9_ALBUMINATURIA     + 1)
+#define J9_PALMOSPASMUS       (J9_UNEXUBERANTLY     + 1)
+#define J9_GALACTOSCOPE       (J9_PALMOSPASMUS      + 1)
+
+#define J9_TRUEHEARTEDLY      1
+#define J9_NONVOLCANIC        (J9_TRUEHEARTEDLY     + 1)
+#define J9_NONVACILLATION     (J9_NONVOLCANIC       + 1)
+#define J9_UNAMICABILITY      (J9_NONVACILLATION    + 1)
+#define J9_VIDEOCASSETTE      (J9_UNAMICABILITY     + 1)
+#define J9MATHS_EXTENDIBLE    (J9_VIDEOCASSETTE     + 1)
+#define J9_RETROAURICULAR     (J9MATHS_EXTENDIBLE   + 1)
+
+#define J9MATHS_DUMBBELLER    1
+#define J9MIRROR_SNOBBINESS   (J9MATHS_DUMBBELLER   + 1)
+#define J9_HANDLE_RENEGATION  (J9MIRROR_SNOBBINESS  + 1)
+
+#define J9_GALLIARDS          1
+#define J9_NONVOLUBLENESS     (J9_GALLIARDS         + 1)
+#define J9_UNBAFFLING         (J9_NONVOLUBLENESS    + 1)
+#define J9_NONSPECIOUS        (J9_UNBAFFLING        + 1)
+
+#define J9_QUIVERINGLY        1
+#define J9_GASTROCENTROUS     (J9_QUIVERINGLY       + 1)
+#define J9_DEMATERIALISED     (J9_GASTROCENTROUS    + 1)
+#define J9_GEOAGRONOMIC       (J9_DEMATERIALISED    + 1)
+#define J9_PALAEOGENESIS      (J9_GEOAGRONOMIC      + 1)
+#define J9_ANDROCEPHALOUS     (J9_PALAEOGENESIS     + 1)
+#define J9_LEPROSE            (J9_ANDROCEPHALOUS    + 1)
+
+#define J9_SUBJECTNESS        1
+#define J9_INTERVENTRALIA     (J9_SUBJECTNESS       + 1)
+#define J9_HYPERCRITICISM     (J9_INTERVENTRALIA    + 1)
+#define J9_ZOOTOMICALLY       (J9_HYPERCRITICISM    + 1)
+#define J9_LEUKOCYTHEMIA      (J9_ZOOTOMICALLY      + 1)
+#define J9_UNACCLIMATIZED     (J9_LEUKOCYTHEMIA     + 1)
+#define J9_PUNTOUT            (J9_UNACCLIMATIZED    + 1)
+
+
+#define VPG(x) (j9_handle_j9m_incumbency(x))
+
+enum j9_clop {
+    VPHEADER,
+    INFO,
+    FRAME,
+    VPTIME,
+    ES11,
+    VG11,
+    HW,
+    MULTI_GPU,
+    PROG,
+    ES11DRAW,
+    MEM,
+    PVS,
+    PPS,
+    ES11_TIME,
+    ES30,
+    ES30_DRAW,
+    ES30_TIME,
+    FINISH,
+    END,
+};
+
+
+#define J9_OAS_         0x080000
+#define J9_ODAC         0x0a0000
+#define J9GUD9          0x0b0000
+#define J9CGA_          0x0c0000
+#define J9CCP_          0x0d0000
+#define J9_EOSIDE       0x0e0000
+#define J9_OSA          0x0f0000
+#define J9DPN9          0x100000
+#define J9PAX9          0x110000
+#define J9_ALU          0x120000
+#define J9_EDIF         0x130000
+#define J9_ANTICORSET   0x220000
+#define J9_ATB          0x230000
+#define J9_TICS         0x250000
+#define J9_HMAS         0x260000
+#define J9_SBS_         0x270000
+#define J9_CIVE         0x280000
+#define J9_OUTFOOT      0x290000
+#define J9_AGA_         0x2a0000
+#define J9_FIMS         0x2b0000
+#define J9_TASH         0x2c0000
+#define J9_GURTS        0x2d0000
+#define J9_ARABS        0x2e0000
+#define J9_WEKI         0x2f0000
+#define J9_IPH_         0x300000
+#define J9_KNP_         0x310000
+#define J9_OCK_         0x320000
+
+
+#define J9MATHS_METHYLATOR    0xaa550001
+#define J9MIRROR_LORICATING   0xaa550002
+#define J9MIRROR_OBSERVATOR   0xaa550003
+#define J9_UNREGENERATELY     0xaa550004
+
+
+#define J9_WOOLGATHERER         (VPG(INFO) + 1)
+#define J9_DENTILINGUAL         (J9_WOOLGATHERER + 1)
+#define J9_UNPERVERTEDLY        (J9_DENTILINGUAL + 1)
+#define J9_FERROMAGNETIC        (J9_UNPERVERTEDLY + 1)
+#define J9_CYANOPATHIC          (J9_FERROMAGNETIC + 1)
+#define J9MATHS_QUINOPYRIN      (J9_CYANOPATHIC + 1)
+#define J9MATHS_COFFEETIME      (J9MATHS_QUINOPYRIN + 1)
+#define J9_GRANDPARENTAL        (J9MATHS_COFFEETIME + 1)
+
+
+#define J9_HYDROTHECAE          (VPG(VPTIME) + 1)
+#define J9_RIMLANDS             (J9_HYDROTHECAE + 1)
+
+#define J9_MIDMONTHLY           (VPG(MEM) + 1)
+#define J9_HAMMERTOES           (J9_MIDMONTHLY + 1)
+#define J9MIRROR_CELIBATIST     (J9_HAMMERTOES + 1)
+#define J9_HANDLE_UNICYCLIST    (J9MIRROR_CELIBATIST + 1)
+
+
+#define    J9_CORELATIVE            (VPG(ES11) +    J9_RECRUIT)
+#define    J9_EXTRAESSENTIAL        (VPG(ES11) +    J9_URINOMETRIC)
+#define    J9_HANDLE_J9M_BRAZENNESS (VPG(ES11) +    J9_HANDLE__CITYNESSES)
+#define    J9MATHS_INSTILLING       (VPG(ES11) +    J9_ACUTENACULUM)
+#define    J9_REFLOURISHMENT        (VPG(ES11) +    J9_UNVULTURINE)
+#define    J9_HANDLE__QUINTUPLET    (VPG(ES11) +    J9MATHS_CALCULABLE)
+
+
+#define    J9_ACCENTUATE            (VPG(ES30) +    J9_JAWFEET)
+#define    J9_PHOTOSYNTHESES        (VPG(ES30) +    J9_ENCOUNTERED)
+#define    J9_HANDLE_J9M_INSTILLING (VPG(ES30) +    J9_HANDLE__ANTERETHIC)
+#define    J9MATHS_GROUNDWAVE       (VPG(ES30) +    J9_BOMBARDMENTS)
+#define    J9_BRONCHIECTASIS        (VPG(ES30) +    J9_BUSHFIGHTER)
+#define    J9_HANDLE__QUINOPYRIN    (VPG(ES30) +    J9MATHS_SCORBUTIZE)
+
+
+#define    J9_UNRELIABLY            (VPG(VG11) +    J9_DRUPOSE)
+#define    J9_PSYCHOANALYZED        (VPG(VG11) +    J9_JOBMISTRESS)
+#define    J9_HANDLE_J9M_UNHONESTLY (VPG(VG11) +    J9_HANDLE__PREPERFECT)
+#define    J9_PLUMBOJAROSITE        (VPG(VG11) +    J9_RIOTOUSNESS)
+#define    J9MIRROR_MISQUALITY      (VPG(VG11) +    J9_THEOTHERAPIST)
+
+
+#define J9_HANDLE_J9MIN_MISQUALITY      (J9_OAS_ + J9_HANDLE_J9_SENATORIAL)
+#define J9_HANDLE_J9MATHS_PATHOMANIA    (J9_OAS_ + J9_HANDLE_J9MA_DENEGATION)
+#define J9_HANDLE_J9MA_PRENEGLECT       (J9_OAS_ + J9_HANDLE_J_UNBLOODIED)
+#define J9_HANDLE_J9MENU_SEVENPENCE     (J9_OAS_ + J9_HANDLE_J9M_REAPPROVAL)
+#define J9_HANDLE_J9MA_CELIBATIST       (J9_OAS_ + J9_HANDLE_J_ORTHOEPIES)
+#define J9_HANDLE_J9MENU_THEOGONIST     (J9_OAS_ + J9_HANDLE_J9M_DOGMATISED)
+#define J9_HANDLE_J9M_GROUNDWAVE        (J9_OAS_ + J9_HANDLE__HISTOLOGIC)
+#define J9_HANDLE_J9MIN_EXTRANEOUS      (J9_OAS_ + J9_HANDLE_J9_ESTAFETTED)
+#define J9_HANDLE_J9MA_GROUNDWARD       (J9_OAS_ + J9_HANDLE_J_UNHELPABLE)
+#define J9_HANDLE_J9MENU_MORBIDNESS     (J9_OAS_ + J9_HANDLE_J9M_SENATORIAL)
+#define J9_HANDLE_J9M_CONGRUENCE        (J9_OAS_ + J9_HANDLE__CORPULENCE)
+#define J9_HANDLE_J9MIN_TARTRONATE      (J9_OAS_ + J9_HANDLE_J9_DOGMATISED)
+
+
+#define J9_WAVELESSLY                   (J9_ODAC + J9_TACTICS)
+#define J9_PERILENTICULAR               (J9_ODAC + J9_MILLISECOND)
+#define J9MATHS_QUINTUPLET              (J9_ODAC + J9_PEDIADONTIST)
+#define J9MATHS_CONGRUENCE              (J9_ODAC + J9_INDULGENCING)
+#define J9_MULTIGRANULATE               (J9_ODAC + J9_FATILOQUENT)
+
+
+#define J9_CHROMATOGRAM                 (J9GUD9 + J9_MORSELIZE)
+#define J9_HANDLE__TONGUELESS           (J9GUD9 + J9MATHS_UNABLENESS)
+#define J9_HANDLE_CROSSBENCH            (J9GUD9 + J9_INTERPAPILLARY)
+#define J9_HANDLE_J9_TARTRONATE         (J9GUD9 + J9_HANDLE_COENOTYPIC)
+#define J9_HANDLE_J9M_CELIBATIST        (J9GUD9 + J9_HANDLE__UNABLENESS)
+#define J9MATHS_SEVENPENCE              (J9GUD9 + J9_ULTRANATURAL)
+#define J9_CANNIBALIZING                (J9GUD9 + J9_CHLORAMINE)
+#define J9MATHS_MORBIDNESS              (J9GUD9 + J9_THERMOMOTIVE)
+
+#define J9_UNDERVILLAIN                 (J9CGA_ + J9_CORRUGATE)
+#define J9_HANDLE__ETHEROLATE           (J9CGA_ + J9MATHS_SPEEDINESS)
+#define J9_HANDLE_OXAMETHANE            (J9CGA_ + J9_PARAPHRASTICAL)
+#define J9_HANDLE_J_SEVENPENCE          (J9CGA_ + J9MIRROR_PREDECLINE)
+#define J9_HANDLE_J9M_QUINOPYRIN        (J9CGA_ + J9_HANDLE__SCOUTINGLY)
+#define J9MATHS_GROUNDWARD              (J9CGA_ + J9_DISCUSSIONAL)
+#define J9_PNEUMATOPHORE                (J9CGA_ + J9_DIATHERMIA)
+#define J9MATHS_CELIBATIST              (J9CGA_ + J9_PHENANTHRENE)
+#define J9_HANDLE_J_CROSSBENCH          (J9CGA_ + J9MIRROR_RHODIZONIC)
+
+
+#define J9_UNREPROVEDNESS               (J9CCP_ + J9_PREDIMINISH)
+#define J9_PREDISCONTINUE               (J9CCP_ + J9_APPROVINGLY)
+#define J9MATHS_ANTIRACISM              (J9CCP_ + J9_SUPERPOWERED)
+#define J9_HANDLE_UNHONESTLY            (J9CCP_ + J9_HYPERACUTENESS)
+#define J9_HANDLE__ANTIRACISM           (J9CCP_ + J9MATHS_PEDIMENTED)
+#define J9_INCREMENTING                 (J9CCP_ + J9_FORCEPSES)
+#define J9_HANDLE_J9M_QUINTUPLET        (J9CCP_ + J9_HANDLE__PEDIMENTED)
+#define J9MATHS_OUTGAMBLED              (J9CCP_ + J9_THINKINGPART)
+#define J9_PERIODONTITIS                (J9CCP_ + J9_MONOGRAPHY)
+#define J9MATHS_ETHEROLATE              (J9CCP_ + J9_ORGANOTROPIC)
+
+
+#define J9MIRROR_TARTRONATE             (J9_EOSIDE + J9_INNERVATIONAL)
+#define J9_INSTIGATIONS                 (J9_EOSIDE + J9_ACRONICAL)
+#define J9_AUTOPHYTOGRAPH               (J9_EOSIDE + J9_UNCLOUDEDLY)
+#define J9_PSEUDIMAGINAL                (J9_EOSIDE + J9_PERIEGESIS)
+#define J9_HANDLE_J9MIN_INUREMENTS      (J9_EOSIDE + J9_HANDLE_J9_COFFEETIME)
+#define J9_HANDLE_J9_EXTRANEOUS         (J9_EOSIDE + J9_HANDLE_INSTILLING)
+#define J9_HANDLE_J9_REMODIFIED         (J9_EOSIDE + J9_HANDLE_BRAZENNESS)
+#define J9_HANDLE_THEOGONIST            (J9_EOSIDE + J9_CICERONIANISTS)
+#define J9_HANDLE_J9M_OUTGAMBLED        (J9_EOSIDE + J9_HANDLE__PALMETTOES)
+#define J9MATHS_TARTRONATE              (J9_EOSIDE + J9_UROPORPHYRIN)
+
+
+#define J9MIRROR_EXTRANEOUS             (J9_OSA + J9_HETEROCLITOUS)
+#define J9_HANDLE_INUREMENTS            (J9_OSA + J9_CONGRATULATORY)
+#define J9_HANDLE_J_BALLBUSTER          (J9_OSA + J9MIRROR_PALMETTOES)
+#define J9_HANDLE_MISQUALITY            (J9_OSA + J9_NEUROLOGICALLY)
+#define J9_HANDLE_J9M_ANTIRACISM        (J9_OSA + J9_HANDLE__CUREMASTER)
+#define J9_HANDLE_J9M_ETHEROLATE        (J9_OSA + J9_HANDLE__OUTSAVORED)
+#define J9MATHS_OXAMETHANE              (J9_OSA + J9_UNEXCEEDABLE)
+#define J9_HANDLE_J9M_COFFEETIME        (J9_OSA + J9_HANDLE__POSTLUDIUM)
+#define J9MATHS_EXTRANEOUS              (J9_OSA + J9_BALLETOMANES)
+#define J9_SECUNDIPAROUS                (J9_OSA + J9_POLIOVIRUS)
+#define J9MATHS_REMODIFIED              (J9_OSA + J9_NONOBSESSIVE)
+
+
+#define J9_HANDLE_SEVENPENCE            (J9DPN9 + J9_NONDEPRECATING)
+#define J9_HANDLE__OUTGAMBLED           (J9DPN9 + J9MATHS_PALMETTOES)
+#define J9_HANDLE_J_LEPROLOGIC          (J9DPN9 + J9MIRROR_ETHEROLATE)
+#define J9_SCLEROIRITIS                 (J9DPN9 + J9_WASSAILRY)
+#define J9MATHS_MISQUALITY              (J9DPN9 + J9_ANTIVIOLENCE)
+#define J9_HANDLE_J_OVEREXPAND          (J9DPN9 + J9MIRROR_ANTIRACISM)
+#define J9_HANDLE_MORBIDNESS            (J9DPN9 + J9_SUPRACORALLINE)
+#define J9_HANDLE_J9M_TONGUELESS        (J9DPN9 + J9_HANDLE__OVERKEENLY)
+#define J9_HANDLE_J9MA_OXAMETHANE       (J9DPN9 + J9_HANDLE_J_MISQUALITY)
+#define J9_HANDLE_J9M_UNICYCLIST        (J9DPN9 + J9_HANDLE__CELIOSCOPY)
+#define J9MATHS_THEOGONIST              (J9DPN9 + J9_UNREFRESHING)
+#define J9_PALAEOTYPICAL                (J9DPN9 + J9_NOTICEABLE)
+#define J9MATHS_INUREMENTS              (J9DPN9 + J9_BROADCASTERS)
+
+
+#define J9MIRROR_GROUNDWARD             (J9PAX9 + J9_ALBUMINATURIA)
+#define J9MIRROR_PRENEGLECT             (J9PAX9 + J9_UNEXUBERANTLY)
+#define J9MATHS_TONGUELESS              (J9PAX9 + J9_PALMOSPASMUS)
+#define J9MATHS_UNICYCLIST              (J9PAX9 + J9_GALACTOSCOPE)
+
+
+#define J9MIRROR_UNHONESTLY             (J9_ALU + J9_TRUEHEARTEDLY)
+#define J9_ERYTHRORRHEXIS               (J9_ALU + J9_NONVOLCANIC)
+#define J9_HANDLE_TONGUELESS            (J9_ALU + J9_NONVACILLATION)
+#define J9MIRROR_UNICYCLIST             (J9_ALU + J9_UNAMICABILITY)
+#define J9MIRROR_TONGUELESS             (J9_ALU + J9_VIDEOCASSETTE)
+#define J9_HANDLE__COFFEETIME           (J9_ALU + J9MATHS_EXTENDIBLE)
+#define J9_HANDLE_OUTGAMBLED            (J9_ALU + J9_RETROAURICULAR)
+
+
+#define J9_HANDLE__CONGRUENCE           (J9_EDIF + J9MATHS_DUMBBELLER)
+#define J9_HANDLE_J_MORBIDNESS          (J9_EDIF + J9MIRROR_SNOBBINESS)
+#define J9_HANDLE_J9_OXAMETHANE         (J9_EDIF + J9_HANDLE_RENEGATION)
+
+
+#define J9_FORESTAYSAIL                 (J9_ATB + J9_GALLIARDS)
+#define J9_HANDLE_ETHEROLATE            (J9_ATB + J9_NONVOLUBLENESS)
+#define J9_CONFERVACEOUS                (J9_ATB + J9_UNBAFFLING)
+#define J9_CALELECTRICITY               (J9_ATB + J9_NONSPECIOUS)
+
+
+#define J9_TRANSSHIPPING                 (J9_HMAS + 1)
+#define J9_HANDLE_J_40000           (J9_HMAS + 2)
+#define J9_HANDLE__COENOTYPIC            (J9_HMAS + 3)
+#define J9_HANDLE_J9M_CALCIFUGAL         (J9_HMAS + 4)
+#define J9_HANDLE_J9MA_UNABLENESS        (J9_HMAS + 5)
+#define J9MIRROR_COENOTYPIC              (J9_HMAS + 6)
+#define J9_VERIFIABLENESS                (J9_HMAS + 7)
+#define J9MIRROR_HOUSESMITH              (J9_HMAS + 8)
+#define J9_HANDLE_J9_HOUSESMITH          (J9_HMAS + 9)
+#define J9_HOMOLOGIES                    (J9_HANDLE_J9_HOUSESMITH - J9_HMAS)
+
+
+#define J9_MISCORRECTING                 (J9_SBS_ + 1)
+#define J9_HANDLE_J_HOUSESMITH           (J9_SBS_ + 2)
+#define J9_HANDLE__TIMBERLIKE            (J9_SBS_ + 3)
+#define J9_HANDLE_J9_PATHOMANIA          (J9_SBS_ + 4)
+#define J9_HANDLE_J9MA_PICHICIAGO        (J9_SBS_ + 5)
+#define J9MIRROR_OVEREXPAND              (J9_SBS_ + 6)
+#define J9_TUMBLIFICATION                (J9_SBS_ + 7)
+#define J9MIRROR_BALLBUSTER              (J9_SBS_ + 8)
+#define J9_HANDLE_J9_TIMBERLIKE          (J9_SBS_ + 9)
+#define J9_OVERFOUGHT                    (J9_HANDLE_J9_TIMBERLIKE - J9_SBS_)
+
+
+#define J9MATHS_PICHICIAGO               (J9_CIVE + 1)
+#define J9MATHS_TIMBERLIKE               (J9_CIVE + 2)
+#define J9MIRROR_MORBIDNESS              (J9_CIVE + 3)
+#define J9_HANDLE__CROSSBENCH            (J9_CIVE + 4)
+#define J9_HANDLE_J_CALCIFUGAL           (J9_CIVE + 5)
+#define J9_HANDLE_OVEREXPAND             (J9_CIVE + 6)
+#define J9_HANDLE_LEPROLOGIC             (J9_CIVE + 7)
+#define J9_HANDLE_J_PHLEBOLOGY           (J9_CIVE + 8)
+#define J9_HANDLE_J9MIN_CALCIFUGAL       (J9_CIVE + 9)
+#define J9_HANDLE_J9MA_TIMBERLIKE        (J9_CIVE + 10)
+#define J9MIRROR_CROSSBENCH              (J9_CIVE + 11)
+#define J9_REACQUAINTANCE                (J9_CIVE + 12)
+#define J9MIRROR_SEVENPENCE              (J9_CIVE + 13)
+#define J9_HAMMERLESS                    (J9MIRROR_SEVENPENCE - J9_CIVE)
+
+
+#define J9_HANDLE_J9M_OVEREXPAND         (J9_OUTFOOT + 1)
+#define J9_HANDLE_HOUSESMITH             (J9_OUTFOOT + 2)
+#define J9_HANDLE_J9M_BALLBUSTER         (J9_OUTFOOT + 3)
+#define J9_HANDLE_CALCIFUGAL             (J9_OUTFOOT + 4)
+#define J9MATHS_PALEOSTYLY               (J9_OUTFOOT + 5)
+#define J9_MICROGRAPHICAL                (J9_OUTFOOT + 6)
+#define J9_HANDLE_J9MENU_CALCIFUGAL      (J9_OUTFOOT + 7)
+#define J9_HANDLE_J9M_PATHOMANIA         (J9_OUTFOOT + 8)
+#define J9_HANDLE_J9M_LEPROLOGIC         (J9_OUTFOOT + 9)
+#define J9_HANDLE__PHLEBOLOGY            (J9_OUTFOOT + 10)
+#define J9_HANDLE_J9MA_HOUSESMITH        (J9_OUTFOOT + 11)
+#define J9_HANDLE_J9MIN_HOUSESMITH       (J9_OUTFOOT + 12)
+#define J9MIRROR_PICHICIAGO              (J9_OUTFOOT + 13)
+#define J9_ANADROMOUS                    (J9MIRROR_PICHICIAGO - J9_OUTFOOT)
+
+
+#define J9_HANDLE_PHLEBOLOGY             (J9_AGA_ + 1)
+#define J9_HANDLE__PALEOSTYLY            (J9_AGA_ + 2)
+#define J9_HANDLE_J9_PALEOSTYLY          (J9_AGA_ + 3)
+#define J9_HANDLE__PICHICIAGO            (J9_AGA_ + 4)
+#define J9_HANDLE_J9MA_PHLEBOLOGY        (J9_AGA_ + 5)
+#define J9_HANDLE_J9MA_CALCIFUGAL        (J9_AGA_ + 6)
+#define J9_HANDLE_J9MENU_PALEOSTYLY      (J9_AGA_ + 7)
+#define J9_HANDLE_J9MENU_PHLEBOLOGY      (J9_AGA_ + 8)
+#define J9_HANDLE_J_COENOTYPIC           (J9_AGA_ + 9)
+#define J9_HANDLE_J9_PICHICIAGO          (J9_AGA_ + 10)
+#define J9MIRROR_LEPROLOGIC              (J9_AGA_ + 11)
+#define J9_HANDLE_J9MA_PALEOSTYLY        (J9_AGA_ + 12)
+#define J9MIRROR_TIMBERLIKE              (J9_AGA_ + 13)
+#define J9_DEMONSTRATABLE                (J9_AGA_ + 14)
+#define J9MIRROR_PATHOMANIA              (J9_AGA_ + 15)
+#define J9_SEMITERETE                    (J9MIRROR_PATHOMANIA - J9_AGA_)
+
+
+#define J9_HANDLE__HOUSESMITH            (J9_FIMS + 1)
+#define J9_HANDLE_J_UNABLENESS           (J9_FIMS + 2)
+#define J9_HANDLE_J9_CALCIFUGAL          (J9_FIMS + 3)
+#define J9_HEARTLESSNESS                 (J9_FIMS + 4)
+#define J9MIRROR_PHLEBOLOGY              (J9_FIMS + 5)
+#define J9MATHS_CALCIFUGAL               (J9_FIMS + 6)
+#define J9MIRROR_CALCIFUGAL              (J9_FIMS + 7)
+#define J9MATHS_HOUSESMITH               (J9_FIMS + 8)
+#define J9_BICHLORIDE                    (J9MATHS_HOUSESMITH - J9_FIMS)
+
+
+#define J9_HANDLE__BALLBUSTER             (J9_TASH + 1)
+#define J9_HANDLE__OVEREXPAND             (J9_TASH + 2)
+#define J9_HANDLE_PATHOMANIA              (J9_TASH + 3)
+#define J9_HANDLE_TIMBERLIKE              (J9_TASH + 4)
+#define J9_HANDLE__LEPROLOGIC             (J9_TASH + 5)
+#define J9_HANDLE__PATHOMANIA             (J9_TASH + 6)
+#define J9_HANDLE_PICHICIAGO              (J9_TASH + 7)
+#define J9_HANDLE_PALEOSTYLY              (J9_TASH + 8)
+#define J9_OPHIOURIDE                     (J9_HANDLE_PALEOSTYLY - J9_TASH)
+
+
+#define J9_HANDLE_J9MIN_SEVENPENCE        (J9_GURTS + 1)
+#define J9_HANDLE_J9MATHS_PICHICIAGO      (J9_GURTS + 2)
+#define J9_HANDLE_J9MENU_CROSSBENCH       (J9_GURTS + 3)
+#define J9_HANDLE_J9MIN_LEPROLOGIC        (J9_GURTS + 4)
+#define J9_HANDLE_J9MA_SEVENPENCE         (J9_GURTS + 5)
+#define J9_HANDLE_J9MIN_CROSSBENCH        (J9_GURTS + 6)
+#define J9_HANDLE_J9MATHS_TIMBERLIKE      (J9_GURTS + 7)
+#define J9_HANDLE_J9MENU_BALLBUSTER       (J9_GURTS + 8)
+#define J9_HANDLE_J9MIN_OVEREXPAND        (J9_GURTS + 9)
+#define J9_HANDLE_J9MA_CROSSBENCH         (J9_GURTS + 10)
+#define J9_HANDLE_J9MIN_BALLBUSTER        (J9_GURTS + 11)
+#define J9_HANDLE_J9MENU_OVEREXPAND       (J9_GURTS + 12)
+#define J9_HANDLE_J9M_INUREMENTS          (J9_GURTS + 13)
+#define J9_HANDLE_J9MA_BALLBUSTER         (J9_GURTS + 14)
+#define J9_HANDLE__INUREMENTS             (J9_GURTS + 15)
+#define J9_HANDLE__MISQUALITY             (J9_GURTS + 16)
+#define J9_HANDLE_J9_SEVENPENCE           (J9_GURTS + 17)
+#define J9_HANDLE_J_PICHICIAGO            (J9_GURTS + 18)
+#define J9_HANDLE_J9_CROSSBENCH           (J9_GURTS + 19)
+#define J9_HANDLE_J9M_TARTRONATE          (J9_GURTS + 20)
+#define J9_HANDLE_J9M_EXTRANEOUS          (J9_GURTS + 21)
+#define J9_HANDLE_J9M_THEOGONIST          (J9_GURTS + 22)
+#define J9_HANDLE_J9M_MORBIDNESS          (J9_GURTS + 23)
+#define J9_HANDLE_J9M_MISQUALITY          (J9_GURTS + 24)
+#define J9_HANDLE_J9MA_INUREMENTS         (J9_GURTS + 25)
+#define J9_HANDLE_J9MA_THEOGONIST         (J9_GURTS + 26)
+#define J9_HANDLE_J9MA_MORBIDNESS         (J9_GURTS + 27)
+#define J9_FEDERALIZED                    (J9_HANDLE_J9MA_MORBIDNESS - J9_GURTS)
+
+
+#define J9_HANDLE_J9MIN_PATHOMANIA        (J9_ARABS + 1)
+#define J9_HANDLE_J9MATHS_PHLEBOLOGY      (J9_ARABS + 2)
+#define J9_HANDLE_J9MENU_LEPROLOGIC       (J9_ARABS + 3)
+#define J9_HANDLE_J9MIN_PHLEBOLOGY        (J9_ARABS + 4)
+#define J9_HANDLE_J9MA_OVEREXPAND         (J9_ARABS + 5)
+#define J9_HANDLE_J9MIN_TIMBERLIKE        (J9_ARABS + 6)
+#define J9_HANDLE_J9MATHS_PALEOSTYLY      (J9_ARABS + 7)
+#define J9_HANDLE_J9MENU_PATHOMANIA       (J9_ARABS + 8)
+#define J9_HANDLE_J9MIN_PALEOSTYLY        (J9_ARABS + 9)
+#define J9_HANDLE_J9MA_LEPROLOGIC         (J9_ARABS + 10)
+#define J9_HANDLE_J9MIN_PICHICIAGO        (J9_ARABS + 11)
+#define J9_HANDLE_J9MENU_TIMBERLIKE       (J9_ARABS + 12)
+#define J9_HANDLE_J9M_SEVENPENCE          (J9_ARABS + 13)
+#define J9_HANDLE_J9MA_PATHOMANIA         (J9_ARABS + 14)
+#define J9_HANDLE__MORBIDNESS             (J9_ARABS + 15)
+#define J9_HANDLE__THEOGONIST             (J9_ARABS + 16)
+#define J9_HANDLE_J9_BALLBUSTER           (J9_ARABS + 17)
+#define J9_HANDLE_J_PALEOSTYLY            (J9_ARABS + 18)
+#define J9_OCTASTICHON                    (J9_HANDLE_J_PALEOSTYLY - J9_ARABS)
+
+
+#define J9_COMPENETRATION                (J9_WEKI + 1)
+#define J9MATHS_BALLBUSTER               (J9_WEKI + 2)
+#define J9_RELUBRICATED                  (J9_WEKI + 3)
+#define J9_ARCHAEOHIPPUS                 (J9_WEKI + 4)
+#define J9_HANDLE_J9_MISQUALITY          (J9_WEKI + 5)
+#define J9_HANDLE_J9M_GROUNDWARD         (J9_WEKI + 6)
+#define J9_HANDLE_J9MA_REMODIFIED        (J9_WEKI + 7)
+#define J9_PHILANTHROPIST                (J9_WEKI + 8)
+#define J9MATHS_OVEREXPAND               (J9_WEKI + 9)
+#define J9_AUTOPLASTIES                  (J9_WEKI + 10)
+#define J9_EXTRAPUNITIVE                 (J9_WEKI + 11)
+#define J9_HANDLE_J9_INUREMENTS          (J9_WEKI + 12)
+#define J9_HANDLE_J9M_PRENEGLECT         (J9_WEKI + 13)
+#define J9_HANDLE_J9MA_EXTRANEOUS        (J9_WEKI + 14)
+#define J9MATHS_LEPROLOGIC               (J9_WEKI + 15)
+#define J9_REMANUFACTURES                (J9_WEKI + 16)
+#define J9_UNIMPERTINENT                 (J9_WEKI + 17)
+#define J9_TINTINNABULANT                (J9_WEKI + 18)
+#define J9_HANDLE_BALLBUSTER             (J9_WEKI + 19)
+#define J9_HANDLE__CELIBATIST            (J9_WEKI + 20)
+#define J9_PENDELOQUE                    (J9_HANDLE__CELIBATIST - J9_WEKI)
+
+
+#define J9_HANDLE_J9_THEOGONIST          (J9_IPH_ + 1)
+#define J9_HANDLE_J9_MORBIDNESS          (J9_IPH_ + 2)
+#define J9_HANDLE_J9M_OXAMETHANE         (J9_IPH_ + 3)
+#define J9_HANDLE_J9M_REMODIFIED         (J9_IPH_ + 4)
+#define J9_HANDLE_J9MA_TARTRONATE        (J9_IPH_ + 5)
+#define J9_HANDLE_J9MA_MISQUALITY        (J9_IPH_ + 6)
+#define J9_HANDLE_J9MIN_THEOGONIST       (J9_IPH_ + 7)
+#define J9_HANDLE_J9MIN_MORBIDNESS       (J9_IPH_ + 8)
+#define J9_HANDLE__PRENEGLECT            (J9_IPH_ + 9)
+#define J9_HANDLE__GROUNDWARD            (J9_IPH_ + 10)
+#define J9_HANDLE__OXAMETHANE            (J9_IPH_ + 11)
+#define J9_HANDLE_J_PATHOMANIA           (J9_IPH_ + 12)
+#define J9_HANDLE__EXTRANEOUS            (J9_IPH_ + 13)
+#define J9_HANDLE__REMODIFIED            (J9_IPH_ + 14)
+#define J9_HANDLE__TARTRONATE            (J9_IPH_ + 15)
+#define J9_HANDLE_J_TIMBERLIKE           (J9_IPH_ + 16)
+#define J9_ETERNALISE                    (J9_HANDLE_J_TIMBERLIKE - J9_IPH_)
+
+
+#define J9_CHOREPISCOPAL                 (J9_TICS + 1)
+#define J9_HANDLE__UNHONESTLY            (J9_TICS + 2)
+#define J9_HANDLE__UNICYCLIST            (J9_TICS + 3)
+#define J9MIRROR_INUREMENTS              (J9_TICS + 4)
+#define J9_TORRENTFULNESS                (J9_TICS + 5)
+#define J9MATHS_CROSSBENCH               (J9_TICS + 6)
+#define J9MIRROR_THEOGONIST              (J9_TICS + 7)
+#define J9_SELECTIONS                    (J9MIRROR_THEOGONIST - J9_TICS)
+
+#define J9_HANDLE_QUINTUPLET   \
+    (J9_SELECTIONS + J9_HOMOLOGIES + J9_HAMMERLESS + J9_ANADROMOUS  + J9_SEMITERETE  + \
+     J9_OVERFOUGHT + J9_BICHLORIDE + J9_OPHIOURIDE + J9_FEDERALIZED + J9_OCTASTICHON + \
+     J9_PENDELOQUE + J9_ETERNALISE)
+
+#define J9MIRROR_COFFEETIME              12
+
+
+#define J9_CHALICOTHERIID           (VPG(PVS) + J9_QUIVERINGLY)
+#define J9_HANDLE_REMODIFIED        (VPG(PVS) + J9_GASTROCENTROUS)
+#define J9_HANDLE_TARTRONATE        (VPG(PVS) + J9_DEMATERIALISED)
+#define J9MATHS_PRENEGLECT          (VPG(PVS) + J9_GEOAGRONOMIC)
+#define J9MIRROR_REMODIFIED         (VPG(PVS) + J9_PALAEOGENESIS)
+#define J9_HANDLE_EXTRANEOUS        (VPG(PVS) + J9_ANDROCEPHALOUS)
+#define J9_HOMOGENATE               (VPG(PVS) + J9_LEPROSE)
+
+#define J9_MICROMESENTERY           (VPG(PPS) + J9_SUBJECTNESS)
+#define J9_HANDLE_CELIBATIST        (VPG(PPS) + J9_INTERVENTRALIA)
+#define J9_HANDLE_PRENEGLECT        (VPG(PPS) + J9_HYPERCRITICISM)
+#define J9MATHS_UNHONESTLY          (VPG(PPS) + J9_ZOOTOMICALLY)
+#define J9MIRROR_OXAMETHANE         (VPG(PPS) + J9_LEUKOCYTHEMIA)
+#define J9_HANDLE_GROUNDWARD        (VPG(PPS) + J9_UNACCLIMATIZED)
+#define J9_INTERPLAIT               (VPG(PPS) + J9_PUNTOUT)
+
+#define J9_ANTEMILLENNIAL           (VPG(PROG) + 1)
+
+#define J9_UNTRADITIONAL            (VPG(ES30_DRAW) + 1)
+#define J9_TRICUSPIDATED            (VPG_ES11_DRAW + 1)
+#define J9_CRYPTODOUBLE             (VPG(MULTI_GPU) + 1)
+
+#define   J9_HANDLE_J9MATHS_DOWNLOADED                    0x5
+#define   J9_HANDLE_J_ATTRIBUTE_PARAPSIDAL                0x9
+#define   J9_HANDLE_J9MENU_ATTRIBUTE_TONGUELESS           0xC
+#define   J9_HANDLE_J9M_PREADAPTED                        0xD
+#define   J9_HANDLE_J9MIRROR_SAPIENTIZE                   0xE
+#define   J9_HANDLE__ATTRIBUTE_STICHARION                 0x9
+#define   J9_HANDLE_J9MIN_TETRAMETER                      0x8
+#define   J9_HANDLE__ATTRIBUTE_COMMENCING                 0x8
+#define   J9_HANDLE_J_ATTRIBUTE_BEHAVIOUR_CROSSBENCH      0xC
+#define   J9_HANDLE_J_ATTRIBUTE_BEHAVIOUR_BALLBUSTER      0xC
+#define   J9_HANDLE_J9M_ATTRIBUTE_PALMETTOES              0x9
+#define   J9_HANDLE_J9M_ATTRIBUTE_OVERKEENLY              0x7
+#define   J9_HANDLE_ATTRIBUTE_RHABDOLOGY                  0xE
+#define   J9MATHS_PREDECLINE                                                    \
+    (J9_HANDLE_J9MATHS_DOWNLOADED + J9_HANDLE_J_ATTRIBUTE_PARAPSIDAL +          \
+     J9_HANDLE_J9MENU_ATTRIBUTE_TONGUELESS + J9_HANDLE_J9M_PREADAPTED +         \
+     J9_HANDLE_J9MIRROR_SAPIENTIZE + J9_HANDLE__ATTRIBUTE_STICHARION +          \
+     J9_HANDLE_J9MIN_TETRAMETER + J9_HANDLE__ATTRIBUTE_COMMENCING +             \
+     J9_HANDLE_J_ATTRIBUTE_BEHAVIOUR_CROSSBENCH +                               \
+     J9_HANDLE_J_ATTRIBUTE_BEHAVIOUR_BALLBUSTER +                               \
+     J9_HANDLE_J9M_ATTRIBUTE_PALMETTOES + J9_HANDLE_J9M_ATTRIBUTE_OVERKEENLY +  \
+     J9_HANDLE_ATTRIBUTE_RHABDOLOGY)
+
+#define   J9_HANDLE_J9_GROUNDWARD                                               \
+    (                                                                           \
+        (J9MIRROR_THEOGONIST - J9MIRROR_INUREMENTS + 1) +                       \
+        J9_BICHLORIDE + (J9_OVERFOUGHT - 1) +                                   \
+        (J9_HANDLE_J9MA_MORBIDNESS - J9_HANDLE_J9MA_CROSSBENCH -                \
+            (J9_HANDLE_J9MA_MORBIDNESS - J9_HANDLE_J9_CROSSBENCH + 1)) +        \
+        (J9_PENDELOQUE - (J9_HANDLE__CELIBATIST - J9_HANDLE_BALLBUSTER + 1)) +  \
+        J9_ETERNALISE                                                           \
+    )
+#define   J9_HANDLE_J_EXTRANEOUS                (6)
+
+#define J9_DIATHERMANOUS                        (J9_KNP_ + 1)
+#define J9_HANDLE__SEVENPENCE                   (J9_KNP_ + 2)
+#define J9MATHS_PATHOMANIA                      (J9_KNP_ + 3)
+#define J9_HANDLE_J9M_CROSSBENCH                (J9_KNP_ + 4)
+#define J9_HANDLE_J9MIRROR_PHLEBOLOGY           (J9_KNP_ + 5)
+#define J9_HANDLE_J9MATHS_COENOTYPIC            (J9_KNP_ + 6)
+#define J9_HANDLE_J9_ATTRIBUTE_COENOTYPIC       (J9_KNP_ + 7)
+#define J9_HANDLE__ATTRIBUTE_TIMBERLIKE         (J9_KNP_ + 8)
+#define J9_HANDLE_J9MIN_ATTRIBUTE_PALEOSTYLY    (J9_KNP_ + 9)
+#define J9_HANDLE_J9MIRROR_HOUSESMITH           (J9_KNP_ + 10)
+#define J9_HANDLE_J9M_ATTRIBUTE_40000      (J9_KNP_ + 11)
+#define J9_HANDLE_J_ATTRIBUTE_COENOTYPIC        (J9_KNP_ + 12)
+#define J9_HANDLE_J9MENU_ATTRIBUTE_40000   (J9_KNP_ + 13)
+#define J9_HANDLE_J9MIRROR_CALCIFUGAL           (J9_KNP_ + 14)
+#define J9_HANDLE_J9M_ATTRIBUTE_UNABLENESS      (J9_KNP_ + 15)
+#define J9_HANDLE_ATTRIBUTE_OVEREXPAND          (J9_KNP_ + 16)
+#define J9_HANDLE_J9MA_ATTRIBUTE_LEPROLOGIC     (J9_KNP_ + 17)
+#define J9_HANDLE_J9_LEPROLOGIC                 (J9_KNP_ + 18)
+#define J9_HANDLE_J9MATHS_HOUSESMITH            (J9_KNP_ + 19)
+#define J9_HANDLE_J9_OVEREXPAND                 (J9_KNP_ + 20)
+#define J9_HANDLE_J9MATHS_CALCIFUGAL            (J9_KNP_ + 21)
+#define J9_HANDLE_J9MATHS_UNABLENESS            (J9_KNP_ + 22)
+#define J9_HANDLE_J9_ATTRIBUTE_UNABLENESS       (J9_KNP_ + 23)
+#define J9_HANDLE_J9MENU_PICHICIAGO             (J9_KNP_ + 24)
+#define J9_HANDLE_J_ATTRIBUTE_HOUSESMITH        (J9_KNP_ + 25)
+#define J9_HANDLE_J9M_ATTRIBUTE_COENOTYPIC      (J9_KNP_ + 26)
+#define J9_HANDLE_ATTRIBUTE_REMODIFIED          (J9_KNP_ + 27)
+#define J9_HANDLE_ATTRIBUTE_EXTRANEOUS          (J9_KNP_ + 28)
+#define J9_HANDLE_ATTRIBUTE_TARTRONATE          (J9_KNP_ + 29)
+#define J9_HANDLE_ATTRIBUTE_MISQUALITY          (J9_KNP_ + 30)
+#define J9_HANDLE_ATTRIBUTE_INUREMENTS          (J9_KNP_ + 31)
+#define J9_HANDLE_ATTRIBUTE_THEOGONIST          (J9_KNP_ + 32)
+#define J9_HANDLE_ATTRIBUTE_MORBIDNESS          (J9_KNP_ + 33)
+#define J9_HANDLE_ATTRIBUTE_SEVENPENCE          (J9_KNP_ + 34)
+#define J9_HANDLE_ATTRIBUTE_CROSSBENCH          (J9_KNP_ + 35)
+#define J9_HANDLE_ATTRIBUTE_BALLBUSTER          (J9_KNP_ + 36)
+#define J9_HANDLE__ATTRIBUTE_ETHEROLATE         (J9_KNP_ + 37)
+#define J9_HANDLE__ATTRIBUTE_OUTGAMBLED         (J9_KNP_ + 38)
+#define J9_HANDLE__ATTRIBUTE_TONGUELESS         (J9_KNP_ + 39)
+#define J9_HANDLE__ATTRIBUTE_UNICYCLIST         (J9_KNP_ + 40)
+#define J9_HANDLE__ATTRIBUTE_UNHONESTLY         (J9_KNP_ + 41)
+#define J9_HANDLE__ATTRIBUTE_CELIBATIST         (J9_KNP_ + 42)
+#define J9_HANDLE__ATTRIBUTE_GROUNDWARD         (J9_KNP_ + 43)
+#define J9_HANDLE__ATTRIBUTE_PRENEGLECT         (J9_KNP_ + 44)
+#define J9_HANDLE__ATTRIBUTE_OXAMETHANE         (J9_KNP_ + 45)
+#define J9_HANDLE__ATTRIBUTE_REMODIFIED         (J9_KNP_ + 46)
+#define J9_HANDLE__ATTRIBUTE_EXTRANEOUS         (J9_KNP_ + 47)
+#define J9_HANDLE__ATTRIBUTE_TARTRONATE         (J9_KNP_ + 48)
+#define J9_HANDLE__ATTRIBUTE_MISQUALITY         (J9_KNP_ + 49)
+#define J9_HANDLE__ATTRIBUTE_INUREMENTS         (J9_KNP_ + 50)
+#define J9_HANDLE__ATTRIBUTE_THEOGONIST         (J9_KNP_ + 51)
+#define J9_HANDLE__ATTRIBUTE_MORBIDNESS         (J9_KNP_ + 52)
+#define J9_HANDLE__ATTRIBUTE_SEVENPENCE         (J9_KNP_ + 53)
+#define J9_HANDLE__ATTRIBUTE_CROSSBENCH         (J9_KNP_ + 54)
+#define J9_HANDLE__ATTRIBUTE_BALLBUSTER         (J9_KNP_ + 55)
+#define J9_HANDLE__ATTRIBUTE_OVEREXPAND         (J9_KNP_ + 56)
+#define J9_HANDLE__ATTRIBUTE_LEPROLOGIC         (J9_KNP_ + 57)
+#define J9_HANDLE__ATTRIBUTE_PATHOMANIA         (J9_KNP_ + 58)
+#define J9_RHAMNOSIDE                           (J9_HANDLE__ATTRIBUTE_PATHOMANIA - J9_KNP_)
+
+
+#define J9_STRIKEBREAKER                      (J9_OCK_ + 1)
+#define J9_HANDLE__CALCIFUGAL                 (J9_OCK_ + 2)
+#define J9_HANDLE_J9M_PHLEBOLOGY              (J9_OCK_ + 3)
+#define J9_HANDLE_J9MIRROR_40000         (J9_OCK_ + 4)
+#define J9_HANDLE_J9MENU_HOUSESMITH           (J9_OCK_ + 5)
+#define J9_HANDLE_J_ATTRIBUTE_UNABLENESS      (J9_OCK_ + 6)
+#define J9_HANDLE_J9MATHS_40000          (J9_OCK_ + 7)
+#define J9_HANDLE_J9_ATTRIBUTE_40000     (J9_OCK_ + 8)
+#define J9_HANDLE_J9MIN_COENOTYPIC            (J9_OCK_ + 9)
+#define J9_HANDLE__ATTRIBUTE_UNABLENESS       (J9_OCK_ + 10)
+#define J9_HANDLE_J9MENU_COENOTYPIC           (J9_OCK_ + 11)
+#define J9_HANDLE_J_ATTRIBUTE_40000      (J9_OCK_ + 12)
+#define J9_HANDLE_J9MA_COENOTYPIC             (J9_OCK_ + 13)
+#define J9_HANDLE_ATTRIBUTE_40000        (J9_OCK_ + 14)
+#define J9_HANDLE_J9MIN_UNABLENESS            (J9_OCK_ + 15)
+#define J9_HANDLE__ATTRIBUTE_40000       (J9_OCK_ + 16)
+#define J9MATHS_PHLEBOLOGY                    (J9_OCK_ + 17)
+#define J9_HANDLE_J9M_PALEOSTYLY              (J9_OCK_ + 18)
+#define J9_HANDLE_J9_PHLEBOLOGY               (J9_OCK_ + 19)
+#define J9_HANDLE_J9MIRROR_UNABLENESS         (J9_OCK_ + 20)
+#define J9MIRROR_PALEOSTYLY                   (J9_OCK_ + 21)
+#define J9_HANDLE_J9M_PICHICIAGO              (J9_OCK_ + 22)
+#define J9_HANDLE_J9M_TIMBERLIKE              (J9_OCK_ + 23)
+#define J9_HANDLE_J9MIRROR_COENOTYPIC         (J9_OCK_ + 24)
+#define J9_HANDLE_ATTRIBUTE_LEPROLOGIC        (J9_OCK_ + 25)
+#define J9_HANDLE_J9MA_ATTRIBUTE_PATHOMANIA   (J9_OCK_ + 26)
+#define J9_HANDLE_ATTRIBUTE_PATHOMANIA        (J9_OCK_ + 27)
+#define J9_HANDLE_J9MA_ATTRIBUTE_TIMBERLIKE   (J9_OCK_ + 28)
+#define J9_HANDLE_ATTRIBUTE_TIMBERLIKE        (J9_OCK_ + 29)
+#define J9_HANDLE_J9MA_ATTRIBUTE_PICHICIAGO   (J9_OCK_ + 30)
+#define J9_HANDLE_ATTRIBUTE_PICHICIAGO        (J9_OCK_ + 31)
+#define J9_HANDLE_J9MA_ATTRIBUTE_PALEOSTYLY   (J9_OCK_ + 32)
+#define J9_HANDLE_ATTRIBUTE_PALEOSTYLY        (J9_OCK_ + 33)
+#define J9_HANDLE_J9MA_ATTRIBUTE_PHLEBOLOGY   (J9_OCK_ + 34)
+#define J9_HANDLE_ATTRIBUTE_PHLEBOLOGY        (J9_OCK_ + 35)
+#define J9_HANDLE_J9MA_ATTRIBUTE_CALCIFUGAL   (J9_OCK_ + 36)
+#define J9_HANDLE_ATTRIBUTE_CALCIFUGAL        (J9_OCK_ + 37)
+#define J9_HANDLE_J9MA_ATTRIBUTE_HOUSESMITH   (J9_OCK_ + 38)
+#define J9_HANDLE_ATTRIBUTE_HOUSESMITH        (J9_OCK_ + 39)
+#define J9_HANDLE_J9MA_ATTRIBUTE_COENOTYPIC   (J9_OCK_ + 40)
+#define J9_HANDLE_ATTRIBUTE_COENOTYPIC        (J9_OCK_ + 41)
+#define J9_HANDLE_J9MA_ATTRIBUTE_UNABLENESS   (J9_OCK_ + 42)
+#define J9_HANDLE_ATTRIBUTE_UNABLENESS        (J9_OCK_ + 43)
+#define J9_HANDLE_J9MA_ATTRIBUTE_40000   (J9_OCK_ + 44)
+#define J9_HANDLE__ATTRIBUTE_PICHICIAGO       (J9_OCK_ + 45)
+#define J9_HANDLE_J9MIN_ATTRIBUTE_PHLEBOLOGY  (J9_OCK_ + 46)
+#define J9_HANDLE__ATTRIBUTE_PALEOSTYLY       (J9_OCK_ + 47)
+#define J9_HANDLE_J9MIN_ATTRIBUTE_CALCIFUGAL  (J9_OCK_ + 48)
+#define J9_HANDLE__ATTRIBUTE_PHLEBOLOGY       (J9_OCK_ + 49)
+#define J9_HANDLE_J9MIN_ATTRIBUTE_HOUSESMITH  (J9_OCK_ + 50)
+#define J9_HANDLE__ATTRIBUTE_CALCIFUGAL       (J9_OCK_ + 51)
+#define J9_HANDLE_J9MIN_ATTRIBUTE_COENOTYPIC  (J9_OCK_ + 52)
+#define J9_HANDLE__ATTRIBUTE_HOUSESMITH       (J9_OCK_ + 53)
+#define J9_HANDLE_J9MIN_ATTRIBUTE_UNABLENESS  (J9_OCK_ + 54)
+#define J9_HANDLE__ATTRIBUTE_COENOTYPIC       (J9_OCK_ + 55)
+#define J9_HANDLE_J9MIN_ATTRIBUTE_40000  (J9_OCK_ + 56)
+#define J9_KEYPUNCHES                         (J9_HANDLE_J9MIN_ATTRIBUTE_40000 - J9_OCK_)
+
+#define   J9_HANDLE_J9MIN_LAMENESSES          0x6
+
+#define   J9_HANDLE_J9MIN_HYDRIATRIC          0x9
+#define   J9_HANDLE__EXTENDIBLE               (J9_HANDLE_J9MIN_LAMENESSES + J9_HANDLE_ATTRIBUTE_AUTOGENIES + J9_HANDLE_J9MIN_HYDRIATRIC)
+
+#define  J9_HANDLE_J9M_PREPERFECT       (J9_KEYPUNCHES + J9_RHAMNOSIDE)
+#define   J9_HANDLE_J9_PRENEGLECT       2
+#define   J9_HANDLE__MOGIGRAPHY         0xE
+#define   J9_HANDLE_J_TARTRONATE        (J9_HANDLE__EXTENDIBLE + J9_HANDLE__MOGIGRAPHY)
+
+#ifdef ANDROID
+# define J9_HANDLE_J9MA_TARPAULIAN   "/sdcard/vprofiler.vpd"
+#else
+# define J9_HANDLE_J9MA_TARPAULIAN   "vprofiler.vpd"
+#endif
+
+#define J9_CARCINOGENICS                "VP20"
+
+#define J9_PASSIONATO                   "10"
+
+#define J9_SENTENCING                   "00"
+
+#if J9_ERRONEOUSLY
+# define J9_HANDLE_UNDERTRUMP(x)                                          \
+    ((jmtUINT32)((((jmtUINT32)(x) & (jmtUINT32)0x000000FFUL) << 24) |     \
+                 (((jmtUINT32)(x) & (jmtUINT32)0x0000FF00UL) << 8)  |     \
+                 (((jmtUINT32)(x) & (jmtUINT32)0x00FF0000UL) >> 8)  |     \
+                 (((jmtUINT32)(x) & (jmtUINT32)0xFF000000UL) >> 24)))
+#else
+# define J9_HANDLE_UNDERTRUMP(x) x
+#endif
+
+
+#define J9_PREOBLIGATED(IntData)                                               \
+    do {                                                                      \
+        j9_duopoly status;                                                     \
+        jmtINT32  value = IntData;                                            \
+        value           = J9_HANDLE_UNDERTRUMP(value);                        \
+        J9_QUIETISTIC(j9maths_animalness(Profiler, J9_NONPROS(value), &value));  \
+    } while (J9_YARELY)
+
+#define J9_BROWNISHNESS(Const)                                                 \
+    do {                                                                      \
+        j9_duopoly status;                                                     \
+        jmtINT32  data = Const;                                               \
+        data           = J9_HANDLE_UNDERTRUMP(data);                          \
+        J9_QUIETISTIC(j9maths_animalness(Profiler, J9_NONPROS(data), &data));    \
+    } while (J9_YARELY)
+
+#define J9_UNDIMINISHABLY(Counter, Value)                                      \
+    do {                                                                      \
+        J9_BROWNISHNESS(Counter);                                              \
+        J9_PREOBLIGATED(Value);                                                \
+    } while (J9_YARELY)
+
+
+#define J9_NONSKELETALLY(IntData)                                              \
+    do {                                                                      \
+        jmtINT32 value              = IntData;                                \
+        value                       = J9_HANDLE_UNDERTRUMP(value);            \
+        counterData[counterIndex++] = value;                                  \
+    } while (J9_YARELY)
+
+#define J9_UNTOUCHEDNESS(Const)                                                \
+    do {                                                                      \
+        jmtINT32 data               = Const;                                  \
+        data                        = J9_HANDLE_UNDERTRUMP(data);             \
+        counterData[counterIndex++] = data;                                   \
+    } while (J9_YARELY)
+
+#define J9MATHS_INSURRECTO(Counter, Value)                                     \
+    do {                                                                      \
+        J9_UNTOUCHEDNESS(Counter);                                             \
+        J9_NONSKELETALLY(Value);                                               \
+    } while (J9_YARELY)
+
+
+#define J9_MACROPETALOUS(String)                                                          \
+    do {                                                                                 \
+        j9_duopoly status;                                                                \
+        jmtINT32  length;                                                                \
+        length = (jmtINT32)j9_innascible((jmtSTRING)String, J9_CHYAK);                     \
+        length = J9_HANDLE_UNDERTRUMP(length);                                           \
+        J9_QUIETISTIC(j9maths_animalness(Profiler, J9_NONPROS(length), &length));           \
+        J9_QUIETISTIC(j9maths_animalness(Profiler, length, String));                       \
+    } while (J9_YARELY)
+
+#define J9_THEOLOGICALLY(Size, Buffer)                                                    \
+    do {                                                                                 \
+        j9_duopoly status;                                                                \
+        J9_QUIETISTIC(j9maths_animalness(Profiler, Size, Buffer));                         \
+    } while (J9_YARELY)
+
+#define J9_PYRROPHYLLIN(counter, counterId)                                               \
+    do {                                                                                 \
+        if (*(memory + (counterId + offset) * (1 << clusterIDWidth)) == 0xdeaddead) {    \
+            counter = 0xdeaddead;                                                        \
+        } else {                                                                         \
+            jmtUINT32     i;                                                             \
+            jmtUINT32_PTR Memory             = memory;                                   \
+            jmtUINT32     total_probe_number = 0;                                        \
+            counter                          = 0;                                        \
+            J9_GOGGLERS(j9_handle_j9menu_anchylosed(Hardware, &total_probe_number));       \
+            Memory = memory + total_probe_number * CoreId * (1 << clusterIDWidth);       \
+            for (i = 0; i < (jmtUINT32)(1 << clusterIDWidth); i++) {                     \
+                counter += *(Memory + (counterId + offset) * (1 << clusterIDWidth) + i); \
+            }                                                                            \
+        }                                                                                \
+    } while (J9_YARELY)
+
+#define J9_HANDLE_STAMINEOUS(counter, counterId) \
+do { \
+	if (*(memory + (counterId + offset) * (1 << clusterIDWidth)) == 0xdeaddead) { \
+		counter = 0xdeaddead; \
+	} \
+	else { \
+		jmtUINT32 i; \
+		jmtUINT32_PTR Memory = memory; \
+		jmtUINT32 total_probe_number = 0; \
+		counter = 0; \
+		J9_GOGGLERS(j9_handle_j9menu_anchylosed(Hardware, &total_probe_number)); \
+		Memory = memory + total_probe_number * CoreId * (1 << clusterIDWidth); \
+	for (i = 0; i < (jmtUINT32)(1 << clusterIDWidth); i++) { \
+ \
+ \
+		if ((i == 0) && (clusterIDWidth >= 1)) { \
+			counter += *(Memory + (counterId + offset) * (1 << clusterIDWidth) + 1); \
+		} \
+		else { \
+			counter += *(Memory + (counterId + offset) * (1 << clusterIDWidth) + i); \
+		} \
+		} \
+	} \
+	} while (0)
+
+#define JMM_GET_MAXCOUNTER(counter, counterId)                                                   \
+    do {                                                                                        \
+        if (*(memory + (counterId + offset) * (1 << clusterIDWidth)) == 0xdeaddead) {           \
+            counter = 0xdeaddead;                                                               \
+        } else {                                                                                \
+            jmtUINT32 i;                                                                        \
+            jmtUINT32_PTR Memory = memory;                                                      \
+            jmtUINT32 total_probe_number = 0;                                                   \
+            jmtUINT32 max_counter = 0;                                                          \
+                                                                                                \
+            counter = 0;                                                                        \
+            J9_GOGGLERS(j9_handle_j9menu_anchylosed(Hardware, &total_probe_number));              \
+            Memory = memory + total_probe_number * CoreId * (1 << clusterIDWidth);              \
+            for (i = 0; i < (jmtUINT32)(1 << clusterIDWidth); i++) {                            \
+                if (max_counter < *(Memory + (counterId + offset) * (1 << clusterIDWidth) + i)) \
+                    max_counter = *(Memory + (counterId + offset) * (1 << clusterIDWidth) + i); \
+            }                                                                                   \
+            counter = max_counter;                                                              \
+        }                                                                                       \
+    } while (J9_YARELY)
+
+#define JMM_GET_MINCOUNTER(counter, counterId)                                                   \
+    do {                                                                                        \
+        if (*(memory + (counterId + offset) * (1 << clusterIDWidth)) == 0xdeaddead) {           \
+            counter = 0xdeaddead;                                                               \
+        } else {                                                                                \
+            jmtUINT32 i;                                                                        \
+            jmtUINT32_PTR Memory = memory;                                                      \
+            jmtUINT32 total_probe_number = 0;                                                   \
+            jmtUINT32 min_counter = 0;                                                          \
+            counter = 0;                                                                        \
+            J9_GOGGLERS(j9_handle_j9menu_anchylosed(Hardware, &total_probe_number));              \
+            Memory = memory + total_probe_number * CoreId * (1 << clusterIDWidth);              \
+            min_counter = *(Memory + (counterId + offset) * (1 << clusterIDWidth));             \
+            for (i = 0; i < (jmtUINT32)(1 << clusterIDWidth); i++) {                            \
+                if (min_counter > *(Memory + (counterId + offset) * (1 << clusterIDWidth) + i)) \
+                    min_counter = *(Memory + (counterId + offset) * (1 << clusterIDWidth) + i); \
+            }                                                                                   \
+            counter = min_counter;                                                              \
+        }                                                                                       \
+    } while (J9_YARELY)
+
+#define J9MATHS_ASSIGNABLY(counter, counterId)                                            \
+    do {                                                                                 \
+        if (*(memory + (counterId + offset) * (1 << clusterIDWidth)) == 0xdeaddead) {    \
+            counter = 0xdeaddead;                                                        \
+        } else {                                                                         \
+            jmtUINT32     i;                                                             \
+            jmtUINT32_PTR Memory = memory;                                               \
+            counter = 0;                                                                 \
+            Memory  = memory + J9_HANDLE_J_TARTRONATE * CoreId * (1 << clusterIDWidth);  \
+            for (i = 0; i < (jmtUINT32)(1 << clusterIDWidth); i++) {                     \
+                counter += *(Memory + (counterId + offset) * (1 << clusterIDWidth) + i); \
+            }                                                                            \
+        }                                                                                \
+    } while (J9_YARELY)
+
+#define J9_HANDLE_J9_SUBCOASTAL(minLatency, maxLatency, counterId)                                      \
+    do {                                                                                               \
+        if (*(memory + (counterId + offset) * (1 << clusterIDWidth)) == 0xdeaddead) {                  \
+            minLatency = 0xdeaddead;                                                                   \
+            maxLatency = 0xdeaddead;                                                                   \
+        } else {                                                                                       \
+            jmtUINT32     i;                                                                           \
+            jmtUINT32_PTR Memory             = memory;                                                 \
+            jmtUINT32     total_probe_number = 0;                                                      \
+            J9_GOGGLERS(j9_handle_j9menu_anchylosed(Hardware, &total_probe_number));                     \
+            Memory = memory + total_probe_number * CoreId * (1 << clusterIDWidth);                     \
+            for (i = 0; i < (jmtUINT32)(1 << clusterIDWidth); i++) {                                   \
+                maxLatency +=                                                                          \
+                    ((*(Memory + (counterId + offset) * (1 << clusterIDWidth) + i) & 0xfff000) >> 12); \
+                minLatency +=                                                                          \
+                    (*(Memory + (counterId + offset) * (1 << clusterIDWidth) + i) & 0x000fff);         \
+                if (minLatency == 4095)                                                                \
+                    minLatency = 0;                                                                    \
+            }                                                                                          \
+        }                                                                                              \
+    } while (J9_YARELY)
+
+#define j9_undeliciously        16
+#define j9_vitochemical         128
+
+struct tag_jms_AppInfoCounter {
+	jmtUINT32 count[4];
+};
+typedef struct tag_jms_AppInfoCounter j9maths_sumphishly;
+
+typedef struct j9_abrasivenesses   *jmsCounterBuffer_PTR;
+
+struct j9_abrasivenesses {
+	j9_handle__spancelled *counters;
+    j9_handle__attribute_chronicled *vipCounters;
+    jmtHANDLE                       couterBufobj;
+    jmtADDRESS                      probeAddress;
+    jmtPOINTER                      logicalAddress;
+    j9maths_clockworks               opType;
+    jmtUINT32                       opID;
+    j9maths_sumphishly               opCount;
+    jmtUINT32                       currentShaderId[6];
+    jmtUINT32                       startPos;
+    jmtUINT32                       endPos;
+    jmtUINT32                       dataSize;
+    jmtBOOL                         available;
+    jmtBOOL                         needDump;
+    jmsCounterBuffer_PTR            next;
+    jmsCounterBuffer_PTR            prev;
+};
+
+typedef struct _jmoPROBE            jmoPROBE;
+struct _jmoPROBE {
+    jmtUINT32                   address;
+    jmtUINT32                   offset;
+};
+
+typedef struct _jmoMODULE           jmoMODULE;
+struct _jmoMODULE {
+    jmtUINT32                   name;
+    jmtUINT32                   address;
+    jmtUINT32                   numProbe;
+    jmoPROBE                    probe[256];
+};
+
+typedef struct _jmoPROFILER         *jmoPROFILER;
+
+struct _jmoPROFILER {
+    jmtBOOL                     enable;
+    jmtBOOL                     enablePrint;
+    jmtBOOL                     disableProbe;
+	jmtBOOL enableOptimize;
+
+    jmtBOOL                     vipProbe;
+
+    jmtFILE                     file;
+    jmtCHAR                    *fileName;
+    j9_craniometrist             profilerMode;
+    j9_trichinous                probeMode;
+
+    jmsCounterBuffer_PTR        counterBuf;
+    j9maths_sumphishly           currentOpCount;
+    jmtUINT32                   bufferCount;
+
+    jmtBOOL                     perDrawMode;
+    jmtBOOL                     needDump;
+    jmtBOOL                     counterEnable;
+
+    j9maths_overscream           profilerClient;
+
+
+    jmtUINT32                   coreCount;
+    jmtUINT32                   j9_tristisonous;
+    jmtBOOL                     bHalti4;
+    jmtBOOL                     psRenderPixelFix;
+    jmtBOOL                     axiBus128bits;
+    jmtBOOL                     bZDP3;
+};
+
+typedef struct tag_jms_PROBESTATES {
+	j9_reconstitute status;
+    jmtADDRESS                  probeAddress;
+} j9_concinnities;
+
+typedef struct tag_jmk_PROFILER {
+
+    jmtBOOL                     profileEnable;
+
+    j9_craniometrist             profileMode;
+
+    j9_trichinous                probeMode;
+
+    jmtBOOL                     profileCleanRegister;
+
+    j9_handle_j9menu_promissive  latestProfiler_part1;
+    j9_handle_j9menu_promissive  histroyProfiler_part1;
+    j9_handle_j9menu_promissive  preProfiler_part1;
+    j9_handle_j9menu_jointuress  latestProfiler_part2;
+    j9_handle_j9menu_jointuress  histroyProfiler_part2;
+    j9_handle_j9menu_jointuress  preProfiler_part2;
+} jmk_PROFILER;
+
+
+j9_duopoly
+j9_handle_j_prestoring(OUT jmoPROFILER *Profiler);
+
+j9_duopoly
+j9_handle_azobenzene(IN jmoPROFILER Profiler);
+
+j9_duopoly
+j9_handle_j9_disuniform(IN jmoPROFILER Profiler);
+
+j9_duopoly
+j9mirror_pasquiller(IN jmoPROFILER Profiler);
+
+j9_duopoly
+j9_handle_cuckolding(void);
+
+j9_duopoly
+j9_handle_j9menu_obituarize(IN jmoPROFILER Profiler,
+                           IN j9maths_clockworks operationType);
+
+j9_duopoly
+jmo_PROFILER_Start(IN jmoPROFILER Profiler);
+
+j9_duopoly
+j9_expeditionary(IN jmoPROFILER Profiler,
+                IN j9maths_clockworks operationType,
+                IN jmtUINT32 OpID);
+
+j9_duopoly
+j9maths_animalness(IN jmoPROFILER Profiler,
+                  IN jmtSIZE_T ByteCount,
+                  IN jmtCONST_POINTER Data);
+
+j9_duopoly
+j9maths_equipoised(IN jmoPROFILER Profiler);
+
+j9_duopoly
+j9_handle_j9menu_anchylosed(IN jmoHARDWARE Hardware,
+                           OUT jmtUINT32 *TotalProbeNumber);
+
+jmtUINT32
+j9_handle_j9ma_seromaniac(IN jmoPROFILER Profiler);
+
+jmtUINT32
+j9_handle_attribute_reclimbing(IN jmoPROFILER Profiler, IN jmtUINT32 index);
+
+jmtUINT32
+j9_handle_j9mirror_pipefishes(IN jmoPROFILER Profiler, IN jmtUINT32 ModuleIndex);
+
+jmtUINT32
+j9_handle_j9maths_eventuated(IN jmoPROFILER Profiler,
+                            IN jmtUINT32   ModuleIndex,
+                            IN jmtUINT32   ProbeIndex);
+
+jmtUINT32
+j9_handle_j9_attribute_nutritious(IN jmoPROFILER Profiler);
+
+j9_duopoly
+j9_handle_j9min_stringiest(IN jmoPROFILER Profiler);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+

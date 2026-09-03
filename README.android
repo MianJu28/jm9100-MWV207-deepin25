@@ -1,0 +1,13 @@
+
+
+1、在内核源码中创建  drivers/gpu/drm/mwv207 目录
+2、将整个目录的文件复制到内核源码的 drivers/gpu/drm/mwv207/ 目录
+3、修改内核源码的 drivers/gpu/drm/Kconfig 文件，在文件中添加如下内容
+source "drivers/gpu/drm/mwv207/Kconfig"
+4、修改内核源的 drivers/gpu/drm/Makefile 文件，在文件中添加如下内容
+obj-$(CONFIG_DRM_MWV207)+= mwv207/
+5、进入内核源码  drivers/gpu/drm/ 目录，执行如下命令
+cp Makefile.android ./Makefile
+cp Kconfig.android ./Kconfig
+
+
