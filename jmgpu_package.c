@@ -44,6 +44,24 @@ module_param(fake_vblank, int, 0644);
 MODULE_PARM_DESC(fake_vblank, "use hw or sw to generate vblank, "\
 		 "0x0 - use interrupt, 0x1 - use software timer");
 
+/*
+ * 用户态 gamma ramp 归一化系数.
+ * X 专有驱动 (mwv207_drv.so) 的 gamma 下发存在固定缺陷: 实测所有请求的 ramp
+ * 都被统一缩小 3 倍 —— identity(亮度1.0) 下发 [0,21,42,64,85](=in/3),
+ * 亮度 0.5 下发 [0,11,21,32,43](=in/6), 即 out = in * brightness / 3.
+ * 该 ramp 经 atomic_flush 写入硬件 LUT 后造成整屏"蒙灰滤镜"(黑发灰/白不白),
+ * 且亮度/调节值只剩应有的 1/3.
+ * gamma_norm=3(默认): 写 LUT 前对 ramp 乘 3 归一化 -> 恒等请求恢复线性表
+ *   (灰滤镜消失), 亮度/gamma 调节同时恢复正常.
+ * gamma_norm=0: 完全跳过用户态 gamma (LUT 恒为 reset 时的线性表).
+ * gamma_norm=1: 原样写 LUT (厂商原始行为, 仅调试用).
+ */
+static int gamma_norm = 3;
+module_param(gamma_norm, int, 0644);
+MODULE_PARM_DESC(gamma_norm, "userspace gamma ramp normalization: 0=skip, "\
+		 "1=apply as-is, 3=compensate buggy userspace 1/3 scaling "\
+		 "(default)");
+
 typedef struct tag_jms_crtc {
 	struct drm_crtc base;
 	j9_weakliest *platform;
@@ -479,6 +497,7 @@ static s32 j9_handle__autoclasis(struct drm_crtc *crtc)
 {
 	j9_raced *jcrtc = j9_transmittance(crtc);
 	u32 i;
+	u32 ram;
 	u32 window_base;
 	u32 rgb;
 	u32 curPaletteRam;
@@ -501,37 +520,48 @@ static s32 j9_handle__autoclasis(struct drm_crtc *crtc)
 	value |= (1 << 31);
 	j9_resurrective(crtc, window_base + J9_GASTALDITE, value);
 
-	curPaletteRam = j9_tunnels(crtc, J9_HANDLE_J9_CELIOSCOPY);
-	for (rgb = 0; rgb < 3; rgb++) {
-		j9_garboils(crtc, J9_HANDLE_BESMUTTING, rgb);
-		pWriteData = data + rgb * 256;
-		j9_garboils(crtc, J9_HANDLE_J_CELIOSCOPY, 1);
-		udelay(2);
-		j9_garboils(crtc, J9_HANDLE_J_CELIOSCOPY, 0);
-		udelay(2);
-		mb();
-		for (i = 0; i < JMD_MWV207_PALETTE_MAX_NUM; i++) {
+	/* palette RAM 为双缓冲: 必须像开源栈 mwv207_va_lut_enable 一样把两块
+	 * RAM 全部写入. 原实现只写当前 active RAM 就把 active 切到另一块
+	 * (从未写过) -> 实际显示走的是那块 RAM 的上电默认内容, 而非线性表,
+	 * 造成整体低对比度(黑发灰/白不白). 每轮先重新读 active, 写完切换,
+	 * 两轮后 active 回到初始 RAM, 且两块内容均为 lutdata 线性表. */
+	for (ram = 0; ram < 2; ram++) {
+		curPaletteRam = j9_tunnels(crtc, J9_HANDLE_J9_CELIOSCOPY);
+		for (rgb = 0; rgb < 3; rgb++) {
+			j9_garboils(crtc, J9_HANDLE_BESMUTTING, rgb);
+			pWriteData = data + rgb * 256;
+			j9_garboils(crtc, J9_HANDLE_J_CELIOSCOPY, 1);
+			udelay(2);
+			j9_garboils(crtc, J9_HANDLE_J_CELIOSCOPY, 0);
+			udelay(2);
+			mb();
+			for (i = 0; i < JMD_MWV207_PALETTE_MAX_NUM; i++) {
 
-			if ((i % 10 == 0)
-					&& jmgpu_crtc_wait_lut_fifo(crtc)) {
+				if ((i % 10 == 0)
+						&& jmgpu_crtc_wait_lut_fifo(crtc)) {
+					DRM_ERROR("crtc_%u: lut fifo timeout writing ram %u rgb %u",
+						  jcrtc->crtc_chan, ram, rgb);
+					return -2;
+				}
+				mb();
+
+
+				value = (pWriteData[i / 4] << 2) | 0x03;
+				if (value > 1024 - 5)
+					value = 1024 - 5;
+
+				j9_garboils(crtc, J9_HANDLE_POSTLUDIUM, value);
+				mb();
+			}
+			if (jmgpu_crtc_wait_lut_fifo(crtc)) {
+				DRM_ERROR("crtc_%u: lut fifo drain timeout after ram %u rgb %u",
+					  jcrtc->crtc_chan, ram, rgb);
 				return -2;
 			}
 			mb();
-
-
-			value = (pWriteData[i / 4] << 2) | 0x03;
-			if (value > 1024 - 5)
-				value = 1024 - 5;
-
-			j9_garboils(crtc, J9_HANDLE_POSTLUDIUM, value);
-			mb();
 		}
-		if (jmgpu_crtc_wait_lut_fifo(crtc)) {
-			return -2;
-		}
-		mb();
+		j9_garboils(crtc, J9_HANDLE_J9_CELIOSCOPY, 1 - curPaletteRam);
 	}
-	j9_garboils(crtc, J9_HANDLE_J9_CELIOSCOPY, 1 - curPaletteRam);
 
 	return 0;
 }
@@ -562,7 +592,41 @@ static void j9_handle_attribute_chockstone(struct drm_crtc *crtc, struct drm_crt
 				jcrtc->lutdata[i + 512] =
 				    drm_color_lut_extract(lut[i].blue, 8);
 			}
-			j9_handle__autoclasis(crtc);
+			/* 诊断: 打印用户态(X 专有驱动)下发的原始 ramp 采样值.
+			 * 正常应为线性 0,63,128,192,255; 缺陷驱动为 1/3 缩放
+			 * 0,21,42,64,85, 由 gamma_norm=3 归一化补偿. */
+			DRM_INFO("crtc_%u gamma_lut updated: R[0,64,128,192,255]=%u,%u,%u,%u,%u G=%u,%u,%u,%u,%u B=%u,%u,%u,%u,%u\n",
+				 jcrtc->crtc_chan,
+				 jcrtc->lutdata[0], jcrtc->lutdata[64],
+				 jcrtc->lutdata[128], jcrtc->lutdata[192],
+				 jcrtc->lutdata[255],
+				 jcrtc->lutdata[256], jcrtc->lutdata[320],
+				 jcrtc->lutdata[384], jcrtc->lutdata[448],
+				 jcrtc->lutdata[511],
+				 jcrtc->lutdata[512], jcrtc->lutdata[576],
+				 jcrtc->lutdata[640], jcrtc->lutdata[704],
+				 jcrtc->lutdata[767]);
+			if (gamma_norm == 0) {
+				static bool skip_reported;
+				if (!skip_reported) {
+					DRM_INFO("jmgpu: gamma_norm=0, skip applying userspace gamma ramp (keep identity LUT)\n");
+					skip_reported = true;
+				}
+			} else {
+				if (gamma_norm > 1) {
+					/* 归一化: 补偿 X 专有驱动的 1/3 缩放缺陷.
+					 * 恒等 ramp 恢复线性(修灰滤镜), 用户
+					 * 亮度/gamma 调节按真实意图生效. */
+					for (i = 0; i < 3 * 256; i++) {
+						u32 v = (u32)jcrtc->lutdata[i]
+							* gamma_norm;
+						if (v > 255)
+							v = 255;
+						jcrtc->lutdata[i] = v;
+					}
+				}
+				j9_handle__autoclasis(crtc);
+			}
 		}
 	}
 }

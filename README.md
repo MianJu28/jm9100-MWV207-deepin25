@@ -8,9 +8,12 @@
 > 此前判定的"显示输出无信号（固有问题）"实为一次内核 API 迁移遗漏，
 > 根因与修复见 §3 路线 A「显示无信号根因与修复」，结论更新见 §4/§6。
 >
-> **遗留问题**：显示画面整体灰蒙蒙（黑不黑、白不白、色相正确），
-> 属 RGB 量化范围类症状；已排除 X 层、LUT 写入、CSC 数据路径、AVI 声明等，
-> 仍在排查，完整证据链与待验证方向见 **FIXLOG.md「问题 2」**。
+> **遗留问题（已解决 ✅ 2026-09-08）**：显示画面整体"蒙灰滤镜"已修复。
+> 根因：X 专有驱动 (mwv207_drv.so) 的 gamma 下发存在**固定 1/3 线性缩放缺陷**
+> （恒等请求也下发 in/3 的 ramp），原样写入 jmgpu 硬件 LUT 后造成整屏低对比度。
+> 修复：内核驱动新增 `gamma_norm` 参数（默认 3 = 写 LUT 前乘 3 归一化）——
+> 显示恢复正常且**系统亮度调节同步恢复可用**。诊断过程（含 initramfs 冻结
+> 旧模块的教训）与使用方法见 **FIXLOG.md「问题 2」修复 5/6**。
 
 ---
 
@@ -39,7 +42,7 @@
 
 | 内核驱动 | 来源 | 建 /dev/jmgpu | 显示 | GL | 视频硬解用户态 |
 |---|---|---|---|---|---|
-| **闭源 jmgpu.ko** | 景美闭源 1.7.0 | ✅ | ⚠️ 已点亮但偏灰 (见§3/FIXLOG 问题2) | ✅ | ✅ (H264/HEVC/VP9 VLD 实测) |
+| **闭源 jmgpu.ko** | 景美闭源 1.7.0 | ✅ | ✅ (灰滤镜已修, 见§3/§4/FIXLOG 问题2 修复6) | ✅ | ✅ (H264/HEVC/VP9 VLD 实测) |
 | **deepin mwv207.ko** | 开源系 (shanjinkui) | ❌ | ✅ | 软渲染(llvmpipe) | ❌ |
 | **Icenowy mwv207-dkms** | 社区开源 | ❌ | 设计支持 | (mesa) | ❌ 无用户态 |
 | **景美官方 6.6 mwv207** | openkylin 开源 | ❌ | 设计支持 | (mesa) | ❌ 无用户态 |
@@ -131,28 +134,28 @@ drm_mode_setcrtc → drm_atomic_commit → commit_tail
   校验和完全一致（像素正确）；4K30 x264 CPU 占用 user 1.617→0.143s（省约 91%），
   但吞吐不及 D2000 软解，价值主要在 CPU 卸载
 
-### 路线 A 附 2：「显示灰蒙蒙」—— 未解决（排查记录见 FIXLOG.md「问题 2」）
+### 路线 A 附 2：「显示灰蒙蒙」—— 已解决 ✅（排查记录见 FIXLOG.md「问题 2」修复 4/5/6）
 
-显示点亮后仍有画质问题：**整体低对比度，黑色发灰、白色不白，但色相完全正确**
-（照片证据见 FIXLOG 引用的两张图）；硬件鼠标光标色彩正常。
+显示点亮后曾有画质问题：**整体像蒙一层灰滤镜，黑色发灰、白色不白，但色相
+完全正确**（照片证据见 FIXLOG 引用的两张图）；硬件鼠标光标色彩正常。
 
-**定位结论**：灰在**内核输出层**——`color_bisect.sh` 实验 A 用 modetest 绕过 X
-直出彩条，观感同为灰，X / 专有驱动 `mwv207_drv.so` 已排除。
+**最终根因**（2026-09-08 定位）：X 专有驱动 `mwv207_drv.so` 的 gamma 下发存在
+**固定 1/3 线性缩放缺陷**（恒等请求也下发 `in/3` 的 ramp，实测采样
+`[0,21,42,64,85]`），经 atomic_flush 写入 jmgpu 硬件 LUT → 整屏低对比度。
+mwv207 开源栈的 X 不写 ramp，故同显示器正常。
 
-**已尝试无效**（详见 FIXLOG）：
-1. `rgb_limited_range` 条件化（full 直通 + FULL 声明）
-2. 清理 grub 残留 `video=`/`drm.edid_firmware=`（曾误入"Linux FHD"假 EDID，
-   清理后真 EDID 与 43 个模式恢复，色彩无变化）
-3. `virtual_display=0`（vdisplay 早退假设不成立）
-4. 数据恢复 CEA 默认 limited + 手写 AVI 量化范围声明 LIMITED
+**最终修复**：内核驱动 `gamma_norm` 参数（默认 3）在写 LUT 前对 ramp 乘 3
+归一化——灰滤镜消失，**系统亮度/gamma 调节同步恢复可用**。
+排查过程、initramfs 冻结旧模块导致的多次误判教训、参数使用方法，
+完整记录见 **FIXLOG.md「问题 2」修复 4/5/6**。
 
-**已排除**：X/专有驱动层、YCC 输出（输出恒 RGB888）、LUT fifo 写入超时、
-闭源 LUT 写入实现（与开源 `mwv207_va_lut_enable` 逐寄存器等价）、
-`lutdata` 初始化、reset 回调 LUT 写入路径、假 EDID。
-
-**待验证方向**（7 项，见 FIXLOG）：显示器 OSD Black Level、AVI infoframe
-是否实际发出、`HDMI_FC_GCP`、LUT 硬件实际值 dump、VP remap/stuffing、
-与 mwv207 开源栈逐寄存器对比、CSC 时钟/flow-control 是否真正 bypass。
+**早期排查记录**（供参考，部分结论后被修正）：
+1. `rgb_limited_range` 条件化（full 直通 + FULL 声明）——无效
+2. 清理 grub 残留 `video=`/`drm.edid_firmware=`——无效
+3. `virtual_display=0`——无效
+4. 数据恢复 CEA 默认 limited + 手写 AVI 量化范围声明 LIMITED——无效
+   （终局认知：灰与 RGB 量化范围/AVI 声明无关，两栈 HDMI 域寄存器完全一致；
+   早期"modetest 直出彩条仍灰"是被 X 已写入的暗化 LUT 遗留污染所致）
 
 ### 路线 B：Icenowy 社区开源 mwv207-dkms
 
@@ -195,7 +198,7 @@ deepin 多媒体(VA-API)接不上；且与 deepin 自带 mwv207 同源同名，�
 ```
                  ┌────────────────────────────────────┐
   单卡全功能     │  闭源 jmgpu 内核 (1.7.0 + 本仓库补丁) │
-  (修复后)       │  显示 ⚠️(点亮但偏灰) GL ✅ 硬解 ✅  │
+  (修复后)       │  显示 ✅ GL ✅ 硬解 ✅              │
                  │  /dev/jmgpu + /dev/dri/card0        │
                  └────────────────────────────────────┘
 ```
@@ -221,10 +224,13 @@ deepin 多媒体(VA-API)接不上；且与 deepin 自带 mwv207 同源同名，�
 |---|---|
 | git 基线 `13de34c` | 闭源 jmgpu 1.7.0 移植到 6.6.143 的完整源码 |
 | git 提交（SCDC 修复） | `jmgpu_nicely.c` 三处修复：`connector.ddc` 同步、8 处调用换 `jmgpu_scdc_*`、函数移出 `<4.12` 条件块（见 §3 路线 A） |
-| `sync_dkms.sh` | 同步源码到 DKMS 并 rebuild |
+| `sync_dkms.sh` | 同步源码到 DKMS 并 build+install+update-initramfs（一条龙） |
 | `force_mode_test.sh` | 方案1 强制点屏验证（live 诊断/boot 持久化/boot-undo 回滚，SSH 可控自动回退） |
 | `color_bisect.sh` | 灰蒙蒙二分实验（A: modetest 彩条判定内核输出层 / B: modesetting 独立 X 判定 X 层） |
-| `FIXLOG.md` | **修复记录**：SCDC 无信号根因修复（已解决）+ 灰蒙蒙问题排查（证据链/已尝试/待验证方向） |
+| `dump_display_regs.sh` | 显示关键寄存器 dump（VA/LUT/HDMI，两栈对比定位用） |
+| `dump_full_regs.sh` | 显示域全量寄存器 dump（VA 0x990000-0x9907FF + TOP + HDMI，深度排查） |
+| `fix_win_contrast.sh` | WIN_CONTRAST(0x990038) 寄存器写回（诊断工具） |
+| `FIXLOG.md` | **修复记录**：SCDC 无信号修复 ✅ + 灰蒙蒙问题（修复 4 双 RAM / 修复 5 应急 / 修复 6 归一化 ✅，含 initramfs 教训与 gamma_norm 使用方法） |
 | `verify_jmgpu_probe*.sh` | 真机 probe 验证脚本（SSH 可控，自动回退） |
 | `check_jmgpu_display.sh` | DRM connector/mode/EDID 预检 |
 | `diag_jmgpu_fail.sh` | 干净 dmesg 失败诊断 |
@@ -245,14 +251,18 @@ deepin 多媒体(VA-API)接不上；且与 deepin 自带 mwv207 同源同名，�
 ## 6. 结论与后续建议
 
 **软件层正解已达成**：本仓库补丁版闭源 jmgpu 1.7.0 在 Deepin 25 / 6.6.143 上
-**显示点亮 + GL + VA-API 硬解全功能可用**，无需 UOS（画质问题见下）。
+**显示（无灰滤镜）+ GL + VA-API 硬解全功能可用**，无需 UOS。
 
 后续建议：
-0. **灰蒙蒙画质问题（当前首要）**：已定位内核输出层、排除 6 类嫌疑、试过 4 种方案，
-   下一步按 FIXLOG.md「问题 2」的 7 个待验证方向推进（首选显示器 OSD Black Level
-   验证 + AVI infoframe 是否实际发出）。不解决也不影响功能使用。
+0. ~~**灰蒙蒙画质问题（当前首要）**~~ **已解决 ✅（2026-09-08）**：根因为 X 专有
+   驱动 gamma 下发的固定 1/3 缩放缺陷，内核侧 `gamma_norm=3` 归一化修复，
+   系统亮度调节同步恢复；完整记录与使用方法见 FIXLOG.md「问题 2」修复 5/6。
+   若需向景美反馈：X 驱动 `jmgpuDrmModeSetupColorMap`/gamma 路径的 1/3 缩放
+   （dmesg 采样日志 `gamma_lut updated` 可作证据）。
 1. **保持本仓库栈**：DKMS 已装补丁版 `jmgpu.ko`；持久化 = `force_mode_test.sh boot`
-   （blacklist mwv207 + modules-load 强制加载 jmgpu）。回滚 = `boot-undo`
+   （blacklist mwv207 + modules-load 强制加载 jmgpu）。回滚 = `boot-undo`。
+   **改驱动源码后部署：`./sync_dkms.sh build`（已含 install + update-initramfs）
+   再重启**——跳过 update-initramfs 会导致重启仍加载 initramfs 冻结的旧模块。
 2. **向景美/deepin/飞腾反馈**：附本 README §3 路线 A 的 SCDC 根因与三处修复——
    同源代码在 UOS 之外的所有 6.x 内核上应有同样问题，补丁可直接回给厂商
 3. **播放器接入硬解**：应用层用 `LIBVA_DRIVER_NAME=jmgpu`（VA-API 已报
@@ -260,3 +270,95 @@ deepin 多媒体(VA-API)接不上；且与 deepin 自带 mwv207 同源同名，�
    `-vaapi_device /dev/dri/renderD128`
 4. （可选）若未来想走纯开源路线：Icenowy/官方 6.6 内核显示可用但解码用户态
    仍缺失，需自写 VA driver 对接 `pipe_dec`，工作量大，现阶段无必要
+
+---
+
+## 7. 使用方法
+
+### 7.1 驱动部署 / 持久化 / 回滚
+
+```bash
+# 当前栈检查：应只见 jmgpu
+lsmod | grep -E 'jmgpu|mwv207'
+
+# jmgpu 接管持久化（blacklist mwv207 进 initramfs + modules-load 强制加载）
+sudo ./force_mode_test.sh boot && sudo reboot
+
+# 回滚到 deepin mwv207 开源栈
+sudo ./force_mode_test.sh boot-undo && sudo reboot
+```
+
+### 7.2 修改驱动源码后的标准部署流程
+
+```bash
+./sync_dkms.sh build    # = 同步源码 + dkms build --force + install --force
+                        #   + update-initramfs -u（一条龙，缺一不可）
+sudo reboot
+```
+
+**红线**：`dkms install` 后**必须重建 initramfs 再重启**——开机早期
+modules-load 加载的是 initramfs 冻结的模块副本，否则新代码永远不生效。
+验证新模块确实在跑：
+
+```bash
+cat /sys/module/jmgpu/srcversion                                          # 运行中模块指纹
+modinfo -F srcversion /lib/modules/$(uname -r)/updates/dkms/jmgpu.ko      # 磁盘模块指纹
+# 两者一致 = 新模块已生效；不一致 = 加载的是 initramfs 冻结的旧模块
+```
+
+### 7.3 显示色彩：`gamma_norm` 参数（灰滤镜修复）
+
+X 专有驱动 `mwv207_drv.so` 的 gamma 下发有固定 1/3 线性缩放缺陷
+（恒等请求也下发 `in/3` ramp），内核默认乘 3 归一化补偿：
+
+```bash
+# 查看当前模式（默认 3）
+cat /sys/module/jmgpu/parameters/gamma_norm
+
+# 运行时切换（立即生效，无需重启）
+echo 3 | sudo tee /sys/module/jmgpu/parameters/gamma_norm  # 3 = 归一化（正常，默认）
+echo 0 | sudo tee /sys/module/jmgpu/parameters/gamma_norm  # 0 = 跳过用户态 gamma（应急）
+echo 1 | sudo tee /sys/module/jmgpu/parameters/gamma_norm  # 1 = 原样写（复现缺陷/调试）
+
+# 开机固定（可选）：写入 /etc/modprobe.d/jmgpu-gamma.conf
+#   options jmgpu gamma_norm=3
+```
+
+| 模式 | 效果 |
+|---|---|
+| `gamma_norm=3`（默认） | 画面正常无灰滤镜，系统设置→显示→亮度滑条可用 |
+| `gamma_norm=0` | LUT 恒为线性表（画面正常），亮度调节失效（应急用） |
+| `gamma_norm=1` | 复现 X 驱动缺陷：整屏蒙灰、亮度只有应有值的 1/3 |
+
+诊断：`sudo dmesg | grep "gamma_lut updated"` —— 打印 X 驱动每次下发的
+ramp 采样值（正常应为线性 `0,63,128,192,255`；缺陷形态为 `0,21,42,64,85`）。
+
+### 7.4 视频硬解（VA-API）
+
+```bash
+# Profile 查询
+LIBVA_DRIVER_NAME=jmgpu vainfo
+
+# mpv（x11 会话自动回落 vaapi-copy，日志可见 Trying hardware decoding）
+LIBVA_DRIVER_NAME=jmgpu mpv --hwdec=auto /path/video.mp4
+
+# ffmpeg 校验硬解输出（与软解 md5 一致 = 像素正确）
+ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i in.mp4 -f rawvideo \
+    -pix_fmt nv12 - | md5sum
+```
+
+### 7.5 显示诊断工具
+
+```bash
+# 关键寄存器 dump（VA/LUT/HDMI 域）
+sudo ./dump_display_regs.sh -o /tmp/reg.txt
+
+# 显示域全量 dump（VA 0x990000-0x9907FF + TOP + HDMI）
+sudo ./dump_full_regs.sh -o /tmp/full.txt
+
+# WIN_CONTRAST 寄存器写回（诊断）
+sudo ./fix_win_contrast.sh f0
+
+# modetest 查 connector（注意：本栈 modetest 直亮彩条点不亮，属已知问题，勿当故障）
+modetest -D /dev/dri/card0 -c
+```

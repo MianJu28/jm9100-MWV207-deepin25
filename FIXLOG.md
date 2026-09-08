@@ -2,7 +2,12 @@
 
 > 本文档记录对闭源 jmgpu 1.7.0 内核驱动（移植到 6.6.143）的修复过程与排查记录。
 > 配套：README.md（整体探索记录）、`force_mode_test.sh`（强制点屏/持久化）、
-> `color_bisect.sh`（色彩二分实验）。
+> `color_bisect.sh`（色彩二分实验）、`dump_display_regs.sh`/`dump_full_regs.sh`
+> （寄存器 dump 对比）、`fix_win_contrast.sh`（LUT 相关键写回，诊断用）。
+>
+> **2026-09-08 状态**：问题 2（灰蒙蒙）已解决——X 专有驱动 gamma 下发的 1/3
+> 缩放缺陷，内核 `gamma_norm=3` 归一化修复（见修复 5/6）。改驱动后的部署必须
+> `./sync_dkms.sh build`（含 update-initramfs，否则 initramfs 冻结旧模块）。
 
 ---
 
@@ -45,7 +50,7 @@ drm_mode_setcrtc → drm_atomic_commit → commit_tail
 
 ---
 
-## 问题 2：显示灰蒙蒙（低对比度）—— 未解决 ⚠️（排查记录）
+## 问题 2：显示灰蒙蒙（低对比度）—— 已解决 ✅（2026-09-08，修复 4/5/6）
 
 ### 症状（照片证据：IMG_20260903_155328.jpg / IMG_20260903_165113.jpg）
 - jmgpu 栈下任意内容（桌面 / X / modetest 彩条）整体低对比度：
@@ -95,6 +100,153 @@ drm_mode_setcrtc → drm_atomic_commit → commit_tail
    找出两栈驱动行为差异
 7. **CSC 时钟/flow-control**：`j9_homography()==false` 时 `CSCCLK disable +
    FEED_THROUGH_OFF_CSC_BYPASS` 是否真正生效
+
+### 修复 4（2026-09-07）：LUT 双 palette RAM 只写一块就切换 —— 已修复，待真机验证 🔧
+
+**排查方法**：FIXLOG 待验证方向 6（与开源栈逐寄存器对比）。开源参考：
+`mwv207-dkms/dc/`（Icenowy）与 `jm9100-oh`（官方 6.6 patch），本仓库副本
+`/home/admin/Desktop/Git/`。
+
+**对比结论**：HDMI TX 域两栈**逐寄存器等价**（CSC 系数/scale、AVICONF0-3+VIC+bar、
+VSIF enable 序列 0x10B3/10B4/10B5、无 GCP、VP packetize、MC_CLKDIS/FLOWCTRL 分支、
+preamble 0x0B/0x16/0x21）；DC/VA 域也等价（timing 0x400-0x420、primary plane
+0x430/434/438/43C/4F8、BACK_PROCESS_MODE 0x2A0 的 enable-RMW/disable-写 2 序列、
+WIN_CONTRAST 0x38 公式 `lutdata[384]*15/8|bit31`、lutdata 线性初始化、
+`drm_crtc_enable_color_mgmt`）。
+
+**唯一实质差异**（对比 `jmgpu_package.c:j9_handle__autoclasis` 与
+`mwv207_va.c:mwv207_va_lut_enable`）：
+palette RAM 是**双缓冲**，开源**两块都写**（`for (ram = 0; ram < 2; ram++)`，
+每轮重新读 0x440 当前 active，写完切 `1-active`），两轮后 active 回到初始块且
+两块内容均为线性表；闭源**只写当前 active 块，随即把 active 切到另一块
+（从未写过）** —— 实际显示采样的是那块 RAM 的**上电默认内容**，而非 lutdata。
+
+**症状吻合度**：
+- LUT 只作用于 primary surface，硬件光标 plane 直通 → 光标色彩正常 ✅
+- modetest/X 都不触发第二次 LUT 写入（`color_mgmt_changed && gamma_lut`）→ 恒灰 ✅
+- mwv207 栈两块都写 → 与默认内容无关 → 正常 ✅
+- 冷启动后稳定复现（RAM1 每次上电都是同一默认表）✅
+
+**修复**（`jmgpu_package.c`）：`j9_handle__autoclasis` 改为与开源一致的双 RAM
+循环；同时为 fifo 超时失败路径（原 `return -2` 静默，方向 4）补 `DRM_ERROR` 日志。
+`sync_dkms.sh build` + `dkms install --force` 编译签名通过。
+
+**验证步骤**：`reboot`（或卸载重载 jmgpu）后观感对比；若仍灰，用
+`dump_display_regs.sh` 在两栈各 dump 一份寄存器 diff（重点 0x440/0x450/0x460、
+HDMI 0x4001/0x4004/0x4100-0x411B/AVI 区）。
+
+**若无效的后续方向**：显示器 OSD Black Level 验证（方向 1）、两栈寄存器全量
+diff（方向 6，脚本已备）、AVI infoframe 抓包（HDMI 分析仪/电视串口）。
+
+---
+
+### 修复 5（2026-09-08）：根因确认 —— X 专有驱动的非恒等 gamma ramp 污染硬件 LUT ✅
+
+> 注：本修复（`gamma_support=off` 应急跳过）后被修复 6 的归一化方案取代；
+> 本节的价值在根因定位过程与诊断方法。
+
+**排查方法**：`dump_display_regs.sh` 两栈寄存器对比（jmgpu vs mwv207，同机切换）。
+
+**证据链**：
+1. **HDMI TX 域两栈逐寄存器完全一致**（VP/AVI/CSC 系数/MC_CLKDIS/MC_FLOWCTRL，
+   diff 为空）→ FIXLOG 方向 2/3/5/7 全部排除，TX 侧无嫌疑。
+2. VA/DC 域唯一实质差异：`WIN_CONTRAST`(0x990038, 公式 `lutdata[384]*15/8|bit31`)
+   —— mwv207 栈 `0x800000F1`（lutdata[384]≈128，线性恒等表）；
+   jmgpu 栈 `0x8000004E`（lutdata[384]≈42，**严重暗化的非恒等表**）。
+3. LUT 写入路径只有两条：crtc reset（写线性表）与 atomic_flush 的
+   `gamma_lut` 提交（写用户态 ramp）→ 非恒等表必来自用户态 gamma。
+4. 链路实锤：`xrandr --output HDMI-1 --gamma 0.3:0.3:0.3` 下发后 LUT 寄存器
+   **立即变化**（CONTRAST 0x4E→0x01，fifo 末端 data 7）；而 identity 请求
+   (`--gamma 1:1:1`) 后 CONTRAST 仍 0x4E —— **X 专有驱动 (mwv207_drv.so，
+   内含 xf86SetGamma) 即使收到恒等 gamma 请求，下发给内核的 ramp 也非恒等**。
+
+**结论**：X 专有驱动的 gamma/ramp 处理缺陷 → 每次桌面启动都把暗化曲线写进
+jmgpu 硬件 LUT → 整体低对比度（黑发灰/白不白/色相正确）。mwv207 开源栈的
+X 不写 ramp → 正常。历史"modetest 彩条仍灰"（实验 A）是被 X 遗留 ramp 污染
+的误判（modetest 场景 gamma_lut=NULL，驱动不重写 LUT，污染持续存在）。
+修复 4（LUT 双 palette RAM）虽非本症状根因，但仍是与开源栈的真实行为差异，
+修复保留。
+
+**修复**（`jmgpu_package.c`，**已被修复 6 的 `gamma_norm` 方案取代**）：
+- 新增模块参数 `gamma_support`（默认 off）：跳过用户态 gamma ramp 写入硬件
+  LUT，保持 crtc reset 时写入的双 RAM 线性表；副作用是亮度调节失效，
+  由修复 6 的三态归一化方案替代。
+- 保留 gamma_lut 采样日志（DRM_INFO，含 R/G/B 通道 5 点采样），可随时从
+  dmesg 观察 X 专有驱动实际下发的 ramp 内容，供向厂商反馈——正是该日志
+  在修复 6 中揭示了 1/3 缩放缺陷。
+
+**验证步骤**（SSH）：
+```
+sudo reboot        # 或停 X 后 rmmod jmgpu && modprobe jmgpu
+# 桌面对比度应恢复正常
+sudo dmesg | grep -E "gamma_lut updated|identity LUT"   # 观察根因证据
+```
+
+**遗留观察**：modetest -D 直亮（`-s 41:1920x1080`）在 jmgpu 栈点不亮（卡屏），
+mwv207 栈同样未成功（两次"无彩条"），原因待查（疑 mode 选择/时序，与色彩
+问题无关，桌面显示不受影响）；两栈 modetest 自动选模式时序亦不同
+（jmgpu htotal=2080/vtotal=1100 vs mwv207 2200/1125），后续如需复测寄存器
+对比需改用显式 mode 参数或抓 modetest.log。
+
+---
+
+### 修复 6（2026-09-08）：最终修复 —— X 驱动 1/3 缩放缺陷 + `gamma_norm` 归一化 ✅（已实测）
+
+**诊断日志立功**：修复 5 的 gamma_lut 采样日志（新模块生效后）直接揭示了
+X 专有驱动 ramp 的精确形态：
+
+| 用户请求 | X 驱动下发的 ramp（R=G=B，采样 [0,64,128,192,255]） | 实际含义 |
+|---|---|---|
+| 亮度 1.0（恒等） | `0,21,42,64,85` | = in × **1/3**（85=255/3） |
+| 亮度 0.5 | `0,11,21,32,43` | = in × **0.5/3** |
+
+→ **X 驱动 (`jmgpuDrmModeSetupColorMap`/gamma ioctl 路径) 对所有 ramp 统一
+做了 1/3 线性缩放**：`out = in × brightness / 3`。原样写 LUT 的后果：
+1. 恒等请求变暗化表 → 整屏"蒙灰滤镜"（黑发灰/白不白/色相与灰阶层次保留）；
+2. 亮度/对比度调节值只剩应有的 1/3。
+
+**最终修复**（`jmgpu_package.c`）：`gamma_support` 布尔参数改为三态
+**`gamma_norm`**（int，0644，默认 **3**）：
+
+| `gamma_norm` | 行为 | 用途 |
+|---|---|---|
+| **3（默认）** | 写 LUT 前 ramp **乘 3 归一化**（clamp 255） | 恒等请求恢复线性表（灰滤镜消失），亮度/gamma 滑条按真实意图生效 ✅ |
+| 0 | 完全跳过用户态 gamma（LUT 恒为 reset 线性表） | 应急（亮度调节失效） |
+| 1 | 原样写（厂商原始行为） | 复现缺陷/调试 |
+
+验证：重启后系统亮度滑条平滑可用、画面无灰滤镜；WIN_CONTRAST 随归一化
+自动恢复 0x800000F0（lutdata[384]=128 → 128×15/8=240）。
+
+**过程教训（重要，供以后所有 dkms 修复参考）**：
+1. **`dkms install` 后必须 `update-initramfs -u` 再重启**。`force_mode_test.sh
+   boot` 时代建的 initramfs 冻结了旧版 `jmgpu.ko`，开机早期 modules-load
+   直接加载冻结副本，真实根上的新模块永远轮不上——期间多次"修复无效"的
+   反馈均因此误判（包括把 WIN_CONTRAST 红鲱鱼当根因、误推 X 直写 MMIO）。
+2. **验证运行中模块身份用 srcversion**：
+   `cat /sys/module/jmgpu/srcversion` vs `modinfo -F srcversion jmgpu`，
+   不一致即加载的不是磁盘上的模块。
+3. `sync_dkms.sh build` 现已自动执行 `update-initramfs -u`。
+
+**使用方法**（`gamma_norm` 参数）：
+```bash
+# 查看当前值（默认 3）
+cat /sys/module/jmgpu/parameters/gamma_norm
+# 运行时切换（无需重启；0/1/3 见上表）
+echo 0 | sudo tee /sys/module/jmgpu/parameters/gamma_norm
+# 开机固定：/etc/modprobe.d/jmgpu-gamma.conf
+#   options jmgpu gamma_norm=3
+```
+亮度调节：deepin 系统设置 → 显示 → 亮度滑条，正常可用（经 gamma_norm=3
+归一化）。诊断：
+```bash
+sudo dmesg | grep "gamma_lut updated"    # X 驱动原始 ramp 采样
+```
+
+**附带工具**（本次排查沉淀，保留在仓库）：
+- `dump_display_regs.sh` / `dump_full_regs.sh`：显示域寄存器 dump（两栈对比）
+- `fix_win_contrast.sh`：WIN_CONTRAST 寄存器写回（诊断用）
+
+---
 
 ### 复现与恢复
 - 复现：jmgpu 栈下任意显示内容均灰（modetest / X / 桌面一致）
