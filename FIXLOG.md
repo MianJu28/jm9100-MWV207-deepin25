@@ -296,3 +296,113 @@ sudo dmesg | grep "gamma_lut updated"    # X 驱动原始 ramp 采样
 - H.264 10bit / HEVC Main10（vainfo 报了 Main10 profile，未测真实 10bit 片源）
 - 复杂/高码率真实片源的吞吐对比（当前仅为合成低复杂度片）
 - `vaapi` 零拷贝后端（`--vo=vaapi`/`vaapi-drm`）——需在无 X 或匹配 VO 下验证
+
+---
+
+## 修复 7：VA 直通 dmabuf 导出链（mmap / map_dma_buf / 导出尺寸）—— 已编译部署，待重启验证 🔄
+
+### 背景（purelive 仓库 `docs/LINUX_JM9100_HWDECODE_AUDIT.md` §10，P6）
+
+mpv `hwdec=vaapi`（直通，VA surface 经 dmabuf 交给 GL）在应用同款环境
+（`LIBGL_ALWAYS_SOFTWARE=1` + Mesa EGL + `LIBVA_DRIVER_NAME=jmgpu`）下：
+
+```
+Using hardware decoding (vaapi).
+VO: [gpu] 1920x1080 vaapi[nv12]
+dmabuf import failed to mmap: Invalid argument × 3 → 段错误 exit=139
+```
+
+`Using hardware decoding (vaapi)` 说明解码与 VA 互操作已建立；失败点是
+**importer 对导出 dmabuf 的 mmap**。该消息位于 Mesa `libgallium`（llvmpipe 的
+dmabuf import 需要线性 CPU 映射，`LIBGL_ALWAYS_SOFTWARE=1` 下 GL 端即 llvmpipe），
+底层是内核 `dma_buf_mmap()` 返回 `-EINVAL`。内核侧无任何日志（失败路径无打印）。
+
+### 根因（jmgpu dmabuf 导出链三处缺陷，均在 VIDMEM → reserved-mem 池路径）
+
+| # | 位置 | 缺陷 |
+|---|---|---|
+| 1 | `jmgpu_setlayout.c` `j9_pathopsychosis`（reserved-mem `.Mmap`） | 池 mdl `cpuAccessible=FALSE`（exclusive 池注册如此，见 `jmgpu_scroll.c:2634`）时直接返回 `-13` → dmabuf mmap 一律 `-EINVAL`。但 VRAM 背后是 PCIe BAR 设备内存，物理上始终 CPU 可映射；该标志只表达"驱动自己不经 CPU 访问" |
+| 2 | `jmgpu_bullets.c` `jmkVIDMEM_NODE_Export` | 导出 dmabuf 尺寸 `bytes & ~(PAGE_SIZE-1)` **向下**页对齐；VIDMEM 节点按 64 字节粒度分配（非页对齐），导致 dmabuf 尺寸小于 VA 驱动声明的 surface 尺寸 → importer mmap 触发 `dma_buf_mmap()` 的范围检查 `-EINVAL` |
+| 3 | `jmgpu_setlayout.c:420` `j9mirror_choriomata`（reserved-mem `.GetSGT`） | 空桩，永远返回 `-13` → `j9_cibarious`（`.map_dma_buf`）失败后**返回 NULL sg_table**；dma-buf 框架/importer 约定失败必须返回 `ERR_PTR`，NULL 会被解引用（潜在内核 oops） |
+
+### 修复
+
+1. `j9_pathopsychosis`：删除 `!cpuAccessible` 拒绝分支，统一 `remap_pfn_range`
+   （BAR 显存始终 CPU 可映射），非 CPU 可访问池打限流警告；
+2. `jmkVIDMEM_NODE_Export`：导出尺寸改 `PAGE_ALIGN()`（向上对齐），尾部仍在
+   VRAM 池内，映射安全；
+3. `j9_cibarious`：SGT 缺失时返回 `ERR_PTR(-EINVAL)` 并限流告警（不再返回 NULL）；
+4. `j9_forefence`：mmap 失败时限流输出内核诊断日志（status/dmabuf_size/pgoff/pages），
+   便于后续定位。
+
+> 说明：reserved-mem 的 `GetSGT` 空桩**未**实现（PCIe BAR 区域无 `struct page`，
+> 正确实现需厂商按设备内存语义提供）——llvmpipe 纯 mmap import 不依赖它，故不阻断
+> 本修复；真实 DMA 设备 importer 仍需厂商补齐。
+
+### 部署与验证状态
+- `./sync_dkms.sh build` 编译安装成功，`update-initramfs -u` 已重跑（首次 plymouth
+  hook 段错误为偶发，重试通过）
+- 2026-09-09 已重启加载，验证通过（见下）
+- 重启后验证：
+  1. `LIBGL_ALWAYS_SOFTWARE=1 __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json LIBVA_DRIVER_NAME=jmgpu mpv --vo=gpu --gpu-context=x11egl --hwdec=vaapi --frames=200 /tmp/hwtest_1080p.mp4` → 期望 exit=0、`hwdec-current=vaapi`、无 `dmabuf import failed to mmap`
+  2. `dmesg | grep jmgpu` 观察残留限流告警（`map_dma_buf failed` 出现即 GetSGT 仍为阻断点）
+  3. 应用内 `hwdec=auto` 复测（直通恢复后按 §7.2 复测整机 CPU）
+
+### 运行态验证（2026-09-09 重启后）
+
+- `dmesg` 命中修复 1 的限流日志 `dmabuf mmap on pool marked non-CPU-accessible`：
+  VA surface 确实分配在 exclusive 池（cpuAccessible=FALSE），修复 1 精确命中根因；
+  无 `dmabuf mmap failed`、无 `map_dma_buf failed` 日志。
+- 行为变化（详见 purelive 仓库审计文档 §10.5/10.6）：Mesa(llvmpipe) EGL + `auto`
+  时 direct 被选中，跨驱动（Jingjia VA 到 llvmpipe mmap 采样）整机 CPU 672%，
+  性能灾难不可用；Jingjia EGL + `auto` 时 direct 仍被 mpv 拒绝（P6）回落 copy 66.7%。
+
+
+### 加固（同日追加）
+
+导出尺寸向上页对齐后，池尾节点的对齐尾部可能越过池末尾，补充两处防御：
+1. `jmkVIDMEM_NODE_Export`：导出尺寸 clamp 到「池大小 - 节点偏移」（页对齐）；
+2. `j9_forefence`：`skipPages + numPages` 超过池页数时拒绝并限流告警，避免
+   `remap_pfn_range` 映射到无效 bus 地址（访问即总线错误）。
+
+已重编部署（模块 12:10、initramfs 12:16），再次重启后生效。
+
+### P6 收尾：mpv 组件补丁（本仓库留档 `mpv_dmabuf_oes_image.patch`）
+
+Jingjia desktop GL 只声明 `GL_OES_EGL_image` 且忽略 GLES context 请求，mpv
+desktop 分支要求的 `GL_EXT_EGL_image_storage` 缺失，direct 被拒（P6）。
+OES_EGL_image 在 desktop context 上的 dmabuf import 经最小验证程序实测可用。
+mpv 补丁（`video/out/hwdec/dmabuf_interop_gl.c`）：
+1. 扩展检查接受 `GL_OES_EGL_image` / `GL_EXT_EGL_image_storage` 任一；
+2. desktop 无 storage 入口时回退解析 `glEGLImageTargetTexture2DOES`。
+
+已按 deepin 源码包（0.40.0-3+deb13u1deepin1）重编 deb 并安装。Jingjia EGL
+下最终实测（600 帧 1080p30，单核当量）：direct + 轻量渲染参数（dither=no +
+bilinear）约 21%（垫片原型 17.2%，波动内一致）；direct + 默认渲染参数约 56%；
+copy + 默认渲染参数（补丁前最优）70.2%。
+
+注意：应用（purelive）UI 仍被强制在 Mesa EGL，应用内 `hwdec=auto` 会选中
+跨驱动 direct（672%），必须维持 vaapi-copy 设置（审计文档 §10.3/10.4，
+应用侧映射待另行实现）；待 Jingjia GLES + Flutter Skia 黑屏解决、UI 切回
+Jingjia 后，direct（约 21%）即可在应用内兑现。
+
+### 直通终局结论（2026-09-09，诊断 shim 实测）
+
+`vaExportSurfaceHandle(DRM_PRIME_2)` 实测（LD_PRELOAD 拦截 va_export_diag.c）：
+- 格式探测 surface（128x128，有数据写入）：nz=48/48、96/96 —— 导出链路本身通；
+- **正式解码帧（NV12 1920x1088, 3133440B）：每帧 nz=0 —— 导出内存全零**；
+- desc 异常：NV12 的 UV plane offset[1]=0（应为 pitch*height 约等于 2088960）；
+- 同一 surface vaGetImage（copy 路径）数据正确；
+- Jingjia GL 与 Mesa llvmpipe 两个独立 importer 采样结果一致（全零深绿），
+  且内核 jmgpu-diag（ioremap 直读 bus 地址）同为全零——排除 importer 侧。
+
+结论：Jingjia 闭源 VA 驱动的 PRIME_2 导出实现不返回解码数据（疑似解码输出
+经 GPU MMU 写入与 VIDMEM node 分离的页面，或导出路径未实现数据别名），UV
+offset 描述符亦损坏。此为厂商级缺陷，内核（jmgpu DRM 驱动）侧无法修复。
+
+处置：
+- 直通暂不可行，应用维持 vaapi-copy（JMDEC 解码收益保留在 copy 模式）；
+- va_export_diag.c（LD_PRELOAD 诊断）与内核 jmgpu-diag 插桩保留，供厂商
+  复现与定位，向景嘉微反馈时附本节数据即可复现；
+- 修复 1-4（mmap 放行/尺寸对齐/NULL-SGT 防护/越界防御）保留——把直通从
+  「进程崩溃」降级为「可安全探测」，也是未来厂商修复后的必要基础。

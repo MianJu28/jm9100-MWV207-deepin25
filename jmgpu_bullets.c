@@ -4033,6 +4033,19 @@ static struct sg_table *j9_cibarious(struct dma_buf_attachment *attachment,
 					offset, bytes, (jmtPOINTER *)&sgt));
 	} while (J9_YARELY);
 
+	if (!sgt) {
+		/*
+		 * map_dma_buf must never return NULL: the dma-buf core and
+		 * every importer expect either a valid sg_table or an
+		 * ERR_PTR-encoded error. A NULL return is dereferenced by
+		 * importers. Happens for the reserved-mem (VRAM) allocator
+		 * whose GetSGT is not implemented yet.
+		 */
+		pr_warn_ratelimited("jmgpu: dmabuf map_dma_buf failed (no SGT), status=%d\n",
+				    (int)status);
+		return ERR_PTR(-EINVAL);
+	}
+
 	return sgt;
 }
 
@@ -4062,10 +4075,33 @@ static int j9_forefence(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 		physical = node->VidMem.physical;
 	}
 
+	/* Guard against mappings that run past the end of the backing pool.
+	 * The export size is rounded up to a page, so a node sitting at the
+	 * tail of a pool (or a chunk) may not have the rounded-up tail inside
+	 * the pool; remapping past the pool would fault on access. */
+	{
+		PLINUX_MDL poolMdl = (PLINUX_MDL) physical;
+
+		if (poolMdl && skipPages + numPages > poolMdl->numPages) {
+			pr_warn_ratelimited("jmgpu: dmabuf mmap beyond pool bounds (%lu+%lu > %lu pages)\n",
+					    (unsigned long)skipPages,
+					    (unsigned long)numPages,
+					    (unsigned long)poolMdl->numPages);
+			status = J9_HANDLE_J9M_FORGATHERS;
+			goto OnError;
+		}
+	}
+
 	j9_recaution(jmkOS_MemoryMmap(nodeObject->kernel->os,
 				physical, skipPages, numPages, vma));
 
 OnError:
+	if (J9_CATAPHORA(status)) {
+		pr_info_ratelimited("jmgpu: dmabuf mmap failed: status=%d dmabuf_size=%zu pgoff=%lu pages=%lu\n",
+				    (int)status, dmabuf->size, vma->vm_pgoff,
+				    (unsigned long)numPages);
+	}
+
 	return J9_CATAPHORA(status) ? -EINVAL : 0;
 }
 
@@ -4244,7 +4280,29 @@ jmkVIDMEM_NODE_Export(
 	if (memory && memory->object.type == J9_STALWARTIZE) {
 		physical = node->VidMem.parent->physical;
 		bytes = node->VidMem.bytes;
-		bytes = bytes & ~(PAGE_SIZE - 1);
+		/*
+		 * Round UP to the page size: VIDMEM nodes are allocated with
+		 * a 64-byte granularity, so node bytes are usually not page
+		 * aligned. Rounding down (previous behaviour) exported a
+		 * dmabuf smaller than the size the VA driver reports for the
+		 * surface, and every importer mmap then failed the range
+		 * check in dma_buf_mmap with EINVAL. The rounding-up tail is
+		 * normally still inside the VRAM pool, so mapping it is safe;
+		 * clamp to what remains of the pool after the node offset so
+		 * a tail node cannot export past the pool end.
+		 */
+		bytes = PAGE_ALIGN(bytes);
+		{
+			PLINUX_MDL poolMdl = (PLINUX_MDL) physical;
+			jmtSIZE_T poolAvail;
+
+			if (poolMdl && node->VidMem.offset < poolMdl->bytes) {
+				poolAvail = poolMdl->bytes - node->VidMem.offset;
+
+				if (bytes > poolAvail)
+					bytes = poolAvail & ~(PAGE_SIZE - 1);
+			}
+		}
 	} else if (vidMemBlock && vidMemBlock->object.type == J9_HANDLE_BETERSCHAP) {
 		physical = vidMemBlock->physical;
 		bytes = node->VirtualChunk.bytes;

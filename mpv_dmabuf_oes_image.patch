@@ -1,0 +1,27 @@
+--- /tmp/mpvorig/mpv-0.40.0/video/out/hwdec/dmabuf_interop_gl.c	2026-07-07 17:32:25.000000000 +0800
++++ /tmp/mpvbuild/mpv-0.40.0/video/out/hwdec/dmabuf_interop_gl.c	2026-09-09 12:26:17.593829414 +0800
+@@ -136,6 +136,14 @@
+         // GL_EXT_EGL_image_storage
+         p->EGLImageTargetTexStorageEXT =
+             (void *)eglGetProcAddress("glEGLImageTargetTexStorageEXT");
++        // Some desktop GL stacks (e.g. Jingjia JM9100) export GL_OES_EGL_image
++        // but neither declare GL_EXT_EGL_image_storage nor honor ES context
++        // requests. Fall back to the OES entry so their dmabuf import can be
++        // used by the vaapi direct path.
++        if (!p->EGLImageTargetTexStorageEXT) {
++            p->EGLImageTargetTexture2DOES =
++                (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
++        }
+     }
+ 
+     if (!p->CreateImageKHR || !p->DestroyImageKHR ||
+@@ -354,7 +362,8 @@
+     const char *imageext = gl->es ? "GL_OES_EGL_image" : "GL_EXT_EGL_image_storage";
+     if (!gl_check_extension(exts, "EGL_EXT_image_dma_buf_import") ||
+         !gl_check_extension(exts, "EGL_KHR_image_base") ||
+-        !gl_check_extension(gl->extensions, imageext) ||
++        !(gl_check_extension(gl->extensions, "GL_OES_EGL_image") ||
++          gl_check_extension(gl->extensions, "GL_EXT_EGL_image_storage")) ||
+         !(gl->mpgl_caps & MPGL_CAP_TEX_RG)) {
+         return false;
+     }

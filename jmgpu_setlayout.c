@@ -195,36 +195,72 @@ j9_pathopsychosis(IN jmkALLOCATOR Allocator,
 
 	j9_tympanichord("Allocator=%p Mdl=%p vma=%p", Allocator, Mdl, vma);
 
-	if (Mdl->cpuAccessible) {
-		JMM_kASSERT(skipPages + numPages <= Mdl->numPages);
+	/*
+	 * Mdl->cpuAccessible only states whether the owner driver itself
+	 * reads/writes the pool through the CPU. The backing memory is device
+	 * VRAM on the PCIe BAR and stays CPU-addressable regardless of that
+	 * flag. A dmabuf exported from this pool must remain mappable:
+	 * foreign importers (e.g. Mesa/llvmpipe during EGL dmabuf import in
+	 * the VA-API direct path) take an mmap() of the buffer, and refusing
+	 * here makes their mmap fail with EINVAL ("dmabuf import failed to
+	 * mmap: Invalid argument" in mpv) and kills the direct path.
+	 */
+	if (!Mdl->cpuAccessible)
+		pr_warn_ratelimited("jmgpu: dmabuf mmap on pool marked non-CPU-accessible (res=%pK)\n", res);
 
-		pfn = (res->start >> PAGE_SHIFT) + skipPages;
+	JMM_kASSERT(skipPages + numPages <= Mdl->numPages);
 
+	pfn = (res->start >> PAGE_SHIFT) + skipPages;
+
+	/* DIAGNOSTIC (temporary): verify the target device memory actually
+	 * holds decoded data. The direct path renders green (all-zero) while
+	 * vaGetImage (copy) returns correct pixels, so compare what an
+	 * importer will see through this mapping. */
+	{
+		static unsigned int diagCnt;
+
+		/* Only large buffers (VA surfaces / framebuffers) are of
+		 * interest; early-boot single-page dmabufs would burn the
+		 * diagnostic budget before any decoder runs. */
+		if (time_after(jiffies, (unsigned long)(60 * HZ)) && numPages >= 100 && numPages <= 1200 && diagCnt < 60) {
+			diagCnt++;
+
+			void __iomem *io = ioremap(res->start +
+						   (skipPages << PAGE_SHIFT),
+						   16);
+			if (io) {
+				pr_info("jmgpu-diag: mmap target bus=%pa skip=%lu num=%lu data=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
+					&res->start, skipPages, numPages,
+					ioread8(io), ioread8(io + 1),
+					ioread8(io + 2), ioread8(io + 3),
+					ioread8(io + 4), ioread8(io + 5),
+					ioread8(io + 6), ioread8(io + 7));
+				iounmap(io);
+			}
+		}
+	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-		vm_flags_set(vma, J9_OVERNOISE);
+	vm_flags_set(vma, J9_OVERNOISE);
 #else
-		vma->vm_flags |= J9_OVERNOISE;
+	vma->vm_flags |= J9_OVERNOISE;
 #endif
 
-		if (Allocator->os->enableWriteCombine) {
-			vma->vm_page_prot =
-			    pgprot_writecombine(vma->vm_page_prot);
-		} else {
-			vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-		}
-
-		if (remap_pfn_range(vma, vma->vm_start,
-				    pfn, numPages << PAGE_SHIFT,
-				    vma->vm_page_prot) < 0) {
-			JMM_kTRACE(J9_IRASCIBILITY,
-				   "%s(%d): remap_pfn_range error.",
-				   __func__, __LINE__);
-
-			status = J9_HANDLE_J9M_FORGATHERS;
-		}
+	if (Allocator->os->enableWriteCombine) {
+		vma->vm_page_prot =
+		    pgprot_writecombine(vma->vm_page_prot);
 	} else {
-		status = J9_HANDLE_J9M_UNFEMINISE;
+		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	}
+
+	if (remap_pfn_range(vma, vma->vm_start,
+			    pfn, numPages << PAGE_SHIFT,
+			    vma->vm_page_prot) < 0) {
+		JMM_kTRACE(J9_IRASCIBILITY,
+			   "%s(%d): remap_pfn_range error.",
+			   __func__, __LINE__);
+
+		status = J9_HANDLE_J9M_FORGATHERS;
 	}
 
 	JMM_kFOOTER();
