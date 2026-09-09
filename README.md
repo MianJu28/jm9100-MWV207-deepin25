@@ -21,7 +21,7 @@
 
 | 项 | 值 |
 |---|---|
-| CPU | 飞腾 D2000 (Phytium, aarch64) |
+| CPU | 飞腾 D3000 (Phytium, aarch64) |
 | GPU | 景嘉微 JM9100 (PCI vendor:device = 0731:9100, 子系统 0731:9101) |
 | 内核 | 6.6.143-arm64-desktop-hwe (Deepin 25 定制) |
 | 系统 | Deepin 25, Xorg 1.21, lightdm |
