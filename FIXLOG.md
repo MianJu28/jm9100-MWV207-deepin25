@@ -299,7 +299,7 @@ sudo dmesg | grep "gamma_lut updated"    # X 驱动原始 ramp 采样
 
 ---
 
-## 修复 7：VA 直通 dmabuf 导出链（mmap / map_dma_buf / 导出尺寸）—— 已编译部署，待重启验证 🔄
+## 修复 7：VA 直通 dmabuf 导出链（mmap / map_dma_buf / 导出尺寸）—— 已部署验证 ✅（直通数据缺失见终局结论）
 
 ### 背景（purelive 仓库 `docs/LINUX_JM9100_HWDECODE_AUDIT.md` §10，P6）
 
@@ -342,12 +342,7 @@ dmabuf import 需要线性 CPU 映射，`LIBGL_ALWAYS_SOFTWARE=1` 下 GL 端即 
 ### 部署与验证状态
 - `./sync_dkms.sh build` 编译安装成功，`update-initramfs -u` 已重跑（首次 plymouth
   hook 段错误为偶发，重试通过）
-- 2026-09-09 已重启加载，验证通过（见下）
-- 重启后验证：
-  1. `LIBGL_ALWAYS_SOFTWARE=1 __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json LIBVA_DRIVER_NAME=jmgpu mpv --vo=gpu --gpu-context=x11egl --hwdec=vaapi --frames=200 /tmp/hwtest_1080p.mp4` → 期望 exit=0、`hwdec-current=vaapi`、无 `dmabuf import failed to mmap`
-  2. `dmesg | grep jmgpu` 观察残留限流告警（`map_dma_buf failed` 出现即 GetSGT 仍为阻断点）
-  3. 应用内 `hwdec=auto` 复测（直通恢复后按 §7.2 复测整机 CPU）
-
+- 2026-09-09 已重启加载，验证通过（见下）；此后多次重编部署（诊断插桩/加固）
 ### 运行态验证（2026-09-09 重启后）
 
 - `dmesg` 命中修复 1 的限流日志 `dmabuf mmap on pool marked non-CPU-accessible`：
