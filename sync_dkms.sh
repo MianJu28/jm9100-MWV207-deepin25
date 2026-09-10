@@ -30,7 +30,7 @@ if [ "${1:-}" = "build" ]; then
   sudo dkms install mwv207/1.7.0.uos --force
   echo "==> dkms install 完成"
   # 关键: modules-load 早期加载走 initramfs 冻结副本, 不重建 initramfs
-  # 的话新模块在重启后不会生效 (教训见 FIXLOG.md 修复 6)
+  # 的话新模块在重启后不会生效 (教训见 README.md §4.2 部署)
   sudo update-initramfs -u
   echo "==> update-initramfs 完成 (新模块重启后生效)"
 fi

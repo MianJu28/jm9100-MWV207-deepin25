@@ -5,9 +5,71 @@
 > `color_bisect.sh`（色彩二分实验）、`dump_display_regs.sh`/`dump_full_regs.sh`
 > （寄存器 dump 对比）、`fix_win_contrast.sh`（LUT 相关键写回，诊断用）。
 >
-> **2026-09-08 状态**：问题 2（灰蒙蒙）已解决——X 专有驱动 gamma 下发的 1/3
-> 缩放缺陷，内核 `gamma_norm=3` 归一化修复（见修复 5/6）。改驱动后的部署必须
-> `./sync_dkms.sh build`（含 update-initramfs，否则 initramfs 冻结旧模块）。
+> **2026-09-10 状态**：
+> - 问题 2（灰蒙蒙）已解决——X 专有驱动 gamma 下发的 1/3 缩放缺陷，
+>   内核 `gamma_norm=3` 归一化修复（见修复 5/6）。
+> - **VA-API 直通（mpv `--hwdec=vaapi`）已打通**——根因是闭源 VA 驱动把解码
+>   surface 放进 CPU 不可见显存池，叠加 mpv 走了 JM9100 未实现的
+>   `glEGLImageTargetTexStorageEXT` 导入入口；修复为 mpv 侧补丁 + 内核
+>   dmabuf 链修正（见修复 7/8）。**使用方法见下方「VA-API 直通使用方法」**。
+> - 改驱动后的部署必须 `./sync_dkms.sh build`（含 update-initramfs，
+>   否则 initramfs 冻结旧模块）。
+
+---
+
+## VA-API 直通使用方法（2026-09-10 实测可用 ✅）
+
+### 前置（已完成，重装系统后需重做）
+
+1. 内核模块：本仓库源码 `./sync_dkms.sh build`（安装 jmgpu.ko + 重建 initramfs）。
+   `prefer_visible_pool` / `no_exclusive_pool` 保持默认 0 即可，**无需**特殊参数。
+2. mpv：应用本仓库 `mpv_dmabuf_oes_image.patch` 后重编安装（见「修复 8」）。
+
+### 播放（直通，VA surface 经 dmabuf 零拷贝交给 GL）
+
+```bash
+LIBVA_DRIVER_NAME=jmgpu mpv --hwdec=vaapi 视频.mp4
+```
+
+- 若走 Mesa 软栈：`LIBGL_ALWAYS_SOFTWARE=1 LIBVA_DRIVER_NAME=jmgpu mpv --hwdec=vaapi 视频.mp4`
+- 应用内（purelive 等）配置 `hwdec=vaapi` 即可，无需再强制 `vaapi-copy`。
+
+### 其它工具
+
+```bash
+# ffmpeg 硬解（VA-API 设备）
+LIBVA_DRIVER_NAME=jmgpu ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 \
+    -i in.mp4 -c:v libx264 out.mp4
+
+# 硬解能力检查
+LIBVA_DRIVER_NAME=jmgpu vainfo
+```
+
+### 自检与验证
+
+```bash
+cd ~/Desktop/Git/jm9100
+./test_passthrough.sh              # 纯色片源自动判定直通是否正常（推荐）
+./test_passthrough.sh -s 720p      # 换分辨率
+./test_passthrough.sh -x           # 附加导出诊断（缓冲内容 / vaGetImage 对比）
+./test_passthrough.sh -n           # 只做环境体检（模块版本、显存池占用）
+```
+
+判定：`直通(vaapi)` 的 `avg` 应等于片源原色（脚本用的纯红片 → `(255,0,0)`）；
+若为 `(0,77,0)` 之类的深绿即仍是全零导出。
+
+### 可选内核参数（一般不需要）
+
+| 参数 | 作用 |
+|---|---|
+| `prefer_visible_pool=0` | 默认，厂商原行为（**当前使用**） |
+| `prefer_visible_pool=1` | 解码 surface 优先申请可见池（可见池空闲充足时） |
+| `prefer_visible_pool=2` | 交换两池角色，可见窗口整块留给解码（可见池碎片化严重时用；会让桌面部分缓冲进不可见池） |
+| `no_exclusive_pool=1` | 关闭不可见池（可用显存降到 255MB，仅在极端场景用） |
+
+运行时切换：`echo N | sudo tee /sys/module/jmgpu/parameters/prefer_visible_pool`
+
+---
 
 ---
 
@@ -443,10 +505,22 @@ offset 描述符亦损坏。此为厂商级缺陷，内核（jmgpu DRM 驱动）
 
 ---
 
-## 修复 8（2026-09-10）：直通真正根因 —— 解码 surface 落在 CPU 不可见的显存池
+## 修复 8（2026-09-10）：直通根因与最终修复 ✅（已实测）
 
-> 结论先行：FIXLOG 修复 7 的「厂商级缺陷、内核侧无法修复」结论**被推翻**。
-> 根因在内核侧，且已定位并可缓解。
+> 结论先行（最终版）：
+> 1. FIXLOG 修复 7 的「厂商级缺陷、内核侧无法修复」结论**不成立**——导出链路
+>    本身正确（可见池缓冲导出字节精确）；
+> 2. 直通全绿有**两个叠加原因**：
+>    - 解码 surface 落在 **CPU 不可见显存池**（VA 驱动把整池作为一块连续显存申请，
+>      可见窗口被桌面打碎后申请失败而回退）；
+>    - **mpv 的导入入口选错**：desktop GL 下走
+>      `glEGLImageTargetTexStorageEXT`，而 JM9100 该入口存在但不真正挂接 dmabuf，
+>      纹理恒为全零。
+> 3. **最终修复 = mpv 侧改用 `EGLImageTargetTexture2DOES`**（`mpv_dmabuf_oes_image.patch`）。
+>    该路径下 Jingjia EGL/GL 经 GEM 句柄在 GPU 侧导入，**与缓冲落在哪个池无关**，
+>    因此内核侧保持厂商默认 `prefer_visible_pool=0` 即可（实测已通过）。
+> 4. 内核侧修复 1-4（mmap 放行/尺寸对齐/NULL-SGT 防护/越界防御）与同驱动
+>    dmabuf 导入快捷路径 `jmgpu_dmabuf_peek_node()` 保留——是 GPU 侧导入能成功的基础。
 
 ### 排查方法（不依赖文档，重新实测）
 
@@ -690,15 +764,47 @@ GL_EXT_EGL_image_storage`）。JM9100 该入口**存在但不真正挂接 dmabuf
 **优先使用并置空 storage 指针**（这样 init/map/unmap 三处的生命周期判断自然
 走 OES 路径）。重编 mpv 即可。
 
-### 本机最终状态与建议
+### 最终修复与验证（2026-09-10 实测通过 ✅）
 
-- 可见池 255MB 被桌面占约 **206MB**（buddycn 107MB + Xorg 58MB +
-  mihomo-party 33.5MB + …），解码 1080p 需约 **60MB** → **放不下**。
-- 因此本机 1080p 直通**需要先把可见池占用压到 ~190MB 以下**
-  （关闭/重启上述应用），再配合 `prefer_visible_pool=1`；
-  验证方法：`python3 passthrough_verify.py <纯红片源> 255,0,0`
-  （直通行 avg 应≈(255,0,0)，若为 (0,135,0) 即仍是全零导出）。
-- 若不加这些前提，维持 `vaapi-copy`（功能与像素均正确，仅多一次回读）。
-- 厂商侧建议：VA 驱动的解码 surface 不应默认请求 CPU 不可见池；
-  或 EGL/GL 导入 dmabuf 时改用 GEM 句柄（配合本次已实现的
-  `jmgpu_dmabuf_peek_node` 同驱动导入快捷路径）而非 CPU mmap。
+**改动清单**
+
+| 位置 | 改动 |
+|---|---|
+| `video/out/hwdec/dmabuf_interop_gl.c`（mpv，见 `mpv_dmabuf_oes_image.patch`） | desktop GL 分支解析出 `glEGLImageTargetTexture2DOES` 后**优先使用并置空 storage 指针**；扩展检查放宽为 OES/storage 任一 |
+| `jmgpu_bullets.c` | `jmgpu_dmabuf_peek_node()`：同驱动 dmabuf 导入快捷路径（`j9_handle_j9_dumbbeller` 直接复用原 VIDMEM 节点，绕开 reserved-mem 缺失的 `GetSGT`） |
+| `jmgpu_bullets.c` / `jmgpu_setlayout.c` | 修复 1-4（mmap 放行、导出尺寸页对齐、NULL-SGT 防护、越界防御）+ 诊断日志（`jmgpu-exp`/`jmgpu-mmap`/`jmgpu-diag`） |
+| `jmgpu_insert.c` | 参数 `no_exclusive_pool`、`prefer_visible_pool`（默认 0，均非必需） |
+| `jmgpu_detect.c` | `prefer_visible_pool` 的两级重定向钩子 |
+
+**验证结果**（`./test_passthrough.sh -s 1080p`，`prefer_visible_pool=0`）：
+
+```
+直通(vaapi): 1920x1080 avg=(255,0,64) 绿色占比 0.0%
+软解(no)   : 1920x1080 avg=(255,0,64) 绿色占比 0.0%
+==> 直通【正常】：画面是片源原色(红)
+```
+
+另：同一状态下 `prefer_visible_pool=1/2` 也正常，但**不再需要**；
+`prefer_visible_pool=2` 会把桌面缓冲推到不可见池，仅建议在可见池碎片化
+导致导出异常时才临时启用。
+
+**部署状态（本机）**
+
+- jmgpu 模块 `srcversion 217561F3771EF4276FFB6A0`，已 dkms 安装且写入 initramfs；
+- `/etc/modprobe.d/` 下**不再有**池策略配置（恢复厂商默认）；
+- mpv 已按补丁重编安装（`mpv v0.40.0`）。
+
+**厂商侧建议（可反馈）**
+
+1. `glEGLImageTargetTexStorageEXT` 入口未真正挂接 dmabuf（建议实现或不要声明
+   `GL_EXT_EGL_image_storage`）；
+2. reserved-mem（VRAM）分配器的 `GetSGT` 为空桩，导致标准 `map_dma_buf` 导入
+   失败（本次已用同驱动快捷路径绕过）；
+3. 解码 surface 池整体按“一块连续显存”申请，在可见窗口碎片化时必然整组回退
+   到 CPU 不可见池，建议改为按需分块或非连续分配。
+
+**回归测试工具（仓库内）**
+
+`test_passthrough.sh`（一键判定）、`va_export_probe.c` / `va_export_diag.c`
+（VA 导出与 importer 诊断）、`jm_gem_probe.c`（内核 GEM 导出双向校验）、
+`bar_probe.c`（BAR 是否为显存窗口）、`ppm_stats.py` / `passthrough_verify.py`。

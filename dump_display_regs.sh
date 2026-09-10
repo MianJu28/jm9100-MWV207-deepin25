@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # JM9100 显示输出域寄存器 dump —— 用于 jmgpu 栈与 mwv207(开源)栈的逐寄存器对比
-# （FIXLOG.md「问题 2」待验证方向 6）
+# （详见 README.md §3.2 显示灰蒙蒙）
 #
 # 用法：
 #   sudo ./dump_display_regs.sh            # 输出到 stdout
