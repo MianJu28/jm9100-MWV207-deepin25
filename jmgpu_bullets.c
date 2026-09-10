@@ -4075,6 +4075,17 @@ static int j9_forefence(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 		physical = node->VidMem.physical;
 	}
 
+	/* DIAGNOSTIC (temporary): node/pool geometry behind a dmabuf mmap. */
+	if (numPages >= 100 && numPages <= 1200)
+		pr_info_ratelimited("jmgpu-mmap: pool=%u node_off=0x%llx bytes=0x%llx node_phys=%p pool_mdl=%p pgoff=%lu skip=%lu num=%lu\n",
+				    (unsigned)node->VidMem.pool,
+				    (unsigned long long)node->VidMem.offset,
+				    (unsigned long long)node->VidMem.bytes,
+				    node->VidMem.physical, (void *)physical,
+				    (unsigned long)vma->vm_pgoff,
+				    (unsigned long)skipPages,
+				    (unsigned long)numPages);
+
 	/* Guard against mappings that run past the end of the backing pool.
 	 * The export size is rounded up to a page, so a node sitting at the
 	 * tail of a pool (or a chunk) may not have the rounded-up tail inside
@@ -4244,6 +4255,32 @@ static struct dma_buf_ops _dmabuf_ops = {
 	.vmap = _dmabuf_vmap,
 	.vunmap = _dmabuf_vunmap,
 };
+
+/*
+ * Same-driver dmabuf import shortcut.
+ *
+ * The reserved-mem (VRAM) allocator has no .GetSGT, so map_dma_buf() cannot
+ * hand an importer a usable sg_table, and j9_cibarious() ends up returning
+ * ERR_PTR: every drmPrimeFDToHandle()/EGLImage import of a jmgpu dmabuf used
+ * to fail. Even when an importer falls back to a CPU mmap it reads the fake
+ * "invisible VRAM" address range (see no_exclusive_pool) as all zero.
+ *
+ * When the importer is jmgpu itself - which is the whole VA-API direct path,
+ * where the Jingjia GL/EGL stack imports the very surface the VA driver just
+ * exported - we still own the real VIDMEM node behind the buffer, so hand
+ * back a GEM object referring to exactly that node. No address translation
+ * and no CPU access is involved, so this also covers buffers that live in
+ * the CPU-inaccessible VRAM pool.
+ *
+ * Returns the node behind a dmabuf exported by this driver, NULL otherwise.
+ */
+jmkVIDMEM_NODE jmgpu_dmabuf_peek_node(struct dma_buf *dmabuf)
+{
+	if (dmabuf && dmabuf->ops == &_dmabuf_ops)
+		return dmabuf->priv;
+
+	return J9_CHYAK;
+}
 #endif
 
 j9_duopoly
@@ -4313,6 +4350,16 @@ jmkVIDMEM_NODE_Export(
 
 	mdl = (PLINUX_MDL)physical;
 	allocator = mdl->allocator;
+
+	/* DIAGNOSTIC (temporary): which pool/offset a large export refers to. */
+	if (bytes >= (100UL << PAGE_SHIFT))
+		pr_info_ratelimited("jmgpu-exp: pool=%u off=0x%llx bytes=0x%llx mdl=%p cpuAcc=%d nPages=%lu alloc=%s\n",
+				    (unsigned)node->VidMem.pool,
+				    (unsigned long long)node->VidMem.offset,
+				    (unsigned long long)node->VidMem.bytes,
+				    (void *)mdl, (int)mdl->cpuAccessible,
+				    (unsigned long)mdl->numPages,
+				    allocator->name ? allocator->name : "?");
 
 	if (strcmp(allocator->name, "reserved-mem")) {
 

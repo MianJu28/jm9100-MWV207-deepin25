@@ -1,21 +1,28 @@
---- /tmp/mpvorig/mpv-0.40.0/video/out/hwdec/dmabuf_interop_gl.c	2026-07-07 17:32:25.000000000 +0800
-+++ /tmp/mpvbuild/mpv-0.40.0/video/out/hwdec/dmabuf_interop_gl.c	2026-09-09 12:26:17.593829414 +0800
-@@ -136,6 +136,14 @@
+--- a/video/out/hwdec/dmabuf_interop_gl.c
++++ b/video/out/hwdec/dmabuf_interop_gl.c
+@@ -136,6 +136,20 @@
          // GL_EXT_EGL_image_storage
          p->EGLImageTargetTexStorageEXT =
              (void *)eglGetProcAddress("glEGLImageTargetTexStorageEXT");
-+        // Some desktop GL stacks (e.g. Jingjia JM9100) export GL_OES_EGL_image
-+        // but neither declare GL_EXT_EGL_image_storage nor honor ES context
-+        // requests. Fall back to the OES entry so their dmabuf import can be
-+        // used by the vaapi direct path.
-+        if (!p->EGLImageTargetTexStorageEXT) {
-+            p->EGLImageTargetTexture2DOES =
-+                (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
++        /*
++         * Some desktop GL stacks (e.g. Jingjia JM9100) expose
++         * glEGLImageTargetTexStorageEXT but never attach the imported dmabuf
++         * to the texture, so the sampler reads all-zero and VA-API direct
++         * decode (mpv --hwdec=vaapi) renders a solid green frame. Their
++         * glEGLImageTargetTexture2DOES entry does work, so prefer it when it
++         * is available. Leaving the storage pointer NULL also preserves the
++         * OES lifecycle used below (textures created once in init, rebound on
++         * every map, freed on uninit).
++         */
++        void *oes = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
++        if (oes) {
++            p->EGLImageTargetTexture2DOES = oes;
++            p->EGLImageTargetTexStorageEXT = NULL;
 +        }
      }
  
      if (!p->CreateImageKHR || !p->DestroyImageKHR ||
-@@ -354,7 +362,8 @@
+@@ -354,7 +368,8 @@
      const char *imageext = gl->es ? "GL_OES_EGL_image" : "GL_EXT_EGL_image_storage";
      if (!gl_check_extension(exts, "EGL_EXT_image_dma_buf_import") ||
          !gl_check_extension(exts, "EGL_KHR_image_base") ||

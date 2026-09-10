@@ -60,6 +60,36 @@ module_param(vram_space_limit, ulong, 0644);
 MODULE_PARM_DESC(vram_space_limit,
 		 "set limit for vram space, default 0, no limit");
 
+/*
+ * The GPU exposes only a 255MB CPU-visible BAR window (the "external" pool);
+ * the remaining ~1.7GB of VRAM (the "exclusive" pool) is reserved in iomem at
+ * an address no host bridge decodes, so a CPU mapping of it reads as zero and
+ * silently drops writes. Every dmabuf exported from that pool therefore looks
+ * empty to an importer, which is why the VA-API direct path (mpv
+ * --hwdec=vaapi) rendered all-zero (green) frames while vaGetImage copy was
+ * correct. Setting this to 1 drops the exclusive pool so all video memory
+ * comes from the CPU-visible window and dmabuf export works, at the cost of
+ * limiting usable VRAM to the visible size.
+ */
+static int no_exclusive_pool;
+module_param(no_exclusive_pool, int, 0644);
+MODULE_PARM_DESC(no_exclusive_pool,
+		 "disable the CPU-inaccessible (invisible) VRAM pool so all "
+		 "allocations come from the CPU-visible BAR window; required "
+		 "for working dmabuf export / VA-API direct passthrough");
+
+/*
+ * See jmgpu_detect.c for the rationale: keep new video memory allocations in
+ * the CPU-visible pool while it can still satisfy them, instead of bailing
+ * out to the invisible pool as soon as it is 3/4 full.
+ */
+int prefer_visible_pool;
+module_param(prefer_visible_pool, int, 0644);
+MODULE_PARM_DESC(prefer_visible_pool,
+		 "prefer the CPU-visible VRAM pool over the invisible one and "
+		 "only fall back to invisible when it cannot satisfy the "
+		 "request; needed for VA-API direct passthrough");
+
 
 #define J9_HANDLE_J_CABALASSOU    0x10EE
 #define J9_HANDLE_PRINCIPIUM      0x8018
@@ -798,7 +828,7 @@ j9_duopoly j9maths_unbloodied(j9_weakliest *pplatform,
 		pargs->externalSize[0] =
 			pargs->slide_window_base - ppcie_info->mem0bar.base;
 
-	if (ppcie_info->vres_exist) {
+	if (ppcie_info->vres_exist && !no_exclusive_pool) {
 		pargs->exclusiveBase[0] = ppcie_info->vres.start;
 		pargs->exclusiveSize[0] =
 			ppcie_info->vres.end - ppcie_info->vres.start + 1;

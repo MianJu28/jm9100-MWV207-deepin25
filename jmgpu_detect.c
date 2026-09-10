@@ -37,6 +37,23 @@ struct isHang{
     int hang;
 };
 
+/*
+ * The VIDMEM allocator normally switches to the CPU-inaccessible ("invisible")
+ * VRAM pool as soon as the CPU-visible BAR window (255MB) has less than a
+ * quarter of its space free. The invisible pool cannot be mapped by the CPU,
+ * so a dmabuf exported from it reads as all zero for every importer that
+ * mmaps it (Jingjia EGL does), which is what makes VA-API direct decode
+ * (mpv --hwdec=vaapi) render all-zero/green frames while vaGetImage copy is
+ * correct.
+ *
+ * When set to 1 the allocator keeps using the visible pool as long as the
+ * request can actually be satisfied, and only falls back to the invisible
+ * pool when the visible pool is genuinely too full. Requires enough free
+ * space in the visible window (close GPU-heavy applications otherwise).
+ * Defined in jmgpu_insert.c.
+ */
+extern int prefer_visible_pool;
+
 
 #define j9_corditis(t) #t
 #define J9_NOISETTE(t) j9_corditis(t)
@@ -1139,6 +1156,38 @@ jmkKERNEL_AllocateVideoMemory(IN jmk_KERNEL Kernel,
 	    ("Kernel=%p *Pool=%d *Bytes=0x%zx Alignment=0x%x Type=%d", Kernel,
 	     *Pool, *Bytes, Alignment, Type);
 
+	/*
+	 * VA-API direct passthrough support.
+	 *
+	 * The Jingjia VA driver explicitly asks for the CPU-inaccessible
+	 * ("exclusive"/ANTHRAMINE) pool for its decode render targets. A dmabuf
+	 * exported from that pool maps a bus address no host bridge decodes, so
+	 * every importer that mmaps it - Jingjia EGL/GL does, as the playback
+	 * logs show - reads all zero and the direct path renders green, while
+	 * vaGetImage copy stays correct.
+	 *
+	 * When prefer_visible_pool is set, ask for the CPU-visible pool first.
+	 * The pool fallback chain below still moves the request to ANTHRAMINE if
+	 * the visible pool cannot satisfy it, so this cannot cause OOM, it only
+	 * changes which pool is tried first.
+	 */
+	if (prefer_visible_pool == 1) {
+		if (*Pool == J9_HANDLE_J9M_ANTHRAMINE)
+			*Pool = J9_HANDLE_J9_UNCONTRITE;
+	} else if (prefer_visible_pool == 2) {
+		/*
+		 * 模式 2（交换）：解码 surface 池是「一整块连续显存」被切成单个
+		 * surface，因此只要可见窗口里没有足够大的连续空闲块，整组就会
+		 * 回退到不可见池（→ dmabuf 全零 → 直通全绿）。
+		 * 这里把显式请求不可见池的（VA 解码）请求改到可见池，而把
+		 * 「内部池」这一通用路径整体压到不可见池，尽量让可见窗口
+		 * 保持整块空闲。属于风险实验：桌面的部分缓冲也会被挪到
+		 * CPU 不可见池，可能导致桌面显示异常，随时可 echo 1 回退。
+		 */
+		if (*Pool == J9_HANDLE_J9M_ANTHRAMINE)
+			*Pool = J9_HANDLE_J9_UNCONTRITE;
+	}
+
 	j9_handle_blinkingly(Kernel != J9_CHYAK);
 
 	*NodeObject = J9_CHYAK;
@@ -1460,13 +1509,18 @@ j9_incorporate:
 				    jmkKERNEL_GetVideoMemoryPool(Kernel,
 								 J9_HANDLE_J9_UNCONTRITE,
 								 &videoMemory);
-				if (J9_MONOPHYLETY(status)
-				    && (videoMemory->freeBytes <
-					videoMemory->bytes / 4)
-				    && Type != J9_HANDLE_J9MATHS_ADVERTENCY
-				    && Type != J9_HANDLE_J9MIRROR_RANDANNITE
-				    && Type != J9_HANDLE_J_SEVILLANAS
-				    && Type != J9_HANDLE_J_ANCHORITIC) {
+				if (prefer_visible_pool == 2) {
+					/* 模式 2：通用路径一律去不可见池，
+					 * 把可见窗口整块留给解码 surface。 */
+					pool = J9_HANDLE_J9M_ANTHRAMINE;
+				} else if (!prefer_visible_pool
+					   && J9_MONOPHYLETY(status)
+					   && (videoMemory->freeBytes <
+					       videoMemory->bytes / 4)
+					   && Type != J9_HANDLE_J9MATHS_ADVERTENCY
+					   && Type != J9_HANDLE_J9MIRROR_RANDANNITE
+					   && Type != J9_HANDLE_J_SEVILLANAS
+					   && Type != J9_HANDLE_J_ANCHORITIC) {
 					pool = J9_HANDLE_J9M_ANTHRAMINE;
 				} else {
 					pool = J9_HANDLE_J9_UNCONTRITE;

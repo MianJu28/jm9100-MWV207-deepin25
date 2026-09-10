@@ -440,3 +440,265 @@ offset 描述符亦损坏。此为厂商级缺陷，内核（jmgpu DRM 驱动）
   复现与定位，向景嘉微反馈时附本节数据即可复现；
 - 修复 1-4（mmap 放行/尺寸对齐/NULL-SGT 防护/越界防御）保留——把直通从
   「进程崩溃」降级为「可安全探测」，也是未来厂商修复后的必要基础。
+
+---
+
+## 修复 8（2026-09-10）：直通真正根因 —— 解码 surface 落在 CPU 不可见的显存池
+
+> 结论先行：FIXLOG 修复 7 的「厂商级缺陷、内核侧无法修复」结论**被推翻**。
+> 根因在内核侧，且已定位并可缓解。
+
+### 排查方法（不依赖文档，重新实测）
+
+新增两个探针（均绕开闭源驱动，直接打到内核/VA 边界）：
+- `jm_gem_probe.c`：jmgpu 私有 GEM ioctl 分配显存 → `GEM_LOCK` 取 CPU 地址 →
+  `PRIME_HANDLE_TO_FD` 导出 → `mmap` 回读，双向交叉验证两个映射是否同一块物理内存；
+- `va_export_probe.c`：`vaPutImage` 写入已知图案 → `vaGetImage` 回读校验 →
+  `vaExportSurfaceHandle(DRM_PRIME_2)` 导出 → `mmap` 逐字节比对图案。
+
+同时在 `jmkVIDMEM_NODE_Export` / `j9_forefence` / `j9_pathopsychosis` 增加
+`jmgpu-exp` / `jmgpu-mmap` / `jmgpu-diag` 内核日志，打印导出节点所在的
+**池编号、池内偏移、池页数、cpuAccessible** 与最终 `remap_pfn_range` 的 pfn。
+
+### 关键实测结果
+
+| 观察 | 数据 |
+|---|---|
+| 描述符其实是**正确**的 | `objects=1 layers=2`：layer0=`R8`(Y, off=0)、layer1=`GR88`(UV, off=2088960)，pitch 1920。此前「UV offset=0」是诊断脚本读 `layers[0].offset[1]` 的误读（每层只有 1 个 plane） |
+| `vaPutImage` 写入的 1920x1088 surface 导出**完全正确** | `pattern match=8160 mismatch=0`，`vaGetImage` 回读 `ok=6120 bad=0` |
+| 同一尺寸**解码帧**导出**全零** | `nz=0/6121`（mpv `--hwdec=vaapi`，16 帧全部 nz=0） |
+| 差异在**显存池** | 成功者：`pool=4 off=0x76cc000 ... cpuAcc=1 nPages=65280`（可见池 255MB）<br>失败者：`pool=12 off=0xdc35000 ... cpuAcc=0 nPages=454656`（不可见池 1776MB） |
+| GEM 探针复现同一现象 | 3MB `CONTIGUOUS` 分配也落到 `pool=12`：cpu→dmabuf `ok=3 bad=765`，dmabuf→cpu `ok=0 bad=768`，`dma[0]=00` 且写入被丢弃 |
+
+### 根因
+
+```
+[jmgpu] VRAM size: 2048MB, visible size: 255MB, invisible size: 1776MB
+[jmgpu]: external  pool CPU physical=0x1000000000 GPU physical=0x0        size=0xff00000
+[jmgpu]: exclusive pool CPU physical=0x100000000  GPU physical=0x10000000 size=0x6f000000
+```
+
+- **external（可见）池** = PCIe BAR2（`/proc/iomem` `1000000000-100fffffff : 0000:07:00.0`），
+  CPU 可映射。
+- **exclusive（不可见）池** 的「CPU physical」是 `0x100000000`，但 `/proc/iomem` 里
+  `100000000-16effffff : jmgpu_vram` 这条只是驱动自己 `request_mem_region` 的占位：
+  系统 RAM 只有 `84030000-fbffffff` 与 `2000000000-237fffffff` 两段，PCI 桥窗口也只到
+  `58000000-7fffffff` 和 `1000000000-1fffffffff`。**0x100000000 没有任何宿主桥解码。**
+
+`j9_pathopsychosis()` 对导出做 `pfn = (res->start >> PAGE_SHIFT) + skipPages`，
+对不可见池就是把这个无解码的总线地址装进 PTE：读恒为 `0x00`、写被静默丢弃，
+且 `mmap()` 本身**成功返回**——于是 importer 拿到一块「看起来正常、内容全零」的内存，
+直通画面全绿，而 `vaGetImage`（走 GPU 拷贝）不受影响，与历史现象完全吻合。
+
+解码器（JMDEC）的 render target 由闭源 VA 驱动指定分配在 exclusive 池；
+`vaPutImage`/桌面 pixmap 走 external 池，所以同为 1920x1088 也会一成一败。
+
+### 修复尝试 A（`jmgpu_insert.c`）：关闭不可见池 —— 验证了根因，但不可用
+
+新增模块参数 **`no_exclusive_pool`**（int，0644，默认 0）：置 1 时走驱动原本就有的
+「exclusive pool disabled」分支（`exclusiveBase/Size = 0`），把全部显存分配压到
+CPU 可见的 BAR 窗口内。
+
+实测结果（`options jmgpu no_exclusive_pool=1`）：
+- ✅ 探针全绿：`jm_gem_probe 3145728 1` → `A[ok=768 bad=0] B[ok=768 bad=0]`；
+  `va_export_probe` → `pattern match=8160 mismatch=0`。
+- ✅ `invisible size: 0MB`，`jmgpu-exp/mmap` 全部落在 `pool=4 cpuAcc=1`。
+- ❌ **不可用**：BAR2 只有 256MB，本机桌面（Xorg 85MB + buddycn 122MB + …）已占
+  约 220MB；mpv 再分配 1080p surface 即 `jmgpu_hbo_create failed … ret:-3`
+  与 GL `OUT_OF_MEMORY`，整机显存耗尽导致 IDE 显示异常。
+
+**结论**：不可见池不能砍——它承担了 1776MB 的 GPU 侧容量；而可见池（255MB）
+是硬上限，装不下"桌面 + 解码"。
+
+### 修复尝试 B（最终采用）：同驱动 dmabuf 导入快捷路径
+
+既然可见池容量无法满足，就让**解码 surface 继续留在不可见池**（保住 2048MB），
+但让 **GPU 侧 importer 不必碰 CPU 地址**。
+
+- `jmgpu_bullets.c` 新增 `jmgpu_dmabuf_peek_node(struct dma_buf *)`：
+  若 `dmabuf->ops == &_dmabuf_ops`（即本驱动导出），返回 `dmabuf->priv`
+  （导出时 `exp_info.priv = NodeObject`，就是原始 VIDMEM 节点）。
+- `jmgpu_garbage.c` `j9_handle_j9_dumbbeller()`（本驱动的 `gem_prime_import`）
+  增加快捷分支：命中时 `jmkVIDMEM_NODE_Reference()` + `j9_handle_j9ma_smellproof()`
+  直接把**同一个 VIDMEM 节点**包装成 GEM 对象返回，完全绕开
+  `map_dma_buf → GetSGT`（reserved-mem 该回调是空桩）与 CPU mmap。
+
+适用场景：VA-API 直通里 importer 与 exporter 是同一个驱动（景嘉微 GL/EGL
+导入 VA 刚导出的 surface），因此节点地址天然正确，**与缓冲区在哪个池无关**，
+不可见池也能零拷贝直通。
+
+局限：纯 CPU importer（Mesa/llvmpipe 的 `mmap` 路径）仍读不到不可见池内容，
+需显式 `no_exclusive_pool=1`（代价见上）或厂商补齐 `GetSGT`。
+
+### 关键补充：importer 走的是 mmap，且可见池有 25% 阈值
+
+后续实测推翻了「同驱动导入即可直通」的乐观假设：
+
+1. **Jingjia EGL/GL 的 dmabuf 导入会 mmap**。播放期间内核 `jmgpu-mmap` 日志
+   显示 importer 对导出缓冲反复调用 `.mmap`（`j9_forefence`），因此即使
+   `PRIME_FD_TO_HANDLE` 已 `rc=0`，只要缓冲区在不可见池，importer 拿到的仍是全零。
+2. **`GetSGT`/`map_dma_buf` 路径实际未被使用**（dmesg 无 `map_dma_buf failed` 告警），
+   所以「补齐 GetSGT」并非当前瓶颈。
+3. **池选择有 25% 空闲阈值**（`jmgpu_detect.c:1447-1474`）：
+
+```c
+} else if (pool == J9_HANDLE_J9_PROSNEUSIS) {
+        status = jmkKERNEL_GetVideoMemoryPool(Kernel, J9_HANDLE_J9M_ANTHRAMINE, &videoMemory);
+        if (失败) pool = J9_HANDLE_J9_UNCONTRITE;
+        else {
+                status = jmkKERNEL_GetVideoMemoryPool(Kernel, J9_HANDLE_J9_UNCONTRITE, &videoMemory);
+                if (J9_MONOPHYLETY(status) && (videoMemory->freeBytes < videoMemory->bytes / 4)
+                    && Type != ...) pool = J9_HANDLE_J9M_ANTHRAMINE;   /* 改用不可见池 */
+                else            pool = J9_HANDLE_J9_UNCONTRITE;
+        }
+}
+```
+
+即 **可见池空闲不足 1/4 时，新分配改投不可见池（ANTHRAMINE，pool=12）**。
+实测吻合：本机桌面占用可见池约 206MB/255MB（buddycn 107MB + Xorg 58MB +
+mihomo-party 33.5MB + …），空闲仅 ~49MB < 63.75MB → 解码 surface 全部落
+`pool=12` → 直通全绿；而**刚开机桌面尚未吃满时**（空闲 > 25%），
+`va_export_probe` 的 surface 落在 `pool=4` 且导出字节精确。
+
+进一步实测（`va_export_diag.c` 同时比对导出内容与 `vaGetImage`）：
+
+```
+[vad]#7 NV12 1920x1088 sz=3133440 mmap_nz=0
+[vad]   vaGetImage(1920x1088) nz=6120/6121 head=49 4a 4a 4a
+```
+
+**surface 里有正确解码数据，只是导出映射读不到** —— 与 360p 片源同样复现
+（360p 仅需约 7MB，仍全绿，因为阈值判定与分辨率无关，只看池空闲比例），
+确认瓶颈是「可见池空闲比例」而不是「本次请求大小」。
+
+### 结论与可行路径
+
+- 直通要求解码 surface 落在 **CPU 可见的 255MB 池**，而该池空闲比例被
+  桌面的显存占用压到 25% 阈值以下 → 厂商策略把解码缓冲改投不可见池。
+- 因此**可行修复 = 释放可见池空间**（把桌面占用压到 ~190MB 以下），
+  使解码 surface 重新落到可见池；或内核侧放宽/关闭该 25% 阈值
+  （`jmgpu_detect.c` 上述分支加参数，让「装得下就用可见池」）。
+- 若两者都不做，直通在本机不可行；copy 模式（`vaapi-copy`）不受影响。
+
+### 内核侧加固与重定向实验（`prefer_visible_pool`）
+
+新增模块参数 **`prefer_visible_pool`**（int，0644，默认 0，定义在
+`jmgpu_insert.c`，`jmgpu_detect.c` 使用）：
+
+1. `jmkKERNEL_AllocateVideoMemory()` 入口：`*Pool == ANTHRAMINE(12, 不可见池)`
+   时改请求 `UNCONTRITE(4, 可见池)`；
+2. PROSNEUSIS 分支的「可见池空闲 < 1/4 就改投不可见池」判定加 `!prefer_visible_pool`。
+
+两者都保留了池回退链（可见池装不下 → 仍回退 ANTHRAMINE），**不会造成 OOM**。
+
+**实测结果（本机，`prefer_visible_pool=1`）**：解码 surface 仍为
+`jmgpu-exp: pool=12 … cpuAcc=0`，直通画面仍 `avg=(0,77,0)`（全零深绿）。
+说明**可见池当时确实无法满足该请求**（VA surface 的连续/对齐要求 + 桌面占用），
+重定向只是把失败提前，最终仍回退不可见池。
+
+对照：同一时刻 `jm_gem_probe 3145728 1` 却能落在 `pool=4` 且导出字节精确
+——VA surface 的分配条件（type/flag/alignment）比普通 GEM 更苛刻。
+
+### 可见池能否调大？—— 不能（硬件 BAR 上限）
+
+```
+ppcie_info->mem0bar.no   = 2;                          /* PCI BAR2 */
+ppcie_info->mem0bar.size = pci_resource_len(pdev, 2);  /* 256MB，硬件固定 */
+pargs->slide_window_base = MIN(mem0bar.base + vram_usable_size,
+                               mem0bar.base + mem0bar.size) - HADEPHOBIA(1MB);
+pargs->externalSize[0]   = slide_window_base - mem0bar.base;   /* = 255MB */
+```
+
+- `vram_space_limit` 只参与**不可见池**尺寸计算，调它不会把空间转给可见池；
+- 设备**不支持 Resizable BAR**（`lspci -vvv` capability 里没有该能力），BAR2 固定 256MB；
+- 其它 BAR 也不行：`bar_probe.c` 实测把特征串写进显存后，**BAR0(128MB) 搜不到**
+  （不是显存窗口），**BAR1(32MB) 顺序读取触发总线错误**（稀疏 MMIO）；
+- 滑窗 `HADEPHOBIA` 只有 1MB，且是驱动切页访问用的。
+
+结论：**没有第二条 CPU 可见通道**，255MB 是硬上限，只能靠减少占用。
+
+### 根因收敛：解码 surface 池是"一整块连续显存"
+
+导出日志里 4 个解码 surface 的池内偏移严格等间隔：
+
+```
+pool=12 off=0x5dd6000 bytes=0x2fd000
+pool=12 off=0x5ad9000 bytes=0x2fd000   (差 = 0x2fd000)
+pool=12 off=0x57dc000 bytes=0x2fd000
+pool=12 off=0x54df000 bytes=0x2fd000
+```
+
+即 VA 驱动把**整个解码 surface 池作为一块连续显存申请**，再切成单个 surface。
+因此只要可见窗口里没有足够大的连续空闲块，**整组**都会回退到不可见池。
+
+实测可见池的碎片化程度（`jm_gem_probe` + `gpu_addr` 判池）：
+
+| 请求大小 | 落池 |
+|---|---|
+| 1/2/4/6/8 MB | 可见（最大块 8~11MB） |
+| 12/16 MB | 不可见 |
+
+而 4 个 1080p surface 就需 12.5MB 连续，典型 1080p 流（~20 帧）需 ~63MB 连续
+—— 可见池总空闲虽有 ~65MB，但**最大连续块只有 8~11MB**，必然失败。
+
+**结论**：直通成立的前提是可见窗口里存在足够大的连续空闲区，实质要求
+"解码时可见池基本是空的"。桌面应用（本机 buddycn ~145MB + Xorg ~47MB +
+dde-shell ~17MB）把可见池打得七零八落，因此默认状态下不可行。
+
+### 对策实验：`prefer_visible_pool=2`（交换两池角色）
+
+在 `jmgpu_detect.c` 增加模式 2：把"通用/内部池"路径一律压到不可见池
+（`pool = J9_HANDLE_J9M_ANTHRAMINE`），把显式请求不可见池的（VA 解码）请求
+改到可见池，从而让可见窗口尽量保持整块空闲给解码 surface 池。
+
+- 默认仍是模式 1（安全）；模式 0 = 厂商原行为；
+- 模式 2 属风险实验：桌面的部分缓冲也会进 CPU 不可见池，可能出现显示异常；
+- 运行时可即时回退：`echo 1 > /sys/module/jmgpu/parameters/prefer_visible_pool`。
+
+### 分水岭：内核侧已通，故障转移到 importer（GL/EGL）
+
+开启 `prefer_visible_pool=2` 后（buddycn 130MB 转到不可见池，可见池占用
+190MB→65MB），`./test_passthrough.sh -x` 的实测：
+
+```
+[vad]#7 NV12 1920x1088 sz=3133440 mmap_nz=6120        ← 导出缓冲内容正确
+[vad]   vaGetImage(1920x1088) nz=6120/6121 head=51 51 51 51
+...
+直通(vaapi): 1920x1080 avg=(0,77,0) 绿色占比 100.0%     ← 画面仍是全零
+```
+
+**缓冲里已有正确数据，但 GL 采样到全零** → 内核导出链路（修复 1-4 + 本次
+参数）已经没问题了，最后一环在 importer：
+
+mpv 0.40 的 `vaapi_gl_mapper_init()` 是**二选一**（`video/out/hwdec/dmabuf_interop_gl.c`）：
+
+```c
+    if (ra_gl_get(mapper->ra)->es) {      /* GLES */
+        p->EGLImageTargetTexture2DOES = eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    } else {                              /* desktop GL ← 我们走这里 */
+        p->EGLImageTargetTexStorageEXT = eglGetProcAddress("glEGLImageTargetTexStorageEXT");
+    }
+```
+
+`--gpu-context=x11egl` 下 Jingjia 给的是 **desktop GL**，mpv 于是调用
+`glEGLImageTargetTexStorageEXT`（日志确认：`Using EGL dmabuf interop via
+GL_EXT_EGL_image_storage`）。JM9100 该入口**存在但不真正挂接 dmabuf**，
+纹理保持全零 → 采样全零 → 深绿；而 `glEGLImageTargetTexture2DOES`
+（GL_OES_EGL_image）是 FIXLOG P6 里最小验证程序实测可用的那个入口。
+
+**修复**：`mpv_dmabuf_oes_image.patch` 已更新——desktop 分支解析出 OES 入口后
+**优先使用并置空 storage 指针**（这样 init/map/unmap 三处的生命周期判断自然
+走 OES 路径）。重编 mpv 即可。
+
+### 本机最终状态与建议
+
+- 可见池 255MB 被桌面占约 **206MB**（buddycn 107MB + Xorg 58MB +
+  mihomo-party 33.5MB + …），解码 1080p 需约 **60MB** → **放不下**。
+- 因此本机 1080p 直通**需要先把可见池占用压到 ~190MB 以下**
+  （关闭/重启上述应用），再配合 `prefer_visible_pool=1`；
+  验证方法：`python3 passthrough_verify.py <纯红片源> 255,0,0`
+  （直通行 avg 应≈(255,0,0)，若为 (0,135,0) 即仍是全零导出）。
+- 若不加这些前提，维持 `vaapi-copy`（功能与像素均正确，仅多一次回读）。
+- 厂商侧建议：VA 驱动的解码 surface 不应默认请求 CPU 不可见池；
+  或 EGL/GL 导入 dmabuf 时改用 GEM 句柄（配合本次已实现的
+  `jmgpu_dmabuf_peek_node` 同驱动导入快捷路径）而非 CPU mmap。

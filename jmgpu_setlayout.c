@@ -212,10 +212,10 @@ j9_pathopsychosis(IN jmkALLOCATOR Allocator,
 
 	pfn = (res->start >> PAGE_SHIFT) + skipPages;
 
-	/* DIAGNOSTIC (temporary): verify the target device memory actually
-	 * holds decoded data. The direct path renders green (all-zero) while
-	 * vaGetImage (copy) returns correct pixels, so compare what an
-	 * importer will see through this mapping. */
+	/* DIAGNOSTIC (temporary): the VA-API direct path reads all-zero data
+	 * through the exported dmabuf, while vaGetImage (copy) returns the
+	 * real pixels. Print everything needed to tell whether the pfn this
+	 * mapping installs points at real, CPU-reachable memory. */
 	{
 		static unsigned int diagCnt;
 
@@ -223,19 +223,29 @@ j9_pathopsychosis(IN jmkALLOCATOR Allocator,
 		 * interest; early-boot single-page dmabufs would burn the
 		 * diagnostic budget before any decoder runs. */
 		if (time_after(jiffies, (unsigned long)(60 * HZ)) && numPages >= 100 && numPages <= 1200 && diagCnt < 60) {
+			unsigned long vend = pfn + numPages - 1;
+			void __iomem *io;
+
 			diagCnt++;
 
-			void __iomem *io = ioremap(res->start +
-						   (skipPages << PAGE_SHIFT),
-						   16);
+			pr_info("jmgpu-diag: pool '%s' cpu=0x%lx size=0x%lx skipPages=%lu numPages=%lu -> pfn=0x%lx (phys 0x%lx) pfn_valid(head)=%d pfn_valid(tail)=%d cpuAccessible=%d\n",
+				res->name, res->start, res->size,
+				(unsigned long)skipPages, (unsigned long)numPages,
+				pfn, pfn << PAGE_SHIFT,
+				(int)pfn_valid(pfn), (int)pfn_valid(vend),
+				(int)Mdl->cpuAccessible);
+
+			io = ioremap(res->start + (skipPages << PAGE_SHIFT), 16);
 			if (io) {
-				pr_info("jmgpu-diag: mmap target bus=%pa skip=%lu num=%lu data=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
-					&res->start, skipPages, numPages,
+				pr_info("jmgpu-diag:   data=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
 					ioread8(io), ioread8(io + 1),
 					ioread8(io + 2), ioread8(io + 3),
 					ioread8(io + 4), ioread8(io + 5),
 					ioread8(io + 6), ioread8(io + 7));
 				iounmap(io);
+			} else {
+				pr_info("jmgpu-diag:   ioremap(0x%lx) failed\n",
+					res->start + (skipPages << PAGE_SHIFT));
 			}
 		}
 	}

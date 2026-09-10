@@ -45,6 +45,11 @@
 
 #define J9_ACESODYNE    J9_UNTHEOLOGIZE
 
+/* jmgpu_bullets.c: returns the VIDMEM node behind a dmabuf exported by this
+ * driver (NULL for foreign dmabufs) - used for the same-driver import path. */
+jmkVIDMEM_NODE jmgpu_dmabuf_peek_node(struct dma_buf *dmabuf);
+
+
 
 static int enable_share_to_ft;
 module_param(enable_share_to_ft, int, 0644);
@@ -107,6 +112,31 @@ static struct drm_gem_object *j9_handle_j9_dumbbeller(struct drm_device *drm,
 	if (!gdev)
 		return ERR_PTR(-EINVAL);
 
+	kernel = gdev->device->map[gdev->device->defaultHwType].kernels[0];
+
+	/*
+	 * Same-driver import shortcut: if jmgpu exported this dmabuf we still
+	 * own the underlying VIDMEM node, so wrap that very node into a GEM
+	 * object. Going through map_dma_buf() is not possible for the
+	 * reserved-mem (VRAM) allocator (no .GetSGT) and a CPU mmap of such a
+	 * buffer would only read the fake "invisible VRAM" address as zero,
+	 * which is what broke VA-API direct decode (mpv --hwdec=vaapi).
+	 */
+	{
+		jmkVIDMEM_NODE src = jmgpu_dmabuf_peek_node(dmabuf);
+
+		if (src) {
+			status = jmkVIDMEM_NODE_Reference(kernel, src);
+			if (J9_CATAPHORA(status))
+				return ERR_PTR(-EINVAL);
+
+			gobj = j9_handle_j9ma_smellproof(drm, src);
+			if (IS_ERR(gobj))
+				jmkVIDMEM_NODE_Dereference(kernel, src);
+
+			return gobj;
+		}
+	}
 
 	desc.flag = J9_HANDLE__SMIFLIGATE;
 	desc.handle = -1;
