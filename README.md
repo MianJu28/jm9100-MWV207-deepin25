@@ -183,9 +183,10 @@ WIN+0x38 WIN_CONTRAST        @0x990038 = 0x800000f0   <-- 128*15/8：LUT 装的�
    池内偏移严格等间隔 `0x2FD000`），再切成单个 surface。而 CPU 可见窗口只有
    255MB（BAR2），被桌面应用打碎后最大连续空闲块只剩 8~11MB，装不下该申请
    （4 个 1080p surface 需 12.5MB 连续，典型流需 ~63MB 连续）→ **整组回退**到
-   1776MB 不可见池。不可见池的"CPU 物理地址"只是驱动 `request_mem_region`
-   的占位地址，**没有任何宿主桥解码**：`mmap()` 会成功返回，但读恒为 `0x00`、
-   写被静默丢弃。
+   1776MB 不可见池。不可见池在 BAR2 之外，驱动只给了它一个 `request_mem_region`
+   的**占位 CPU 地址**、没有宿主桥解码：直接对它 `remap_pfn_range()` 会成功返回，
+   但读恒为 `0x00`、写被静默丢弃。（仅指 `dma_buf_mmap()` 这条路——不可见池
+   并非 CPU 完全够不到，驱动另有滑动窗口，见下方「补」中的两条路径对比。）
 2. **mpv 的导入入口选错。**
    mpv（0.40/0.41）的 `vaapi_gl_mapper_init()` 在 desktop GL 下只解析并调用
    `glEGLImageTargetTexStorageEXT`；JM9100 的该入口**存在但不真正把 dmabuf
@@ -226,6 +227,31 @@ dmabuf 的，**与缓冲落在哪个池无关**。因此内核侧保持**厂商�
   `vaapi-copy`/软解，画面正确但非零拷贝）——把静默错误变成可见、可回退的失败；
 - Jingjia EGL/GL 的 GPU 侧导入不受影响（不经 `dma_buf_mmap`），零拷贝直通照旧；
 - `allow_invisible_mmap=1` 可复现历史（静默全零）行为，仅用于排查。
+
+**为什么是"拒绝"而不是"改走滑动窗口"**（2026-09-11 实测澄清）
+
+不可见池并非 CPU 完全够不到：驱动在 **BAR2 末尾**开了一块 128KB 一档的
+**滑动窗口**（`slide_window_base/top`，`jmgpu_insert.c`），GEM/dumb 的 `mmap()`
+缺页时（`jmgpu_garbage.c: j9_handle_j9_sitatungas`）把窗口页重指向设备显存页，
+并 `unmap_mapping_range()` 失效旧映射。但 `dma_buf_mmap()` 这条路径**不经过**
+窗口，只有占位地址上的 `remap_pfn_range()` 一条路，于是"映射成功、读全零"：
+
+| CPU 访问路径 | 走的代码 | 不可见池结果 |
+|---|---|---|
+| `dma_buf_mmap()`（Mesa/llvmpipe 导入 dmabuf） | reserved-mem `.Mmap` | 静默读全零 → **故显式拒绝** |
+| GEM/dumb `mmap()`（`j9_diluvianism` + 缺页） | `j9_handle_j9_sitatungas` | **可用**（滑动窗口） |
+
+不改走窗口的理由是性能与资源，而非"不可能"：窗口一次仅映射 128KB、每次滑动
+都要失效旧映射，整帧采样（1080p NV12 = 3MB/帧）会严重抖动；且窗口是全局共享
+资源，与厂商用户态自身的用法有冲突风险。实测 GEM/dumb 通路完好：
+
+```
+$ ./jm_dumb_probe /dev/dri/card0
+[1] CREATE_DUMB      : ok (handle=1 pitch=1024 size=262144)
+[2] MAP_DUMB(取偏移) : ok (offset=0x1007f1000)
+[3] mmap             : ok (0xffff811d0000)
+[4] 读写回环         : map[0]=0xa5 map[63]=0xa5 (正常)
+```
 
 内核级复现（`./jm_gem_probe <bytes> 1`；尺寸要大到可见池装不下才会落到
 不可见池，本机实测 **64MB 起**如此，32MB 仍落可见池）：
@@ -293,6 +319,59 @@ LD_LIBRARY_PATH=$PWD/build PATH=$PWD/build:$PATH \
 
 ---
 
+### 3.4 卸载/重载 与 S3 挂起恢复（2026-09-11 实测 ✅）
+
+用 `jmgpu_reload_test.sh` 在 **SSH 会话**里执行（图形会话会被停掉，所以发起
+通道必须独立于桌面）：
+
+| 检查项 | 结果 |
+|---|---|
+| 停机前引用计数 | 121 / 93（两次独立运行） |
+| 停 lightdm + 结束 X 后 | 引用计数 **0**，`fuser /dev/dri/card0` 无占用 → 客户端都正常释放 |
+| `rmmod jmgpu` | rc=0，`/dev/jmgpu`、`/dev/dri` 全部消失，dmesg 仅 `jmgpu_dec: module removed` |
+| `modprobe jmgpu` | 重建 `/dev/jmgpu`+`card0`+`renderD128`，初始化链完整、无告警 |
+| 重复性 | 连续两次结果一致 |
+| **S3（带活动桌面）** | 挂起前 `lightdm=active`；唤醒后 vram / decoder / cores / j2d / dvfs / jaudio / **kms** 全部 `resume done`，**桌面存活**，无 BUG/WARNING |
+
+过程中修掉两处问题：
+
+1. **测试脚本自身（非驱动问题）**：`pkill -9 Xorg` 不会清理 `/tmp/.X0-lock` 与
+   `/tmp/.X11-unix/X0`，残留使 lightdm 之后启 X 报
+   `Cannot establish any listening sockets - Make sure an X server isn't already running`
+   → 桌面再也起不来，只能重启。现改为：先 `TERM` 等 X 自清（5s），必要时才 `-9`，
+   **`-9` 后强制清锁/socket**；restore 改为**轮询等待 30s**（原先 4s 就判死并
+   restart，越帮越忙），失败时自动把 `systemctl status lightdm` /
+   `journalctl -u lightdm` / Xorg 日志收进测试日志。
+   同样的陷阱在既有 `verify_jmgpu_probe_ssh.sh` 里也有，已一并修正。
+   修复后同一脚本能自动把桌面带回来（`lightdm=active`）。
+
+2. **SCDC 日志级别**（`jmgpu_nicely.c`）：普通 1080p sink 不支持 SCDC，
+   `drm_scdc_readb` 返回 `-ENXIO(-6)` 属**正常降级**（Scrambling/TMDS 比率是
+   HDMI 2.0 高时钟才需要），原实现却按 `DRM_ERROR` 打印，于是每次建链、每次
+   S3 恢复都刷 4 行 `*ERROR*`，既误导又把真正的错误淹没。现改为：无 SCDC 的
+   sink 只 `DRM_INFO` 提示一次，其余失败降为 `DRM_DEBUG_KMS`。
+
+   验证（2026-09-11 重启后，模块 `F55C8DA4…`）：
+
+   ```
+   $ sudo dmesg | grep -i scdc
+   [   27.854490] [drm] HDMI sink does not support SCDC (err=-6);
+                  scrambling / TMDS clock-ratio setup skipped
+   ```
+
+   只有一行一次性 INFO、**零 `*ERROR*`**；随后用 `xrandr` 反复切换刷新率
+   （等价于重新建链）也不再产生任何输出。
+
+> **环境事实（排查须知）**：本机 `journalctl -k` **不收录内核消息**（只有 1 行），
+> 且 `kernel.dmesg_restrict=1` —— 内核日志只能靠 `sudo dmesg` 取得，
+> 排查时不要用 journal。
+
+> 已知但未改动：`jmgpu_dec: IRQ irq[0] not in use!`（每次加载都出现）——
+> 解码器未注册独立 IRQ（走轮询/共享机制）。硬解实测正常（600 帧 1080p30 仅
+> 0.70s CPU），按信息性提示处理，待有 IRQ 负载疑虑时再深查。
+
+---
+
 ## 4. 部署
 
 ### 4.1 首次部署 / 持久化 / 回滚
@@ -321,8 +400,17 @@ sudo reboot
 > **红线**：`dkms install` 后**必须重建 initramfs 再重启**——开机早期
 > `modules-load` 加载的是 initramfs 冻结的模块副本，否则新代码永远不生效
 > （历史上多次"修复无效"的误判均由此而来）。
+> 2026-09-11 又实测到一次：新模块已装到磁盘，但重启后运行的仍是 initramfs 里
+> 上一版（`srcversion` 不一致），直到重建 initramfs 才恢复一致。
+> 修复后的正向验证：重建 initramfs 后重启（16:40:49），运行态 `srcversion`
+> 与磁盘/initramfs 完全一致（`F55C8DA4…`），即开机早期加载的确实是最新模块。
 >
-> initramfs 重建若报 dracut `138/139` 段错误属**偶发**，重试一次即可。
+> initramfs 重建时 dracut 会偶发 `failed with 139` / `Segmentation fault`
+> （`dracut-install` 调用的 `cp` 段错误，本机常见于 `pata_opti`、`hid-ezkey`、
+> `ti-am65-cpsw-nuss`、`xhci-mtk-hcd` 等**与显存无关**的模块）——
+> 它**不一定导致命令失败**，却可能静默漏拷。因此 `sync_dkms.sh build`
+> 现在会自动重试一次，并**校验 initramfs 里的 `jmgpu.ko` 与磁盘模块同指纹**，
+> 不一致时以非零码退出并给出处理建议。
 
 验证运行中模块确实是新模块：
 
@@ -330,6 +418,11 @@ sudo reboot
 cat /sys/module/jmgpu/srcversion                                      # 运行中指纹
 modinfo -F srcversion /lib/modules/$(uname -r)/updates/dkms/jmgpu.ko  # 磁盘指纹
 # 两者一致 = 新模块已生效；不一致 = 加载的是 initramfs 冻结的旧模块
+
+# 直接校验 initramfs 内容（sync_dkms.sh build 已内置同样的检查）
+sudo rm -rf /tmp/ir && mkdir -p /tmp/ir
+sudo unmkinitramfs /boot/initrd.img-$(uname -r) /tmp/ir
+find /tmp/ir -name 'jmgpu.ko' -exec modinfo -F srcversion {} \;
 ```
 
 ### 4.3 重装系统后需重做的两件事
@@ -476,10 +569,13 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | `sync_dkms.sh` | 同步源码到 DKMS + build + install + update-initramfs（一条龙） |
 | `force_mode_test.sh` | 强制点屏验证与持久化接管 / 回滚（`boot` / `boot-undo`） |
 | `test_passthrough.sh` | **直通一键自检**（纯色片源判定 + 导出诊断 + 环境体检） |
-| `drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 与当前 `GAMMA_LUT` blob 项数（定位灰蒙蒙根因用，§3.2） |
+| `drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 以及当前 `GAMMA_LUT` blob 的项数与内容（定位灰蒙蒙根因用，§3.2） |
+| `jmgpu_reload_test.sh` | **卸载/重载 + S3 验证脚本**（须在 SSH/TTY 中跑，自带恢复桌面与回滚，§3.4） |
+| `jm_dmabuf_cycle.c` | dmabuf 导出→同驱动导入→释放 循环压测与泄漏检查（无需 root，§3.3 相关） |
 | `va_export_probe.c` | VA 导出保真度探针（`vaPutImage`→导出→逐字节比对） |
 | `va_export_diag.c` | LD_PRELOAD 导出诊断（mmap 内容 vs `vaGetImage`） |
 | `jm_gem_probe.c` | 内核 GEM 导出双向校验（CPU↔dmabuf 交叉比对、pagemap） |
+| `jm_dumb_probe.c` | dumb/GEM `mmap()` 通路探针（`CREATE_DUMB`/`MAP_DUMB`/`mmap` 三态 + 读写回环），用于区分「滑动窗口可用」与「dmabuf 路径静默全零」（§3.3 补） |
 | `bar_probe.c` | 验证其它 PCI BAR 是否也是显存窗口 |
 | `ppm_stats.py` / `passthrough_verify.py` | 截图取色判定直通画面 |
 | `dump_display_regs.sh` / `dump_full_regs.sh` / `fix_win_contrast.sh` | 显示域寄存器 dump 与写回（诊断） |

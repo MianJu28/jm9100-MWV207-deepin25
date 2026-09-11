@@ -821,7 +821,29 @@ static inline int drm_scdc_writeb(struct i2c_adapter *adapter, u8 offset,
  * 6.6+ 内核的 drm_scdc_set_scrambling/set_high_tmds_clock_ratio 为 connector
  * 签名且依赖 connector->ddc; 本模块 SCDC 一律走自管 adapter, 避免签名与
  * 空指针耦合. (原定义位于 <4.12 条件块内, 现对所有内核版本开放)
+ *
+ * 日志级别: SCDC 只在 HDMI 2.0 (高 TMDS 时钟/4K) 场景才需要, 普通 sink
+ * 对 SCDC 寄存器一律不应答, drm_scdc_readb 返回 -ENXIO(-6)。这属于正常
+ * 降级(时序照原样走), 但原实现用 DRM_ERROR 打印, 于是每次建链、每次 S3
+ * 恢复都刷 4 行 *ERROR* (2026-09-11 S3 验证中实测), 既误导又会把真正的
+ * 错误淹没。现在: 无 SCDC 的 sink 只提示一次(INFO), 其余失败降为
+ * DEBUG_KMS(可用 dynamic debug 打开)。
  */
+static bool jmgpu_scdc_notice_once;
+
+static void jmgpu_scdc_notice(const char *what, int err)
+{
+	if (err == -ENXIO) {
+		if (!jmgpu_scdc_notice_once) {
+			jmgpu_scdc_notice_once = true;
+			DRM_INFO("HDMI sink does not support SCDC (err=%d); scrambling / TMDS clock-ratio setup skipped\n",
+				 err);
+		}
+		return;
+	}
+	DRM_DEBUG_KMS("SCDC %s failed, err=%d\n", what, err);
+}
+
 bool jmgpu_scdc_set_scrambling(struct i2c_adapter *adapter, bool enable)
 {
 	u8 config;
@@ -829,7 +851,7 @@ bool jmgpu_scdc_set_scrambling(struct i2c_adapter *adapter, bool enable)
 
 	ret = drm_scdc_readb(adapter, SCDC_TMDS_CONFIG, &config);
 	if (ret < 0) {
-		DRM_ERROR("Failed to read tmds config, err=%d\n", ret);
+		jmgpu_scdc_notice("read tmds config", ret);
 		return false;
 	}
 
@@ -840,7 +862,7 @@ bool jmgpu_scdc_set_scrambling(struct i2c_adapter *adapter, bool enable)
 
 	ret = drm_scdc_writeb(adapter, SCDC_TMDS_CONFIG, config);
 	if (ret < 0) {
-		DRM_ERROR("Failed to enable scrambling, error %d\n", ret);
+		jmgpu_scdc_notice("enable scrambling", ret);
 		return false;
 	}
 
@@ -854,7 +876,7 @@ bool jmgpu_scdc_set_high_tmds_clock_ratio(struct i2c_adapter *adapter, bool set)
 
 	ret = drm_scdc_readb(adapter, SCDC_TMDS_CONFIG, &config);
 	if (ret < 0) {
-		DRM_ERROR("Failed to read tmds config, err=%d\n", ret);
+		jmgpu_scdc_notice("read tmds config", ret);
 		return false;
 	}
 
@@ -865,7 +887,7 @@ bool jmgpu_scdc_set_high_tmds_clock_ratio(struct i2c_adapter *adapter, bool set)
 
 	ret = drm_scdc_writeb(adapter, SCDC_TMDS_CONFIG, config);
 	if (ret < 0) {
-		DRM_ERROR("Failed to set TMDS clock ratio, error %d\n", ret);
+		jmgpu_scdc_notice("set TMDS clock ratio", ret);
 		return false;
 	}
 

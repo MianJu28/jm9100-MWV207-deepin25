@@ -43,6 +43,10 @@ systemctl stop lightdm 2>>"$LOG"
 sleep 2
 pkill -9 Xorg 2>/dev/null
 sleep 1
+# SIGKILL 不会清理 X 的锁/socket，残留会让之后 lightdm 启 X 报
+# "Cannot establish any listening sockets - server already running"（见
+# jmgpu_reload_test.sh 头部说明），必须手动清掉。
+rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null
 
 # ---------- 卸载 mwv207 ----------
 log "[2] 卸载 mwv207"

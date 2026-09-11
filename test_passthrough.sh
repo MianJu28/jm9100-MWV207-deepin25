@@ -61,9 +61,11 @@ export DISPLAY
 export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-jmgpu}"
 RENDER=/dev/dri/renderD128
 VID="/tmp/pt_red_${SIZE}.mp4"
-# 读 dmesg / debugfs 需要 root；非 root 时用 sudo（可能会提示一次密码）
+# 读 dmesg / debugfs 需要 root；非 root 时用 sudo -n（非交互）：
+# 凭据未缓存时立即失败，下面各处会打印"已跳过"，而不是卡在密码提示上
+# （后台/自动化运行时裸 sudo 会让整个脚本永久挂起）。
 sudo=()
-[ "$(id -u)" = "0" ] || sudo=(sudo)
+[ "$(id -u)" = "0" ] || sudo=(sudo -n)
 
 hr() { printf '%s\n' "------------------------------------------------------------"; }
 say() { printf '%s\n' "$*"; }
