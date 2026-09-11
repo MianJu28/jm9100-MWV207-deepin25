@@ -31,6 +31,9 @@
 
 #define J9_ACESODYNE    J9_PASTURES
 
+/* See jmgpu_insert.c: 0 (default) refuses CPU mmap of the CPU-invisible pool. */
+extern int allow_invisible_mmap;
+
 
 
 struct reserved_mem {
@@ -196,17 +199,35 @@ j9_pathopsychosis(IN jmkALLOCATOR Allocator,
 	j9_tympanichord("Allocator=%p Mdl=%p vma=%p", Allocator, Mdl, vma);
 
 	/*
-	 * Mdl->cpuAccessible only states whether the owner driver itself
-	 * reads/writes the pool through the CPU. The backing memory is device
-	 * VRAM on the PCIe BAR and stays CPU-addressable regardless of that
-	 * flag. A dmabuf exported from this pool must remain mappable:
-	 * foreign importers (e.g. Mesa/llvmpipe during EGL dmabuf import in
-	 * the VA-API direct path) take an mmap() of the buffer, and refusing
-	 * here makes their mmap fail with EINVAL ("dmabuf import failed to
-	 * mmap: Invalid argument" in mpv) and kills the direct path.
+	 * Refuse to CPU-map the CPU-inaccessible VRAM pool.
+	 *
+	 * Mdl->cpuAccessible is exactly "this pool is not reachable from the
+	 * CPU": the "exclusive" pool is reserved in iomem at a bus address no
+	 * host bridge decodes, its CPU physical base being only a driver
+	 * placeholder (see jmgpu_scroll.c, which registers the external pool
+	 * CPU-accessible and the exclusive one not). remap_pfn_range() on that
+	 * range still succeeds, but the mapping reads as zero and drops
+	 * writes - it only *looks* like working memory.
+	 *
+	 * An importer that samples an exported dmabuf through the CPU -
+	 * Mesa/llvmpipe during EGL dmabuf import, i.e. the VA-API direct path
+	 * on a software GL stack - therefore produced an all-zero (dark green)
+	 * frame with no error reported anywhere. Report the failure instead so
+	 * it falls back to a copy path: a visible failure beats silent
+	 * corruption.
+	 *
+	 * The GPU-side import route (Jingjia EGL/GL importing the dmabuf
+	 * through the same-driver GEM shortcut, see jmgpu_dmabuf_peek_node)
+	 * never comes through here and keeps working.
 	 */
-	if (!Mdl->cpuAccessible)
-		pr_warn_ratelimited("jmgpu: dmabuf mmap on pool marked non-CPU-accessible (res=%pK)\n", res);
+	if (!Mdl->cpuAccessible && !allow_invisible_mmap) {
+		pr_info_ratelimited("jmgpu: refusing CPU mmap of %lu pages in pool '%s' @0x%lx (pid %d '%s'): pool is not host-addressable, so the mapping would read zeros; use allow_invisible_mmap=1 to override\n",
+				    (unsigned long)numPages, res->name,
+				    res->start, current->pid, current->comm);
+
+		JMM_kFOOTER();
+		return J9_HANDLE_J9M_UNFEMINISE;
+	}
 
 	JMM_kASSERT(skipPages + numPages <= Mdl->numPages);
 

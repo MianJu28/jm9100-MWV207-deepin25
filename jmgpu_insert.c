@@ -79,6 +79,30 @@ MODULE_PARM_DESC(no_exclusive_pool,
 		 "for working dmabuf export / VA-API direct passthrough");
 
 /*
+ * Refuse to CPU-map buffers that live in the CPU-inaccessible VRAM pool.
+ *
+ * That pool is reserved in iomem at a bus address no host bridge decodes, so
+ * remap_pfn_range() on it "succeeds" while every read returns zero and every
+ * write is dropped. An importer that samples an exported dmabuf through the
+ * CPU (Mesa/llvmpipe during EGL dmabuf import - i.e. VA-API direct playback
+ * on a software GL stack) then renders an all-zero, dark green frame without
+ * a single error being reported anywhere. Refusing the mmap instead makes
+ * such importers fail cleanly and fall back to a copy path.
+ *
+ * GPU-side importers are unaffected: the Jingjia EGL/GL stack imports the
+ * dmabuf through the same-driver GEM shortcut (see jmgpu_dmabuf_peek_node)
+ * and never mmaps it, so VA-API direct playback with the Jingjia GL stack
+ * keeps working with this at its default.
+ *
+ * Only set this to 1 to reproduce the historical silent-zero behaviour.
+ */
+int allow_invisible_mmap;
+module_param(allow_invisible_mmap, int, 0644);
+MODULE_PARM_DESC(allow_invisible_mmap,
+		 "allow CPU mmap of buffers in the CPU-invisible VRAM pool "
+		 "(the mapping reads zeros; debug only, default 0 = refuse)");
+
+/*
  * See jmgpu_detect.c for the rationale: keep new video memory allocations in
  * the CPU-visible pool while it can still satisfy them, instead of bailing
  * out to the invisible pool as soon as it is 3/4 full.

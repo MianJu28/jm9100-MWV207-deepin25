@@ -8,7 +8,7 @@
 | # | 问题 | 状态 | 主要修复位置 |
 |---|---|---|---|
 | 1 | HDMI 无信号（内核 oops） | ✅ | `jmgpu_nicely.c` |
-| 2 | 显示灰蒙蒙（低对比度） | ✅ | `jmgpu_package.c`（`gamma_norm`） |
+| 2 | 显示灰蒙蒙（低对比度） | ✅ | `jmgpu_package.c`（GAMMA_LUT 契约 768 → 256） |
 | 3 | VA-API 直通画面全绿 | ✅ | `mpv_dmabuf_oes_image.patch` + `jmgpu_bullets.c` / `jmgpu_setlayout.c` |
 
 - 部署流程见 **§4**，日常使用见 **§5**。
@@ -100,30 +100,74 @@ drm_mode_setcrtc → drm_atomic_commit → commit_tail
 **症状**：jmgpu 栈下任意内容整体低对比度——**黑发灰、白不白、色相完全正确**；
 硬件光标正常（cursor plane 不走主 surface 的 LUT）。mwv207 栈显示正常。
 
-**根因**：X 专有驱动 `mwv207_drv.so` 的 gamma 下发存在**固定 1/3 线性缩放缺陷**：
+**根因（2026-09-11 更正）**：不是 X 驱动的问题，是**本仓库内核驱动的
+color-mgmt 契约与自身消费端不一致**：
 
-| 用户请求 | X 驱动下发的 ramp（采样 `[0,64,128,192,255]`） | 含义 |
-|---|---|---|
-| 亮度 1.0（恒等） | `0,21,42,64,85` | = in × **1/3**（85 = 255/3） |
-| 亮度 0.5 | `0,11,21,32,43` | = in × 0.5/3 |
+```c
+jmgpu_package.c:1270  drm_crtc_enable_color_mgmt(&jcrtc->base, 768, true, 768);
+                      /* 宣称 gamma_lut_size = 768 —— 厂商把「3 通道 × 256」
+                         误当成了一个 LUT 的项数 */
+jmgpu_package.c:587   for (i = 0; i < 256; i++)    /* 却只读前 256 项 */
+```
 
-即 `out = in × brightness / 3`。原样写入硬件 LUT 后：恒等请求变成暗化表
-→ 整屏"蒙灰滤镜"；亮度滑条只剩应有值的 1/3。
+DRM 的契约是「`gamma_lut_size` 个表项，每项自带 r/g/b」，不是三通道首尾相接。
+于是客户端下发的 **768 项 identity ramp 只有前 1/3 进硬件**，采样值恰好是
+`0,21,42,64,85` = `in/3` —— 整屏被压到 1/3 动态范围，表现为"黑发灰、白不白、
+色相正确"，且亮度值只剩应有的 1/3。
 
-**定位手段**：`gamma_norm` 的采样日志（`dmesg | grep "gamma_lut updated"`）
-直接打印 X 驱动下发的 ramp；并与开源栈逐寄存器对比 `WIN_CONTRAST(0x990038)`
-（jmgpu `0x8000004E` 暗化表 vs mwv207 `0x800000F1` 恒等表）。
+**证据**（本轮新增探针 `drm_gamma_probe.c`，读 CRTC 的真实属性）：
 
-**修复**（`jmgpu_package.c`）：新增三态参数 **`gamma_norm`**（int，0644，默认 **3**）
+```
+$ ./drm_gamma_probe /dev/dri/card0
+crtc 35: legacy gamma_size=256
+  GAMMA_LUT_SIZE     value: 768          <-- 对外宣称 768 项
+  GAMMA_LUT          blob: 6144 字节 = 768 项   <-- 客户端确实下发了 768 项
+  DEGAMMA_LUT_SIZE   value: 768          <-- 驱动并未实现 degamma
+```
 
-| 值 | 行为 |
-|---|---|
-| **3（默认）** | 写 LUT 前 ramp **×3 归一化**（clamp 255）→ 恒等请求恢复线性表，亮度/gamma 按真实意图生效 ✅ |
-| 0 | 完全跳过用户态 gamma（LUT 恒为 reset 线性表）→ 画面正常但亮度调节失效（应急） |
-| 1 | 原样写（厂商原始行为）→ 复现灰滤镜缺陷 |
+而驱动内部 `lutdata[3*256]`、`pWriteData = data + rgb*256` 与读取循环
+都只按 **256 项/通道** 工作。
 
-**验证**：灰滤镜消失，系统设置→显示→亮度滑条平滑可用；
-`WIN_CONTRAST` 自动恢复 `0x800000F0`。
+> 历史结论「X 专有驱动 `mwv207_drv.so` 的 gamma 下发有固定 1/3 缩放缺陷」
+> **不成立**：X 下发的是完全正确的 768 项 identity ramp（其项数正是照内核宣称的
+> `GAMMA_LUT_SIZE` 来的）。当时的 `gamma_norm=3` 补偿是在补我们自己的 bug，
+> 且补偿会带来精度损失（X 侧 ramp 先被截断到 1/3 分辨率，再乘 3 放大，
+> 灰阶只能落在 3 的倍数上）。
+
+**修复**（`jmgpu_package.c`）
+
+1. 新增常量 **`JMGPU_LUT_ENTRIES_PER_CHANNEL = 256`**，同时用于：
+   对外宣称的 `gamma_lut_size`、`lutdata[3*N]` 布局、`pWriteData = data + rgb*N`、
+   `atomic_flush` 的读取项数 —— 三者不可能再各自漂移；
+2. `drm_crtc_enable_color_mgmt(crtc, 256)`：degamma/CTM 本驱动未实现，
+   一并关闭（改前客户端设置它们会被静默忽略）；契约与
+   `drm_mode_crtc_set_gamma_size(256)` 统一；
+3. `atomic_flush` 增加 `BUILD_BUG_ON` 与 blob 长度校验告警；
+4. `gamma_norm` 默认值由 3 改回 **1（原样写）**——契约修正后这就是正确行为。
+
+**验证（2026-09-11 实测通过 ✅，模块 `3D636A0CE8AA8C215CACE52`，`gamma_norm=1`）**
+
+```
+$ ./drm_gamma_probe /dev/dri/card0
+crtc 35: legacy gamma_size=256
+  GAMMA_LUT          blob: 2048 字节 = 256 项      <-- 契约与消费项数一致
+    ramp 采样(8位) R: 0 64 128 192 255  G: 0 64 128 192 255  B: 0 64 128 192 255
+    判定: 线性(正确)
+  GAMMA_LUT_SIZE     value: 256
+（DEGAMMA_LUT / CTM 属性已不再提供）
+
+$ sudo grep -i CONTRAST /tmp/reg.txt          # 显示域寄存器 dump
+WIN+0x38 WIN_CONTRAST        @0x990038 = 0x800000f0   <-- 128*15/8：LUT 装的是线性表
+                                                      （修复前为 0x8000004e ≈ 42 = 128/3）
+```
+
+即：X 下发的 256 项 ramp 被**完整**消费，硬件 LUT 为精确线性表，且**无需任何
+内核侧补偿**（`gamma_norm=1`）。这一结果同时反证了历史结论——X 下发的本来就是
+线性 ramp（`0,64,128,192,255`），并不存在"1/3 缩放缺陷"。
+
+**回退**：若客户端仍按旧契约提交 768 项 blob（未重启 X 时），`drm_atomic` 会以
+`-EINVAL` 拒绝，此时改回 `echo 3 | sudo tee /sys/module/jmgpu/parameters/gamma_norm`
+即可临时回到旧行为；`gamma_norm` 参数保留正是为了这种兼容场景。
 
 ---
 
@@ -143,29 +187,109 @@ drm_mode_setcrtc → drm_atomic_commit → commit_tail
    的占位地址，**没有任何宿主桥解码**：`mmap()` 会成功返回，但读恒为 `0x00`、
    写被静默丢弃。
 2. **mpv 的导入入口选错。**
-   mpv 0.40 的 `vaapi_gl_mapper_init()` 在 desktop GL 下只解析并调用
+   mpv（0.40/0.41）的 `vaapi_gl_mapper_init()` 在 desktop GL 下只解析并调用
    `glEGLImageTargetTexStorageEXT`；JM9100 的该入口**存在但不真正把 dmabuf
-   挂接到纹理**，纹理恒为全零。
+   挂接到纹理**，纹理恒为全零（JM9100 只声明 `GL_OES_EGL_image`，不声明
+   `GL_EXT_EGL_image_storage`）。
 
 **修复**
 
 | 侧 | 改动 |
 |---|---|
-| mpv（`mpv_dmabuf_oes_image.patch`） | `video/out/hwdec/dmabuf_interop_gl.c`：desktop 分支解析出 `glEGLImageTargetTexture2DOES`(GL_OES_EGL_image) 后**优先使用并把 storage 指针置空**（init/map/unmap 三处生命周期判断随之自动走 OES 路径）；扩展检查放宽为 OES / storage 任一 |
-| 内核（dmabuf 导出链） | ① reserved-mem `.Mmap` 删除 `!cpuAccessible` 拒绝分支（BAR 显存物理上始终可映射）；② 导出尺寸改 `PAGE_ALIGN()` 向上对齐；③ `.map_dma_buf` 失败改返回 `ERR_PTR`（原返回 NULL 会被解引用）；④ `mmap`/导出补越界防御（clamp 到池尾）与限流诊断日志 |
+| mpv（`mpv_dmabuf_oes_image.patch`） | `video/out/hwdec/dmabuf_interop_gl.c`：desktop GL 分支在未声明 `GL_EXT_EGL_image_storage` 时改用 `glEGLImageTargetTexture2DOES`(GL_OES_EGL_image)（init/map/unmap 三处生命周期判断随之自动走 OES 路径）；扩展检查放宽为 OES / storage 任一。补丁同时适配 mpv 0.40 与 0.41 |
+| 内核（dmabuf 导出链） | ① 导出尺寸改 `PAGE_ALIGN()` 向上对齐；② `.map_dma_buf` 失败改返回 `ERR_PTR`（原返回 NULL 会被解引用）；③ `mmap`/导出补越界防御（clamp 到池尾）与限流诊断日志；④ reserved-mem `.Mmap` 对**非宿主可寻址**池（`cpuAccessible=FALSE` 的不可见池）直接拒绝——见下方「补」 |
 | 内核（同驱动导入） | 新增 `jmgpu_dmabuf_peek_node()`：dmabuf 由本驱动导出时（`dmabuf->ops == &_dmabuf_ops`），`j9_handle_j9_dumbbeller()` 直接复用原 VIDMEM 节点包装成 GEM 对象，绕开 reserved-mem 缺失的 `.GetSGT`（该空桩会让标准 `map_dma_buf` 导入永远失败） |
 
 **关键认识**：改用 OES 入口后，Jingjia EGL/GL 是经 **GEM 句柄在 GPU 侧**导入
 dmabuf 的，**与缓冲落在哪个池无关**。因此内核侧保持**厂商默认池策略**即可，
 不需要 `prefer_visible_pool` / `no_exclusive_pool` 等参数。
 
-**验证**（`./test_passthrough.sh -s 1080p`，纯红片源）：
+**补（2026-09-11，据应用侧实测）：CPU 侧 importer 必须被显式拒绝**
+
+上述「与池无关」只对 **GPU 侧导入**成立。应用侧审计
+（purelive `docs/LINUX_JM9100_HWDECODE_AUDIT.md` §10.1）实测到另一条路径：
+
+| 实测 | 结果 |
+|---|---|
+| 纯 EGL/ES 进程 + Jingjia EGL，`hwdec=vaapi` | ✅ `Using EGL dmabuf interop via GL_OES_EGL_image`，回读帧为源色红 `(254,24,0)` |
+| 同一路径改用 **Mesa/llvmpipe**（应用 §9.2 的 UI 形态） | ⚠️ 仍报 `hwdec-current=vaapi`，但回读帧是**全零 NV12 深绿** `(26,130,73)` |
+
+原因：Mesa/llvmpipe 的 dmabuf 导入**要走 CPU mmap**（`dma_buf_mmap()`）。旧代码在
+不可见池上把 `remap_pfn_range()` 装进 PTE 并成功返回，映射却恒读 `0` ——
+**全链路无一处报错，画面静默变绿**。
+
+因此 `j9_pathopsychosis` 现在对 `cpuAccessible=FALSE` 的池**拒绝 CPU mmap**
+（`-ENODEV`/`EINVAL`，限流日志打印池名、总线地址与进程名），
+新参数 **`allow_invisible_mmap=0`（默认）** 即为该行为。效果：
+
+- llvmpipe 这类 CPU importer 的导入**立即失败**（mpv 日志出现 mmap 失败并回落
+  `vaapi-copy`/软解，画面正确但非零拷贝）——把静默错误变成可见、可回退的失败；
+- Jingjia EGL/GL 的 GPU 侧导入不受影响（不经 `dma_buf_mmap`），零拷贝直通照旧；
+- `allow_invisible_mmap=1` 可复现历史（静默全零）行为，仅用于排查。
+
+内核级复现（`./jm_gem_probe <bytes> 1`；尺寸要大到可见池装不下才会落到
+不可见池，本机实测 **64MB 起**如此，32MB 仍落可见池）：
 
 ```
+# 32MB → 可见池：两端映射内容一致（无回归）
+sz=33554432 flags=0x1 gpu_addr=0xcc26000 ... A[ok=8192 bad=0] B[ok=8192 bad=0] cpu[0]=5a dma[0]=5a
+
+# 64MB → 不可见池，allow_invisible_mmap=0（默认）：直接显式失败
+sz=67108864 flags=0x1 mmap dmabuf FAILED
+
+# 64MB → 不可见池，allow_invisible_mmap=1（旧行为）：成功但读全零
+sz=67108864 flags=0x1 gpu_addr=0x123cf000 ... A[ok=64 bad=16320] B[ok=0 bad=16384] cpu[0]=a5 dma[0]=00
+#                                        ↑ CPU 映射写入生效      ↑ dmabuf 映射读全零
+```
+
+对应的内核日志：
+
+```
+jmgpu: refusing CPU mmap of 16384 pages in pool 'jmExtMem0' @0x100000000
+  (pid 17236 'jm_gem_probe'): pool is not host-addressable, so the mapping
+  would read zeros; use allow_invisible_mmap=1 to override
+```
+
+> 注：`jmExtMem0` 是厂商给 external/exclusive 两个池起的同一个名字（`jmgpu_scroll.c`
+> 里两处 `sprintf(name, "jmExtMem%d")`），因此以地址区分——`@0x100000000` 才是
+> 不可见池，可见池是 BAR2 的 `0x1000000000`。
+
+**验证**（2026-09-11 复测：内核 `718BB943…` + 打过补丁的 mpv 0.41 CLI，
+`./test_passthrough.sh -s 1080p`，纯红片源）：
+
+```
+本次播放新增的导出池归属：
+  -> 可见池(pool=4): 0 个；不可见池(pool=12): 7 个
 直通(vaapi): 1920x1080 avg=(255,0,64) 绿色占比 0.0%
 软解(no)   : 1920x1080 avg=(255,0,64) 绿色占比 0.0%
 ==> 直通【正常】：画面是片源原色(红)
+  mpv 实际使用: Using hardware decoding (vaapi)
 ```
+
+解码 surface **全部来自不可见池（pool=12）**，direct 仍渲染正确——这就是
+「GPU 侧导入与池无关」的端到端证明，同时也说明新增的 mmap 拒绝**没有**影响该路径
+（本次播放无任何 `refusing CPU mmap` 记录）。
+
+复现用的带补丁 CLI 可以不动系统 mpv，直接在 `/tmp` 构建：
+
+```bash
+curl -sL -o /tmp/mpv-0.41.0.tar.gz \
+  https://codeload.github.com/mpv-player/mpv/tar.gz/refs/tags/v0.41.0
+tar xf /tmp/mpv-0.41.0.tar.gz -C /tmp && cd /tmp/mpv-0.41.0
+patch -p1 < ~/Desktop/Git/jm9100/mpv_dmabuf_oes_image.patch
+meson setup build -Dlibmpv=true -Dcplayer=true -Dvulkan=disabled -Dgpl=true \
+      -Dlua=disabled -Djavascript=disabled && ninja -C build
+LD_LIBRARY_PATH=$PWD/build PATH=$PWD/build:$PATH \
+  ~/Desktop/Git/jm9100/test_passthrough.sh -s 1080p
+```
+
+> **前提**：被测 mpv 必须是**打过本仓库补丁**的重编版本。系统原版 mpv 在
+> desktop GL 下会直接拒绝 VA-API interop（verbose 日志：
+> `VAAPI hwdec only works with OpenGL or Vulkan backends`），此时 mpv **静默回落
+> 软解**，脚本仍会输出「直通【正常】」——那是在测软解，不能作为直通可用的证据。
+> 自检脚本现在会显式报出 mpv 实际是否启用硬解（见 §5.3）；2026-09-11 复查发现
+> 本机 `/usr/bin/mpv` 是 `0.40.0-3+deb13u1deepin1` 原版包（未重编），
+> 因此当时那次「正常」判定无效，需按 §4.3 重编 mpv 后重测。
 
 ---
 
@@ -211,7 +335,8 @@ modinfo -F srcversion /lib/modules/$(uname -r)/updates/dkms/jmgpu.ko  # 磁盘�
 ### 4.3 重装系统后需重做的两件事
 
 1. 内核模块：`./sync_dkms.sh build`（+ `force_mode_test.sh boot` 持久化接管）。
-2. **mpv**：应用 `mpv_dmabuf_oes_image.patch` 后重编安装（§3.3，直通必需）：
+2. **mpv**：应用 `mpv_dmabuf_oes_image.patch` 后重编安装（§3.3，直通必需）。
+   补丁同时适用于 mpv 0.40（系统包）与 0.41：
 
 ```bash
 sudo apt-get install -y build-essential devscripts dpkg-dev
@@ -219,6 +344,17 @@ cd /tmp && apt-get source mpv && cd mpv-0.40.0
 patch -p1 --fuzz=3 < ~/Desktop/Git/jm9100/mpv_dmabuf_oes_image.patch
 dpkg-buildpackage -b -uc -us -j$(nproc)
 sudo dpkg -i ../mpv_*.deb
+```
+
+重编后必须确认 mpv 真的启用硬解（否则一切"正常"都是软解）：
+
+```bash
+libva 需要: export LIBVA_DRIVER_NAME=jmgpu
+DISPLAY=:0 mpv --no-config --vo=gpu --hwdec=vaapi --frames=5 --msg-level=vo=v video.mp4 2>&1 \
+  | grep -E "hardware decoding|EGL dmabuf interop|GL_RENDERER|hwdec only works"
+# 期望: Using hardware decoding (vaapi)  +  Using EGL dmabuf interop via GL_OES_EGL_image
+# 若出现 "VAAPI hwdec only works with OpenGL or Vulkan backends" → 补丁没生效，
+# 检查 /usr/bin/mpv 的构建日期，或改用自检脚本（会显式报出是否启用硬解）
 ```
 
 ---
@@ -266,34 +402,47 @@ cd ~/Desktop/Git/jm9100
 ./test_passthrough.sh -e '--hwdec-extra-frames=0'   # 追加任意 mpv 参数
 ```
 
-判定规则：`直通(vaapi)` 一行的 `avg` 应等于片源原色（脚本用纯红片 → `(255,0,0)`）；
-若为 `(0,77,0)` 之类的深绿，即仍是全零导出（回看 `-x` 的 `mmap_nz` 与
-「导出池归属」定位是缓冲问题还是 importer 问题）。
+判定规则：
 
-### 5.4 显示色彩：`gamma_norm`（灰滤镜修复）
+1. **先看前提**——脚本会打印 `mpv 实际使用: Using hardware decoding (…)`。
+   若提示「没有启用硬解」，说明 mpv 没走硬解（多半是未打补丁的原版 mpv），
+   后面的画面判定无意义，先按 §4.3 重编 mpv；
+2. `直通(vaapi)` 一行的 `avg` 应等于片源原色（脚本用纯红片 → `(255,0,0)`）；
+   若为 `(0,77,0)` 之类的深绿，即仍是全零导出（回看 `-x` 的 `mmap_nz` 与
+   「导出池归属」定位是缓冲问题还是 importer 问题）；
+3. 若出现「不可见池缓冲的 CPU mmap 被拒」提示，说明该 importer 走的是 CPU
+   采样路径（Mesa/llvmpipe）——它本来也拿不到数据（过去是全零绿屏），
+   现在会被内核显式拒绝并回落 copy/软解（§3.3 补）。
+
+> 脚本自身会设定 `LIBVA_DRIVER_NAME=jmgpu`；不设时 libva 找不到
+> `jmgpu_drv_video.so`，mpv 同样会静默软解。
+
+### 5.4 显示色彩：`gamma_norm`
+
+灰蒙蒙的根因已按 §3.2 更正为内核 color-mgmt 契约不一致（GAMMA_LUT_SIZE
+宣称 768 而驱动只消费 256）。契约修正后**默认不需要任何参数**：
 
 ```bash
-# 查看当前模式（默认 3）
+# 查看当前值（契约修正后默认 1 = 原样写）
 cat /sys/module/jmgpu/parameters/gamma_norm
 
 # 运行时切换（立即生效，无需重启）
-echo 3 | sudo tee /sys/module/jmgpu/parameters/gamma_norm  # 3 = 归一化（正常，默认）
-echo 0 | sudo tee /sys/module/jmgpu/parameters/gamma_norm  # 0 = 跳过用户态 gamma（应急）
-echo 1 | sudo tee /sys/module/jmgpu/parameters/gamma_norm  # 1 = 原样写（复现缺陷）
+echo 1 | sudo tee /sys/module/jmgpu/parameters/gamma_norm  # 1 = 原样写（默认，正确）
+echo 0 | sudo tee /sys/module/jmgpu/parameters/gamma_norm  # 0 = 跳过用户态 gamma（应急，亮度调节失效）
+echo 3 | sudo tee /sys/module/jmgpu/parameters/gamma_norm  # 3 = ×3 补偿，仅用于旧 768 契约/复现
 
-# 开机固定（可选）：/etc/modprobe.d/jmgpu-gamma.conf
-#   options jmgpu gamma_norm=3
-
-# 诊断：打印 X 驱动每次下发的 ramp 采样
-sudo dmesg | grep "gamma_lut updated"
-#   正常应为线性 0,63,128,192,255；缺陷形态为 0,21,42,64,85
+# 诊断：ramp 契约与采样
+./drm_gamma_probe /dev/dri/card0        # 期望 GAMMA_LUT_SIZE=256、GAMMA_LUT=2048 字节
+sudo dmesg | grep "gamma_lut updated"   # 期望线性 0,64,128,192,255
+#   若仍是 0,21,42,64,85 → 契约又被改成 768（或 gamma_norm 被设成 3）
 ```
 
 ### 5.5 可选内核参数（一般无需设置）
 
 | 参数 | 说明 |
 |---|---|
-| `gamma_norm=3` | 默认。灰滤镜修复（§3.2） |
+| `gamma_norm=1` | 默认。原样写用户态 gamma ramp（契约修正后即正确，§3.2） |
+| `allow_invisible_mmap=0` | 默认。拒绝 CPU mmap 不可见池缓冲——**直通正确性依赖此默认值**（§3.3 补）；设 1 会退回"mmap 成功但读到全零"的静默错误行为，仅供复现 |
 | `prefer_visible_pool=0` | 默认。厂商显存池策略（**直通已不需要改动**） |
 | `prefer_visible_pool=1` | 解码 surface 优先申请 CPU 可见池（可见池空闲充足时） |
 | `prefer_visible_pool=2` | 交换两池角色，可见窗口整块留给解码（可见池严重碎片化时临时用；会让桌面部分缓冲进不可见池） |
@@ -320,13 +469,14 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 |---|---|
 | git 基线 `13de34c` | 闭源 jmgpu 1.7.0 移植到 6.6.143 的完整源码 |
 | `jmgpu_nicely.c` | HDMI 无信号修复（3 处） |
-| `jmgpu_package.c` | 灰滤镜修复：`gamma_norm` 三态归一化 + gamma ramp 采样日志 |
-| `jmgpu_setlayout.c` / `jmgpu_bullets.c` | dmabuf 导出链修复（mmap/尺寸/NULL-SGT/越界）+ 同驱动导入快捷路径 `jmgpu_dmabuf_peek_node()` + 诊断日志（`jmgpu-exp` / `jmgpu-mmap` / `jmgpu-diag`） |
-| `jmgpu_insert.c` / `jmgpu_detect.c` | 可选参数 `no_exclusive_pool` / `prefer_visible_pool` |
-| `mpv_dmabuf_oes_image.patch` | **mpv 直通必需补丁**（改走 `glEGLImageTargetTexture2DOES`） |
+| `jmgpu_package.c` | 灰蒙蒙修复：`JMGPU_LUT_ENTRIES_PER_CHANNEL` 统一 gamma LUT 契约（768→256）+ blob 长度校验 + `gamma_norm` 采样日志 |
+| `jmgpu_setlayout.c` / `jmgpu_bullets.c` | dmabuf 导出链修复（尺寸对齐/NULL-SGT/越界）+ **拒绝不可见池的 CPU mmap** + 同驱动导入快捷路径 `jmgpu_dmabuf_peek_node()` + 诊断日志（`jmgpu-exp` / `jmgpu-mmap` / `jmgpu-diag` / `refusing CPU mmap`） |
+| `jmgpu_insert.c` / `jmgpu_detect.c` | 可选参数 `allow_invisible_mmap` / `no_exclusive_pool` / `prefer_visible_pool` |
+| `mpv_dmabuf_oes_image.patch` | **mpv 直通必需补丁**（desktop GL 改走 `glEGLImageTargetTexture2DOES`；适配 0.40 / 0.41） |
 | `sync_dkms.sh` | 同步源码到 DKMS + build + install + update-initramfs（一条龙） |
 | `force_mode_test.sh` | 强制点屏验证与持久化接管 / 回滚（`boot` / `boot-undo`） |
 | `test_passthrough.sh` | **直通一键自检**（纯色片源判定 + 导出诊断 + 环境体检） |
+| `drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 与当前 `GAMMA_LUT` blob 项数（定位灰蒙蒙根因用，§3.2） |
 | `va_export_probe.c` | VA 导出保真度探针（`vaPutImage`→导出→逐字节比对） |
 | `va_export_diag.c` | LD_PRELOAD 导出诊断（mmap 内容 vs `vaGetImage`） |
 | `jm_gem_probe.c` | 内核 GEM 导出双向校验（CPU↔dmabuf 交叉比对、pagemap） |

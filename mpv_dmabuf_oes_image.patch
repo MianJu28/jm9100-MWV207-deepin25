@@ -1,34 +1,71 @@
+mpv VA-API direct (dmabuf/EGLImage) interop for the Jingjia JM9100 GL stack.
+
+Applies to mpv 0.40 and 0.41 (video/out/hwdec/dmabuf_interop_gl.c):
+  - desktop GL may import through GL_OES_EGL_image, not only through
+    GL_EXT_EGL_image_storage;
+  - the JM9100 desktop GL stack resolves glEGLImageTargetTexStorageEXT but
+    never binds the imported dmabuf, so take the OES entry when the storage
+    extension is not advertised (otherwise direct decode renders all-zero).
+
+    cd /tmp && apt-get source mpv && cd mpv-0.40.0
+    patch -p1 --fuzz=3 < ~/Desktop/Git/jm9100/mpv_dmabuf_oes_image.patch
+
 --- a/video/out/hwdec/dmabuf_interop_gl.c
 +++ b/video/out/hwdec/dmabuf_interop_gl.c
-@@ -136,6 +136,20 @@
+@@ -128,14 +128,28 @@
+         .CreateImageKHR = (void *)eglGetProcAddress("eglCreateImageKHR"),
+         .DestroyImageKHR = (void *)eglGetProcAddress("eglDestroyImageKHR"),
+     };
+-    if (ra_gl_get(mapper->ra)->es) {
++    GL *gl = ra_gl_get(mapper->ra);
++    if (gl->es) {
+         // GL_OES_EGL_image
+         p->EGLImageTargetTexture2DOES =
+             (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+-    } else {
++    } else if (gl_check_extension(gl->extensions, "GL_EXT_EGL_image_storage")) {
          // GL_EXT_EGL_image_storage
          p->EGLImageTargetTexStorageEXT =
              (void *)eglGetProcAddress("glEGLImageTargetTexStorageEXT");
++    } else if (gl_check_extension(gl->extensions, "GL_OES_EGL_image")) {
 +        /*
-+         * Some desktop GL stacks (e.g. Jingjia JM9100) expose
-+         * glEGLImageTargetTexStorageEXT but never attach the imported dmabuf
-+         * to the texture, so the sampler reads all-zero and VA-API direct
-+         * decode (mpv --hwdec=vaapi) renders a solid green frame. Their
-+         * glEGLImageTargetTexture2DOES entry does work, so prefer it when it
-+         * is available. Leaving the storage pointer NULL also preserves the
-+         * OES lifecycle used below (textures created once in init, rebound on
-+         * every map, freed on uninit).
++         * Some desktop GL stacks (e.g. Jingjia JM9100) resolve
++         * glEGLImageTargetTexStorageEXT but never attach the imported dmabuf to
++         * the texture, so the sampler reads all-zero and VA-API direct decoding
++         * renders a solid green frame. Such stacks do not advertise
++         * GL_EXT_EGL_image_storage while GL_OES_EGL_image works, so take the OES
++         * entry there. Leaving the storage pointer NULL also keeps the OES
++         * lifecycle used below (textures created once in init, rebound on every
++         * map, freed on uninit).
 +         */
-+        void *oes = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
-+        if (oes) {
-+            p->EGLImageTargetTexture2DOES = oes;
-+            p->EGLImageTargetTexStorageEXT = NULL;
-+        }
++        p->EGLImageTargetTexture2DOES =
++            (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
      }
  
      if (!p->CreateImageKHR || !p->DestroyImageKHR ||
-@@ -354,7 +368,8 @@
-     const char *imageext = gl->es ? "GL_OES_EGL_image" : "GL_EXT_EGL_image_storage";
+@@ -351,10 +365,23 @@
+         return false;
+ 
+     GL *gl = ra_gl_get(hw->ra_ctx->ra);
+-    const char *imageext = gl->es ? "GL_OES_EGL_image" : "GL_EXT_EGL_image_storage";
++    /*
++     * A desktop GL stack may import dmabufs through GL_EXT_EGL_image_storage or
++     * through GL_OES_EGL_image. The storage route is preferred (it is the
++     * extension designed for it) but the OES route is accepted as well: Jingjia
++     * JM9100 resolves glEGLImageTargetTexStorageEXT while omitting the storage
++     * extension string, and only its OES entry binds the imported surface.
++     */
++    const bool has_storage =
++        gl_check_extension(gl->extensions, "GL_EXT_EGL_image_storage");
++    const bool has_oes = gl_check_extension(gl->extensions, "GL_OES_EGL_image");
++    const char *imageext = "GL_OES_EGL_image";
++    if (!gl->es) {
++        imageext = has_storage ? "GL_EXT_EGL_image_storage" : "GL_OES_EGL_image";
++    }
      if (!gl_check_extension(exts, "EGL_EXT_image_dma_buf_import") ||
          !gl_check_extension(exts, "EGL_KHR_image_base") ||
 -        !gl_check_extension(gl->extensions, imageext) ||
-+        !(gl_check_extension(gl->extensions, "GL_OES_EGL_image") ||
-+          gl_check_extension(gl->extensions, "GL_EXT_EGL_image_storage")) ||
++        !(gl->es ? has_oes : (has_storage || has_oes)) ||
          !(gl->mpgl_caps & MPGL_CAP_TEX_RG)) {
          return false;
      }

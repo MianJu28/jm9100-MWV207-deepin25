@@ -2,9 +2,13 @@
 #
 # test_passthrough.sh -- VA-API 直通（mpv --hwdec=vaapi）一键验证
 #
-# 原理：用纯红静态片源播放，直通正常则画面为红 (255,0,0)；
-#       若缓存在 CPU 不可见显存池，dmabuf 导入方 mmap 读到全零 NV12，
-#       画面会变成深绿 (约 0,77,0 ~ 0,135,0)。两者可明确区分。
+# 原理：用纯红静态片源播放，直通正常则画面为红 (255,0,0)。
+#       失败形态有两种，必须区分：
+#       a) 缓冲在 CPU 不可见显存池，且导入方经 CPU mmap 采样（Mesa/llvmpipe），
+#          且 allow_invisible_mmap=1（默认 0，不会走到这里）→ 读到全零 NV12，
+#          画面深绿 (约 0,77,0 ~ 0,135,0)；
+#       b) 导入方需要 CPU mmap，内核直接拒绝（allow_invisible_mmap=0，默认）
+#          → 导入失败，mpv 回落 vaapi-copy/软解，画面正确但不是零拷贝。
 #
 # 用法：
 #   ./test_passthrough.sh                 # 默认 1080p
@@ -52,6 +56,9 @@ done
 
 DISPLAY="${DISPLAY:-:0}"
 export DISPLAY
+# libva 不认识 jmgpu_drv_video.so，不设这个变量 mpv 会静默退回软解，
+# 那样"判定正常"只是在测软解，必须由脚本自己保证。
+export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-jmgpu}"
 RENDER=/dev/dri/renderD128
 VID="/tmp/pt_red_${SIZE}.mp4"
 # 读 dmesg / debugfs 需要 root；非 root 时用 sudo（可能会提示一次密码）
@@ -67,6 +74,12 @@ say "===== 1/4 环境体检 ====="
 hr
 
 say "内核模块: $(uname -r)"
+if [ -r /usr/lib/aarch64-linux-gnu/dri/jmgpu_drv_video.so ] || \
+   [ -r /usr/lib/dri/jmgpu_drv_video.so ]; then
+	say "  VA 驱动: LIBVA_DRIVER_NAME=$LIBVA_DRIVER_NAME (jmgpu_drv_video.so 已找到)"
+else
+	warn "未找到 jmgpu_drv_video.so，硬解不可用（只会测到软解）"
+fi
 if [ -r /sys/module/jmgpu/srcversion ]; then
 	run_sv=$(cat /sys/module/jmgpu/srcversion)
 	disk_sv=$(modinfo -F srcversion jmgpu 2>/dev/null)
@@ -79,11 +92,12 @@ fi
 
 pvp=$(cat /sys/module/jmgpu/parameters/prefer_visible_pool 2>/dev/null)
 nep=$(cat /sys/module/jmgpu/parameters/no_exclusive_pool 2>/dev/null)
-say "  prefer_visible_pool = ${pvp:-<无此参数>}   （直通需要 =1）"
-say "  no_exclusive_pool   = ${nep:-<无此参数>}   （=1 会禁用不可见池，代价是显存只剩 255MB）"
-if [ "${pvp:-0}" != "1" ]; then
-	warn "prefer_visible_pool 不为 1：解码 surface 会优先落不可见池，直通基本不可能成功"
-	say "      可即时开启: echo 1 | sudo tee /sys/module/jmgpu/parameters/prefer_visible_pool"
+aim=$(cat /sys/module/jmgpu/parameters/allow_invisible_mmap 2>/dev/null)
+say "  prefer_visible_pool  = ${pvp:-<无此参数>}   （默认 0，直通不需要改动）"
+say "  no_exclusive_pool    = ${nep:-<无此参数>}   （默认 0；=1 禁用不可见池，代价是显存只剩 255MB）"
+say "  allow_invisible_mmap = ${aim:-<无此参数>}   （默认 0：拒绝不可见池的 CPU mmap，避免静默全零绿屏）"
+if [ "${aim:-0}" = "1" ]; then
+	warn "allow_invisible_mmap=1：不可见池缓冲可被 CPU mmap 且读到全零（旧行为，仅用于复现故障）"
 fi
 
 say ""
@@ -107,6 +121,11 @@ fi
 say ""
 say "最近一次导出的 buffer 落在哪个池（pool=4 可见 / pool=12 不可见）："
 "${sudo[@]}" dmesg 2>/dev/null | grep "jmgpu-exp" | tail -6 | sed 's/^/  /' || true
+
+say ""
+say "被内核拒绝的 CPU mmap（CPU 导入方遇到不可见池缓冲时会打这条）："
+"${sudo[@]}" dmesg 2>/dev/null | grep "refusing CPU mmap" | tail -4 | sed 's/^/  /' || \
+	say "  （无：说明本次没有 CPU 导入方去 mmap 不可见池缓冲）"
 
 [ "$CHECK_ONLY" = "1" ] && { hr; say "(-n) 仅体检完成"; exit 0; }
 
@@ -144,6 +163,8 @@ say "===== 3/4 播放并抓帧 ====="
 hr
 
 BEFORE=$("${sudo[@]}" dmesg 2>/dev/null | grep -c "jmgpu-exp")
+BEFORE_REFUSE=$("${sudo[@]}" dmesg 2>/dev/null | grep -c "refusing CPU mmap")
+HWUSED=""
 
 run_one() { # $1=hwdec 标签  $2=输出 ppm
 	local tag=$1 ppm=$2 dir="/tmp/pt_shots_$1"
@@ -197,6 +218,11 @@ run_one() { # $1=hwdec 标签  $2=输出 ppm
 	fi
 	ffmpeg -y -hide_banner -loglevel error -i "$png" "$ppm" || return 1
 	say "    [$tag] 截图: $png"
+	# 记录 mpv 是否真的启用了硬解：没启用时，基于画面的判定没有意义
+	if [ "$tag" = "vaapi" ]; then
+		HWUSED=$(grep -a -m1 -o "Using hardware decoding ([^)]*)" \
+			 "/tmp/pt_mpv_vaapi.log" 2>/dev/null | sed 's/.*(//;s/)//')
+	fi
 	return 0
 }
 
@@ -275,6 +301,19 @@ python3 - /tmp/pt_direct.ppm /tmp/pt_soft.ppm <<-'PYEOF'
 	open("/tmp/pt_verdict.txt", "w").write(v)
 PYEOF
 
+# 前提校验：mpv 没启用硬解时的"画面正常"证明不了任何事
+if [ -z "${HWUSED:-}" ]; then
+	say ""
+	warn "本次 [vaapi] 播放【没有启用硬解】（mpv 回了软解），上面的判定无意义。"
+	say "  常见原因：mpv 未打 mpv_dmabuf_oes_image.patch —— desktop GL 下"
+	say "  会直接拒绝 VA-API interop（verbose 日志：VAAPI hwdec only works with"
+	say "  OpenGL or Vulkan backends）。此时画面当然是软的、正常的。"
+	say "  核验：ls -l /usr/bin/mpv（打过补丁重编的日期应是最近一次构建日）"
+	say "  重编步骤见 README §4.3；重编后请重跑本脚本。"
+else
+	say "  mpv 实际使用: Using hardware decoding ($HWUSED)"
+fi
+
 # 归因提示：缓冲有数据但画面仍绿 => importer（GL/EGL）侧问题
 if [ "$DIAG" = "1" ]; then
 	NZD=$(grep -a -o "mmap_nz=[1-9][0-9]*" /tmp/pt_mpv_vaapi.log 2>/dev/null | head -1)
@@ -282,13 +321,27 @@ if [ "$DIAG" = "1" ]; then
 	VERD=$(cat /tmp/pt_verdict.txt 2>/dev/null)
 	if [ -n "$NZD" ]; then
 		say ""
-		say "  导出缓冲内容非零（$NZD）—— 内核导出/mmapp 链路正常。"
+		say "  导出缓冲内容非零（$NZD）—— 内核导出/mmap 链路正常。"
 		say "  当前 interop：${INTEROP:-未知}"
 		if [ "$VERD" = "green" ]; then
 			say "  ==> 故障定位在 importer（GL/EGL）侧：desktop GL 走了"
 			say "      glEGLImageTargetTexStorageEXT，而 JM9100 该入口不生效，"
 			say "      纹理保持全零。应用 mpv_dmabuf_oes_image.patch 重编 mpv 后重测。"
 		fi
+	fi
+
+	# 新行为：CPU 导入方（Mesa/llvmpipe）要求 mmap 不可见池缓冲时被内核拒绝。
+	# 只统计本次播放新增的拒绝记录，避免把历史记录当成本次结果。
+	REFUSE_NEW=$("${sudo[@]}" dmesg 2>/dev/null | grep "refusing CPU mmap" | \
+		      tail -n +"$((BEFORE_REFUSE + 1))")
+	if [ -n "$REFUSE_NEW" ] || grep -a -q "mmap failed" /tmp/pt_mpv_vaapi.log 2>/dev/null; then
+		say ""
+		say "  本次出现了「不可见池缓冲的 CPU mmap 被拒」$(printf '%s' "$REFUSE_NEW" | grep -c . ) 次："
+		say "  该 importer 走的是 CPU 采样路径（Mesa/llvmpipe 的 EGL dmabuf 导入），"
+		say "  对不可见池缓冲无法工作——这是 allow_invisible_mmap=0 的预期行为，"
+		say "  它把过去的「静默全零绿屏」变成了可见的导入失败，mpv 随后回落 copy/软解。"
+		say "  要走零拷贝直通，请让 GL 走 Jingjia EGL/GL（OES 入口，GPU 侧导入，"
+		say "  与缓冲落在哪个池无关）。"
 	fi
 fi
 

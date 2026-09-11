@@ -45,22 +45,42 @@ MODULE_PARM_DESC(fake_vblank, "use hw or sw to generate vblank, "\
 		 "0x0 - use interrupt, 0x1 - use software timer");
 
 /*
- * 用户态 gamma ramp 归一化系数.
- * X 专有驱动 (mwv207_drv.so) 的 gamma 下发存在固定缺陷: 实测所有请求的 ramp
- * 都被统一缩小 3 倍 —— identity(亮度1.0) 下发 [0,21,42,64,85](=in/3),
- * 亮度 0.5 下发 [0,11,21,32,43](=in/6), 即 out = in * brightness / 3.
- * 该 ramp 经 atomic_flush 写入硬件 LUT 后造成整屏"蒙灰滤镜"(黑发灰/白不白),
- * 且亮度/调节值只剩应有的 1/3.
- * gamma_norm=3(默认): 写 LUT 前对 ramp 乘 3 归一化 -> 恒等请求恢复线性表
- *   (灰滤镜消失), 亮度/gamma 调节同时恢复正常.
- * gamma_norm=0: 完全跳过用户态 gamma (LUT 恒为 reset 时的线性表).
- * gamma_norm=1: 原样写 LUT (厂商原始行为, 仅调试用).
+ * 用户态 gamma ramp 归一化系数（写 LUT 前的额外缩放）.
+ *
+ * 历史: 观测到 X 下发的 identity ramp 采样为 [0,21,42,64,85](=in/3),
+ * 一度判定为 X 专有驱动 (mwv207_drv.so) 的 gamma 缩放缺陷, 并用
+ * gamma_norm=3 在内核侧乘回去补偿.
+ *
+ * 2026-09-11 定位到真实根因: 是本驱动的 color-mgmt 契约不一致 ——
+ * drm_crtc_enable_color_mgmt(crtc, 768, true, 768) 宣称 gamma_lut_size=768
+ * (厂商把"3 通道 x 256"当成一个 LUT 的项数), 而 atomic_flush 只读前 256 项,
+ * 于是客户端下发的 768 项 identity ramp 只有前 1/3 生效(数值恰为 in/3).
+ * 已在 jmgpu_crtc_init 中把契约统一为 256, X 侧无需任何改动, 故默认值改回
+ * "原样写"(1); gamma_norm=3 仅在使用旧契约(768)的模块上有意义.
+ *
+ * gamma_norm=1(默认): 原样写 LUT —— 契约修正后这就是正确行为.
+ * gamma_norm=0: 完全跳过用户态 gamma (LUT 恒为 reset 时的线性表, 亮度调节失效).
+ * gamma_norm=3: 对 ramp 乘 3 归一化, 用于复现/兼容旧的 768 契约.
  */
-static int gamma_norm = 3;
+static int gamma_norm = 1;
 module_param(gamma_norm, int, 0644);
-MODULE_PARM_DESC(gamma_norm, "userspace gamma ramp normalization: 0=skip, "\
-		 "1=apply as-is, 3=compensate buggy userspace 1/3 scaling "\
-		 "(default)");
+MODULE_PARM_DESC(gamma_norm, "extra scaling applied to the userspace gamma "\
+		 "ramp before writing the LUT: 0=skip userspace gamma, "\
+		 "1=apply as-is (default, correct now that GAMMA_LUT_SIZE is "\
+		 "consistent), 3=compensate the historical 768-entry contract "\
+		 "truncation (debug)");
+
+/*
+ * 每通道 gamma LUT 表项数.
+ * 这个值必须同时用于三处，否则会出现"契约/消费"不一致:
+ *   1) drm_crtc_enable_color_mgmt() 对外宣称的 gamma_lut_size;
+ *   2) jcrtc->lutdata 的每通道布局 (lutdata + rgb * N);
+ *   3) atomic_flush 里从 drm_color_lut 读出的项数.
+ * 历史事故: 厂商把 (1) 写成 768 (误把"3 通道 x 256"当成一个 LUT 的项数),
+ * 而 (3) 只读 256 —— 客户端下发的 ramp 只有前 1/3 进硬件, 整屏压暗
+ * ("黑发灰/白不白"), 长期被误判为 X 驱动的 gamma 缺陷.
+ */
+#define JMGPU_LUT_ENTRIES_PER_CHANNEL 256
 
 typedef struct tag_jms_crtc {
 	struct drm_crtc base;
@@ -68,7 +88,7 @@ typedef struct tag_jms_crtc {
 	struct drm_pending_vblank_event *event;
 	struct hrtimer vblank_timer;
 	u32 mem_base;
-	u16 lutdata[3 * 256];
+	u16 lutdata[3 * JMGPU_LUT_ENTRIES_PER_CHANNEL];
 	u8 crtc_chan;
 
 
@@ -529,7 +549,7 @@ static s32 j9_handle__autoclasis(struct drm_crtc *crtc)
 		curPaletteRam = j9_tunnels(crtc, J9_HANDLE_J9_CELIOSCOPY);
 		for (rgb = 0; rgb < 3; rgb++) {
 			j9_garboils(crtc, J9_HANDLE_BESMUTTING, rgb);
-			pWriteData = data + rgb * 256;
+			pWriteData = data + rgb * JMGPU_LUT_ENTRIES_PER_CHANNEL;
 			j9_garboils(crtc, J9_HANDLE_J_CELIOSCOPY, 1);
 			udelay(2);
 			j9_garboils(crtc, J9_HANDLE_J_CELIOSCOPY, 0);
@@ -584,17 +604,35 @@ static void j9_handle_attribute_chockstone(struct drm_crtc *crtc, struct drm_crt
 
 			lut =
 			    (struct drm_color_lut *)crtc->state->gamma_lut->data;
-			for (i = 0; i < 256; i++) {
+			/*
+			 * 消费项数必须等于 jmgpu_crtc_init 宣称的
+			 * GAMMA_LUT_SIZE（JMGPU_LUT_ENTRIES_PER_CHANNEL），
+			 * 否则客户端下发的 ramp 只会有一部分生效：历史上契约写成
+			 * 768 而这里只读 256，于是 768 项 identity ramp 的前 1/3
+			 * （采样恰为 0,21,42,64,85 = in/3）进了硬件，整屏被压到
+			 * 1/3 动态范围，表现为"黑发灰、白不白、色相正确"。
+			 */
+			BUILD_BUG_ON(3 * JMGPU_LUT_ENTRIES_PER_CHANNEL >
+				     ARRAY_SIZE(jcrtc->lutdata));
+			for (i = 0; i < JMGPU_LUT_ENTRIES_PER_CHANNEL; i++) {
 				jcrtc->lutdata[i] =
 				    drm_color_lut_extract(lut[i].red, 8);
-				jcrtc->lutdata[i + 256] =
+				jcrtc->lutdata[i + JMGPU_LUT_ENTRIES_PER_CHANNEL] =
 				    drm_color_lut_extract(lut[i].green, 8);
-				jcrtc->lutdata[i + 512] =
+				jcrtc->lutdata[i + 2 * JMGPU_LUT_ENTRIES_PER_CHANNEL] =
 				    drm_color_lut_extract(lut[i].blue, 8);
 			}
-			/* 诊断: 打印用户态(X 专有驱动)下发的原始 ramp 采样值.
-			 * 正常应为线性 0,63,128,192,255; 缺陷驱动为 1/3 缩放
-			 * 0,21,42,64,85, 由 gamma_norm=3 归一化补偿. */
+			if (crtc->state->gamma_lut->length !=
+			    JMGPU_LUT_ENTRIES_PER_CHANNEL *
+			    sizeof(struct drm_color_lut))
+				DRM_WARN("crtc_%u: gamma blob %zu bytes != %u entries\n",
+					 jcrtc->crtc_chan,
+					 crtc->state->gamma_lut->length,
+					 JMGPU_LUT_ENTRIES_PER_CHANNEL);
+			/* 诊断: 打印下发 ramp 的采样值（内核已归一化到 8 位）.
+			 * 契约正确时应为线性 0,64,128,192,255；
+			 * 若仍是 0,21,42,64,85 说明又出现了契约/消费不一致，或
+			 * gamma_norm 仍为旧的补偿值 3. */
 			DRM_INFO("crtc_%u gamma_lut updated: R[0,64,128,192,255]=%u,%u,%u,%u,%u G=%u,%u,%u,%u,%u B=%u,%u,%u,%u,%u\n",
 				 jcrtc->crtc_chan,
 				 jcrtc->lutdata[0], jcrtc->lutdata[64],
@@ -1267,8 +1305,31 @@ int j9mirror_forehammer(struct drm_device *ddev, j9_weakliest *platform,
 	drm_crtc_helper_add(&jcrtc->base, &jmgpu_crtc_helper_funcs);
 
 
-	drm_crtc_enable_color_mgmt(&jcrtc->base, 768, true, 768);
-	ret = drm_mode_crtc_set_gamma_size(&jcrtc->base, 256);
+	/*
+	 * 不要照抄厂商的 (768, true, 768)：那是把「3 通道 × 256」误当成
+	 * 一个 LUT 的项数。DRM 的 color-mgmt 契约是「gamma_lut_size 个表项，
+	 * 每项自带 r/g/b」，不是三个通道首尾相接。
+	 *
+	 * 宣称 768 而本驱动的 atomic_flush（j9_handle_attribute_chockstone）
+	 * 只读前 256 项的后果：无论客户端下发什么，硬件拿到的永远是那 768 项
+	 * ramp 的前 1/3 —— 整屏被压到 1/3 动态范围，即「黑发灰、白不白、
+	 * 色相正确」的灰蒙蒙根因（X 下发的 identity ramp 采样为
+	 * 0,21,42,64,85 = in/3）。历史上这一现象被误判为 X 专有驱动
+	 * (mwv207_drv.so) 的 gamma 缩放缺陷，并用 gamma_norm=3 在内核侧补偿；
+	 * 实测 GAMMA_LUT blob 长度正是 768 项，证明根因在此处。
+	 *
+	 * 统一为 256：与下面的 drm_mode_crtc_set_gamma_size(256) 以及本驱动
+	 * 内部的 256 项/通道 LUT 表 (lutdata + rgb*256) 一致。
+	 * degamma 与 CTM 本驱动并未实现（会静默忽略），一并关闭，避免客户端
+	 * 设置成功却毫无效果。
+	 *
+	 * 注意：改成 256 后必须重启 X/系统让客户端重新读取 GAMMA_LUT_SIZE，
+	 * 否则旧会话仍会提交 768 项 blob，被 drm_atomic 以 -EINVAL 拒绝。
+	 */
+	drm_crtc_enable_color_mgmt(&jcrtc->base, 0, false,
+				   JMGPU_LUT_ENTRIES_PER_CHANNEL);
+	ret = drm_mode_crtc_set_gamma_size(&jcrtc->base,
+					   JMGPU_LUT_ENTRIES_PER_CHANNEL);
 	if (ret)
 		goto fail;
 
