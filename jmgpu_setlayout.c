@@ -233,44 +233,6 @@ j9_pathopsychosis(IN jmkALLOCATOR Allocator,
 
 	pfn = (res->start >> PAGE_SHIFT) + skipPages;
 
-	/* DIAGNOSTIC (temporary): the VA-API direct path reads all-zero data
-	 * through the exported dmabuf, while vaGetImage (copy) returns the
-	 * real pixels. Print everything needed to tell whether the pfn this
-	 * mapping installs points at real, CPU-reachable memory. */
-	{
-		static unsigned int diagCnt;
-
-		/* Only large buffers (VA surfaces / framebuffers) are of
-		 * interest; early-boot single-page dmabufs would burn the
-		 * diagnostic budget before any decoder runs. */
-		if (time_after(jiffies, (unsigned long)(60 * HZ)) && numPages >= 100 && numPages <= 1200 && diagCnt < 60) {
-			unsigned long vend = pfn + numPages - 1;
-			void __iomem *io;
-
-			diagCnt++;
-
-			pr_info("jmgpu-diag: pool '%s' cpu=0x%lx size=0x%lx skipPages=%lu numPages=%lu -> pfn=0x%lx (phys 0x%lx) pfn_valid(head)=%d pfn_valid(tail)=%d cpuAccessible=%d\n",
-				res->name, res->start, res->size,
-				(unsigned long)skipPages, (unsigned long)numPages,
-				pfn, pfn << PAGE_SHIFT,
-				(int)pfn_valid(pfn), (int)pfn_valid(vend),
-				(int)Mdl->cpuAccessible);
-
-			io = ioremap(res->start + (skipPages << PAGE_SHIFT), 16);
-			if (io) {
-				pr_info("jmgpu-diag:   data=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
-					ioread8(io), ioread8(io + 1),
-					ioread8(io + 2), ioread8(io + 3),
-					ioread8(io + 4), ioread8(io + 5),
-					ioread8(io + 6), ioread8(io + 7));
-				iounmap(io);
-			} else {
-				pr_info("jmgpu-diag:   ioremap(0x%lx) failed\n",
-					res->start + (skipPages << PAGE_SHIFT));
-			}
-		}
-	}
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	vm_flags_set(vma, J9_OVERNOISE);
 #else

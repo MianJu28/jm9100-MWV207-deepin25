@@ -4075,17 +4075,6 @@ static int j9_forefence(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 		physical = node->VidMem.physical;
 	}
 
-	/* DIAGNOSTIC (temporary): node/pool geometry behind a dmabuf mmap. */
-	if (numPages >= 100 && numPages <= 1200)
-		pr_info_ratelimited("jmgpu-mmap: pool=%u node_off=0x%llx bytes=0x%llx node_phys=%p pool_mdl=%p pgoff=%lu skip=%lu num=%lu\n",
-				    (unsigned)node->VidMem.pool,
-				    (unsigned long long)node->VidMem.offset,
-				    (unsigned long long)node->VidMem.bytes,
-				    node->VidMem.physical, (void *)physical,
-				    (unsigned long)vma->vm_pgoff,
-				    (unsigned long)skipPages,
-				    (unsigned long)numPages);
-
 	/* Guard against mappings that run past the end of the backing pool.
 	 * The export size is rounded up to a page, so a node sitting at the
 	 * tail of a pool (or a chunk) may not have the rounded-up tail inside
@@ -4351,7 +4340,9 @@ jmkVIDMEM_NODE_Export(
 	mdl = (PLINUX_MDL)physical;
 	allocator = mdl->allocator;
 
-	/* DIAGNOSTIC (temporary): which pool/offset a large export refers to. */
+	/* 哪个池/偏移的大缓冲被导出。保留为长期诊断: test_passthrough.sh 的
+	 * 「导出池归属」一节依赖这行输出定位直通问题(可见池 pool=4 /
+	 * 不可见池 pool=12)，限流后开销可忽略。 */
 	if (bytes >= (100UL << PAGE_SHIFT))
 		pr_info_ratelimited("jmgpu-exp: pool=%u off=0x%llx bytes=0x%llx mdl=%p cpuAcc=%d nPages=%lu alloc=%s\n",
 				    (unsigned)node->VidMem.pool,

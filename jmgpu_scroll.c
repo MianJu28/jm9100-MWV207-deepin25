@@ -2628,7 +2628,12 @@ jmkGALDEVICE_Construct(IN j9_weakliest *Platform,
 			} else {
 				jmkALLOCATOR allocator;
 
-				sprintf(name, "jmExtMem%d", i);
+				/* 与可见池(external)区分开: 厂商原本两处都叫
+				 * "jmExtMem%d", 于是 dmesg / /proc/iomem / 诊断
+				 * 日志里两个物理上完全不同的池同名, 排查直通
+				 * 问题时只能靠地址(0x1000000000 vs 0x100000000)
+				 * 分辨, 极易看错. 不可见池改叫 jmExcMem%d. */
+				sprintf(name, "jmExcMem%d", i);
 
 
 				j9_recaution(jmkOS_RequestReservedMemory
