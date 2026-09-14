@@ -196,6 +196,8 @@ WIN+0x38 WIN_CONTRAST        @0x990038 = 0x800000f0   <-- 128*15/8：LUT 装的�
    `glEGLImageTargetTexStorageEXT`；JM9100 的该入口**存在但不真正把 dmabuf
    挂接到纹理**，纹理恒为全零（JM9100 只声明 `GL_OES_EGL_image`，不声明
    `GL_EXT_EGL_image_storage`）。
+   > §3.8 反编译更正：驱动里**根本没有**该符号，入口是 glvnd 生成的 no-op stub 顶替的，
+   > 即"未实现"而非"实现错误"；客户端侧由 §3.6 的 `jm_gl_compat.c` 兜底。
 
 **修复**
 
@@ -550,6 +552,76 @@ EGL 共 40 个 config，覆盖 1 个 X visual
 > **对 purelive 审计 §10.1 的更正**：其中「屏幕默认 visual `0x21` 能建上下文但呈现阶段崩溃、
 > 只有 32 位 ARGB `0x7c` 能出图」的规则来自 GLX 路径观测，且被首次 glamor OOM 污染。
 > 以本节的 EGL 实测为准：`0x21` 是**唯一**能让景美 EGL 建出 window surface 的 visual。
+
+---
+
+### 3.8 用户态库反编译结论：两处缺陷属「未实现」，无法小补丁修复（2026-09-14）🔍
+
+> 结论先行：**§3.6 的扩展/入口缺失与 §3.7 的 EGL visual 缺失，都不是"实现错了"，而是
+> "没有实现"或"结构性缺失"**。在闭源二进制上做等价补丁需要**新增可执行段 + 运行时表项**，
+> 风险大于收益。因此修复落点保持在**客户端侧**（§3.6 的 `jm_gl_compat.c` + §3.7 的
+> visual 选择），反编译结果转为**给厂商的精确缺陷报告**（含地址与结构）。
+
+**方法与可分析性**：三个厂商用户态库**均未 strip**（符号表完整），用 `objdump` / `nm` /
+`readelf` / `radare2` 可直接得到函数名与数据结构。
+
+| 库 | BuildID | 大小 |
+|---|---|---|
+| `dri/jmgpu_dri.so`（GL 实现） | `367ef146…` | 4.0 MB |
+| `mwv207/libEGL_mwv207.so.1.5.0` | `e418a068…` | 426 KB |
+| `mwv207/libGLX_mwv207.so.1.2.0` | `cce3049e…` | 789 KB |
+
+**发现 1：`glEGLImageTargetTexStorageEXT` 在驱动里根本不存在**
+
+```
+$ nm -D --defined-only jmgpu_dri.so | grep -i glEGLImage
+glEGLImageTargetRenderbufferStorageOES   0x81e20
+glEGLImageTargetTexture2DOES             0x81dc0     ← 只有 OES 版
+（无任何 TexStorage 符号；GL_EXT_EGL_image_storage 字符串也不存在）
+```
+
+所以 §3.3 里「入口存在但不真正挂接 dmabuf」的**真正机制**是：该入口由 **glvnd 生成的
+no-op stub** 顶替（驱动未实现），而不是厂商实现写错了。**§3.3 的措辞据此更正。**
+
+扩展表结构（可用于未来补丁）：
+
+| 结构 | 地址/说明 |
+|---|---|
+| `__glExtension` | `.data` @`0x37be70`，**206 条 × 24 B** = `{u64 index; u64 name_ptr; u64 profile_flags}`，index 0…205，**无空槽**（符号大小 4944 = 206×24） |
+| 扩展名字符串 | 32 B 步长表，`0x293fb8`…`0x2956a8`；**有空槽**（首个空槽 `0x294a18`，可容纳 25 B 的名字） |
+| `glGetString` / `glGetStringi` | `0x6c800` / `0x70650` |
+| `__glGetProcAddr` | `0xe4348`：两张 name→func 表（表 A 记录 24 B，头 `0x379c50`、首条 `0x379c68`；表 B 记录 16 B，count/基址由 GOT `0x36a830` / `0x36b358` 取） |
+
+**为什么不能只改表**：表 A 记录里的 `func` 字段在**文件里恒为 0**（运行时才填充），
+因此无法静态插入一条可用入口；而 `__glExtension` 已满，只能"顶掉"某个现成扩展 —— 那会
+反而破坏一个真实能力。要正确实现需要**新增代码**（至少一条 trampoline）与新表项。
+
+**发现 2：EGL 的 `EGL_NATIVE_VISUAL_ID` 是「显示级」调用，与 config 无关**
+
+```
+libEGL_mwv207: eglGetConfigAttrib @0x19d70
+  EGL_NATIVE_VISUAL_ID (0x302E) 分支 @0x1a0a8:
+    1a0a8  ldr  x2, [x20, #8]     ; display->vtable
+    1a0ac  mov  x0, x20           ; 只传 display，x1(=config 记录) 未参与
+    1a0b0  ldr  x2, [x2, #48]     ; 平台级 _GetNativeVisualId
+    1a0b4  blr  x2
+    1a0b8  str  w0, [x24]
+```
+
+→ **40 个 config 必然报同一个 visual**（实测 `0x21`），这正是 §3.7 的根因。
+对照 `EGL_NATIVE_VISUAL_TYPE`(0x302F) 分支 @`0x19e70` 读的是 `config+48`，其存的是
+**位深/格式代码**（`0x10`=16bpp、`0x20`=32bpp、`0x3038`=EGL_NONE），**不是 visual id**，
+因此也不能把它当作 visual 来用。
+
+其余结构：config 记录步长 **220 B**；`eglGetConfigs` @`0x18e70`；`eglChooseConfig`
+@`0x19038`；`eglCreateWindowSurface` @`0x20570` → `veglCreatePlatformWindowSurface`
+@`0x1fac8`（attrib 解析在 @`0x1fb88`）。
+`libGLX_mwv207` 侧 FBConfig visual 覆盖 `0x21/0x22/0x113…0x14c`（审计 §10.1）。
+
+**为什么也不能小补丁修**：让 EGL 支持 ARGB 等窗口需要为每个 config 建立**真实的
+config↔visual 映射**（现在 40 个 config 只有一个 visual），属重建数据表，不是改一个字段。
+
+**因此**：两处都转为厂商侧需求（见 §7 反馈清单），客户端侧继续用 §3.6/§3.7 的方案兜底。
 
 ---
 

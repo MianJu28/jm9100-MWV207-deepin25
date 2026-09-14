@@ -40,7 +40,41 @@ typedef struct {
 	int buffer_size;
 } VisualMap;
 
-int main(void) {
+/* -a：逐个 dump 全部 EGL config 的关键属性。
+ * 关键点在于对照 EGL_NATIVE_VISUAL_ID 与 EGL_NATIVE_VISUAL_TYPE：
+ * 前者在 libEGL_mwv207 里是「显示级」调用（不读 config），后者读 config+48，
+ * 因此前者对 40 个 config 恒定、后者才可能是每 config 独立值。 */
+static void dumpConfigs(EGLDisplay edpy) {
+	EGLConfig cfgs[MAXCFG];
+	EGLint ncfg = 0;
+	if (!eglGetConfigs(edpy, cfgs, MAXCFG, &ncfg)) {
+		fprintf(stderr, "eglGetConfigs 失败\n");
+		return;
+	}
+	printf("\n%-4s %-10s %-12s %-12s %-5s %-4s %-4s %-4s %-4s %-6s %-8s %-6s %s\n",
+	       "#", "CONFIG_ID", "VISUAL_ID", "VISUAL_TYPE", "BUF", "R", "G", "B", "A",
+	       "DEPTH", "STENCIL", "SAMPLES", "SURFACE_TYPE");
+	for (int i = 0; i < ncfg; i++) {
+		EGLint id, vid, vtype, bufsz, r, g, b, a, depth, stencil, samples, stype;
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_CONFIG_ID, &id);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_NATIVE_VISUAL_ID, &vid);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_NATIVE_VISUAL_TYPE, &vtype);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_BUFFER_SIZE, &bufsz);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_RED_SIZE, &r);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_GREEN_SIZE, &g);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_BLUE_SIZE, &b);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_ALPHA_SIZE, &a);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_DEPTH_SIZE, &depth);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_STENCIL_SIZE, &stencil);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_SAMPLES, &samples);
+		eglGetConfigAttrib(edpy, cfgs[i], EGL_SURFACE_TYPE, &stype);
+		printf("%-4d 0x%-8x 0x%-10x 0x%-10x %-5d %-4d %-4d %-4d %-4d %-6d %-8d %-6d 0x%x\n",
+		       i + 1, id, vid, vtype, bufsz, r, g, b, a, depth, stencil, samples,
+		       stype);
+	}
+}
+
+int main(int argc, char **argv) {
 	Display *dpy = XOpenDisplay(NULL);
 	if (dpy == NULL) {
 		fprintf(stderr, "无法打开 X display（DISPLAY=%s）\n",
@@ -162,6 +196,8 @@ int main(void) {
 		printf("  0x%-6lx %-6d %-10s %-12s %s\n", vis[i].visualid, vis[i].depth,
 		       cls, cfgstr, surfstr);
 	}
+
+	if (argc > 1 && strcmp(argv[1], "-a") == 0) dumpConfigs(edpy);
 
 	printf("\n小结: visual 总数 %d，无 EGL config %d，有 config 但 surface 失败 %d，可用 %d\n",
 	       nvis, cfg_missing, surf_fail, ok_cnt);
