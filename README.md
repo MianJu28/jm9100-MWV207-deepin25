@@ -3,13 +3,15 @@
 > 平台：**飞腾 D3000 + 景嘉微 JM9100**，内核 **6.6.143-arm64-desktop-hwe (Deepin 25)**。
 > 目标：把闭源 **jmgpu 1.7.0** 内核驱动移植到 6.6 并**同时**点亮显示与打通 VA-API 硬解。
 >
-> **最终结果（2026-09-10）：三项关键问题全部解决 ✅**
+> **最终结果：四项关键问题全部解决 ✅**
+> （1–3 于 2026-09-10，4 于 2026-09-14，详见 §3.5）
 
 | # | 问题 | 状态 | 主要修复位置 |
 |---|---|---|---|
 | 1 | HDMI 无信号（内核 oops） | ✅ | `jmgpu_nicely.c` |
 | 2 | 显示灰蒙蒙（低对比度） | ✅ | `jmgpu_package.c`（GAMMA_LUT 契约 768 → 256） |
 | 3 | VA-API 直通画面全绿 | ✅ | `mpv_dmabuf_oes_image.patch` + `jmgpu_bullets.c` / `jmgpu_setlayout.c` |
+| 4 | EasyTier GUI 白屏（提权进程丢 GL vendor 变量） | ✅ | `/etc/environment`（§3.5，**非仓库代码**） |
 
 - 部署流程见 **§4**，日常使用见 **§5**。
 - 历史排查全过程（含大量已排除方案、实验数据）见 `backup/FIXLOG.2026-09-10.md`
@@ -372,6 +374,94 @@ LD_LIBRARY_PATH=$PWD/build PATH=$PWD/build:$PATH \
 
 ---
 
+### 3.5 EasyTier GUI 白屏（提权进程丢失 GL vendor 变量，2026-09-14）✅
+
+**症状**：EasyTier GUI v2.6.4（**Tauri + WebKitGTK 4.1**，libwebkit2gtk 2.50.4）在 jmgpu
+栈下窗口**纯白**，只剩标题栏。量化：窗口像素 `mean=1.0 / std=0`（完全均匀白）。
+
+**第一手结论：白屏不是"驱动画不出来"，而是 WebKit 的 web 内容进程已死**
+
+```
+$ pgrep -af "webkit2gtk-4.1/WebKit"      # 白屏实例
+26282 …/WebKitNetworkProcess 1 16 18     # 网络进程在，WebKitWebProcess 不存在
+```
+
+内核侧**无 GPU 复位/hang/fault、无 OOM**；`jmgpu-exp` 导出记录全部**早于**应用启动
+（应用启动 ≈ t1620s，最后一条导出 t1442s）——即 **EasyTier 根本没走 GPU/dmabuf**，
+与 §3.3 的 dmabuf 改动无关。
+
+**根因：环境变量断链，被驱动栈切换放大**
+
+1. EasyTier GUI 需要 root（建 TUN），会**通过 `pkexec` 把自己重新拉起**：
+
+```
+easytier-gui(admin) → pkexec /usr/bin/env DISPLAY=:0 XAUTHORITY=… HOME=… /usr/bin/easytier-gui (root)
+```
+
+2. 景美 GL 依赖 `__GLX_VENDOR_LIBRARY_NAME=mwv207`
+   （来源 `/etc/profile.d/mwv207_glvnd.sh`；配套 `/usr/share/glvnd/{glx,egl}_vendor.d/10_mwv207.json`）。
+   **`pkexec` 会清空并重建环境**，该变量不在白名单 → 提权后的 GUI 丢失它。
+   （逐项对比两个进程环境：除该变量外其余差异 `PKEXEC_UID`/`PATH`/`TERM`/`XDG_CURRENT_DESKTOP`
+   均不影响结果。）
+3. 变量丢失后 glvnd 取 **X server 通告的 vendor 名**（Xorg 21.1.16 默认 `mesa`），
+   去加载 `libGLX_mesa.so.0`：`libGLX.so.0` 的内部常量是 `libGLX_%s.so.0`，
+   **Vendor 名由 server 决定，JSON 的 `library_path` 不参与**。于是 Mesa 顶上来，
+   而 Mesa 对 `0731:9100` 无驱动：
+
+```
+glx: failed to create dri3 screen
+failed to load driver: jmgpu
+KMS: DRM_IOCTL_MODE_CREATE_DUMB failed: 权限不够
+Failed to create GBM buffer of size 800x600: 权限不够
+```
+
+4. WebKit WebProcess 渲染 / GBM 初始化失败 → **进程死亡** → 白页。
+
+**为什么"改完驱动"才暴露**：开源 mwv207 栈下 Mesa 有配套 `mwv207_dri.so`，回落路径
+可用，问题被掩盖；换成闭源 jmgpu 内核驱动后 Mesa 无驱动，回落必然失败。
+**驱动修复本身没错，只是把"GL vendor 选择依赖"从被掩盖变成致命。**
+
+**修复**：在这套 Xorg + 专有 DDX 组合下，**变量只能靠环境变量交付**（glvnd 级配置
+消除不掉，见下方"已排除"），因此只需补齐 PAM 这条链路 —— `/usr/lib/pam.d/polkit-1`
+本就调用 `pam_env.so readenv=1`（会读 `/etc/environment`），而驱动安装脚本只写了
+`/etc/profile.d/`（仅登录 shell 生效）：
+
+```bash
+# 追加一行（覆盖 pkexec / su / login / sshd / lightdm / cron 等所有 PAM 会话）
+__GLX_VENDOR_LIBRARY_NAME=mwv207      # 写入 /etc/environment
+```
+
+> `sudo` 的 PAM 栈**不含** `pam_env`，所以**不能**用 `sudo easytier-gui` 来复现/验证本问题
+> ——那种方式自带变量，画面正常，会得出"没问题"的错误结论。
+
+**验证（2026-09-14，重启后从桌面图标启动，即走 pkexec 提权路径）**
+
+| 检查项 | 修复前 | 修复后 |
+|---|---|---|
+| 提权进程环境（`PKEXEC_UID=1000` 的 root 实例） | 无 `__GLX_VENDOR_LIBRARY_NAME` | **有** `__GLX_VENDOR_LIBRARY_NAME=mwv207` |
+| `WebKitWebProcess` | 不存在（仅 NetworkProcess） | 存活 |
+| 窗口像素 | `mean=1.0  std=0`（纯白） | `mean=0.975  std=0.104`（正常渲染） |
+
+**对照实验（同一二进制、同为 root，只改环境）**
+
+| 启动方式 | WebProcess | 画面 |
+|---|---|---|
+| `sudo` + 环境含 `__GLX_VENDOR_LIBRARY_NAME=mwv207` | 存活 | 正常 |
+| `env -i …`（精确复刻 pkexec 环境，无该变量） | 起来后**立即死** | 白屏 |
+| `MiniBrowser`（`/usr/lib/aarch64-linux-gnu/webkit2gtk-4.1/MiniBrowser`）免 root 复现 | 同上结论一致 | 同上 |
+
+**已排除的"glvnd 级"方案（勿再尝试）**
+
+1. 在 `glx_vendor.d` 增加 `{"name":"mesa", "library_path":"…/libGLX_mwv207.so.1.2.0"}` →
+   **无效**：glvnd 按 `libGLX_<name>.so.0` 拼 soname，不看 JSON 的 `library_path`。
+2. 指望 glvnd/景美 X 驱动"默认认领 vendor" → server 侧报的就是 Xorg 默认的 `mesa`，
+   客户端改不动；除非顶掉 `libGLX_mesa.so.0` 本体，代价过大（会打掉 Mesa 软栈）。
+3. 顺带排除：系统范围内 `Disabled hardware acceleration because GTK failed to initialize GL:
+   指定的 RGBA 像素格式没有可用的设置` 在**修复前后都会出现**（WebKit 因此走软件回退），
+   **不是**白屏的判据，不要拿它当根因。
+
+---
+
 ## 4. 部署
 
 ### 4.1 首次部署 / 持久化 / 回滚
@@ -569,6 +659,7 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | `sync_dkms.sh` | 同步源码到 DKMS + build + install + update-initramfs（一条龙） |
 | `force_mode_test.sh` | 强制点屏验证与持久化接管 / 回滚（`boot` / `boot-undo`） |
 | `test_passthrough.sh` | **直通一键自检**（纯色片源判定 + 导出诊断 + 环境体检） |
+| `/etc/environment`（**系统配置，非本仓库文件**） | 追加 `__GLX_VENDOR_LIBRARY_NAME=mwv207`：修复 pkexec 提权应用（EasyTier GUI 等）白屏（§3.5） |
 | `drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 以及当前 `GAMMA_LUT` blob 的项数与内容（定位灰蒙蒙根因用，§3.2） |
 | `jmgpu_reload_test.sh` | **卸载/重载 + S3 验证脚本**（须在 SSH/TTY 中跑，自带恢复桌面与回滚，§3.4） |
 | `jm_dmabuf_cycle.c` | dmabuf 导出→同驱动导入→释放 循环压测与泄漏检查（无需 root，§3.3 相关） |
@@ -601,14 +692,25 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
    （blacklist mwv207 + modules-load 强制加载 jmgpu），回滚 = `boot-undo`。
    改驱动源码后务必 `./sync_dkms.sh build` 再重启（含 initramfs 重建）。
 2. **mpv 补丁不可丢**：直通依赖 `mpv_dmabuf_oes_image.patch`，升级 mpv 后需重新应用。
-3. **向景美反馈的三点**（附本 README §3.3 数据即可复现）：
+3. **`/etc/environment` 不可丢**（§3.5）：`__GLX_VENDOR_LIBRARY_NAME=mwv207`
+   必须**同时**存在于
+   - `/etc/profile.d/mwv207_glvnd.sh`（登录 shell / 桌面会话应用），与
+   - `/etc/environment`（PAM 会话，含 `pkexec` 提权的应用）。
+
+   驱动的安装脚本目前**只写了前者**，凡"自我提权"的应用（EasyTier GUI 等）
+   都会白屏。重装系统或重装驱动包后需重新确认这两处都在。
+4. **向景美反馈的四点**（附本 README §3.3 / §3.5 数据即可复现）：
    - `glEGLImageTargetTexStorageEXT` 入口存在但未真正挂接 dmabuf，建议实现或
      不要声明 `GL_EXT_EGL_image_storage`；
    - reserved-mem（VRAM）分配器的 `.GetSGT` 为空桩，导致标准 `map_dma_buf`
      导入必然失败；
    - 解码 surface 池整体按"一块连续显存"申请，在可见窗口碎片化时整组回退到
-     CPU 不可见池，建议改为按需分块或非连续分配。
-4. **向景美/deepin/飞腾反馈 SCDC 修复**：同源代码在所有 6.x 内核上都有该问题，
+     CPU 不可见池，建议改为按需分块或非连续分配；
+   - **X 驱动应通过 `GLX_EXT_libglvnd` 通告 libglvnd vendor 名 `mwv207`**（当前
+     报的是 Xorg 默认的 `mesa`）。否则凡经 `pkexec`/纯净环境启动的 WebKit、
+     Chromium、GTK 程序都会让 glvnd 回落到 Mesa 而崩溃（§3.5 有完整复现与对照）；
+     另外驱动安装脚本应把 `__GLX_VENDOR_LIBRARY_NAME` 同时写入 `/etc/environment`。
+5. **向景美/deepin/飞腾反馈 SCDC 修复**：同源代码在所有 6.x 内核上都有该问题，
    §3.1 的补丁可直接回给厂商。
-5. （可选）纯开源路线：Icenowy / 官方 6.6 内核显示可用但解码用户态仍缺失，
+6. （可选）纯开源路线：Icenowy / 官方 6.6 内核显示可用但解码用户态仍缺失，
    需自写 VA driver 对接 `pipe_dec`，工作量大，现阶段无必要。
