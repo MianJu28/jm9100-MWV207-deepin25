@@ -3,8 +3,8 @@
 > 平台：**飞腾 D3000 + 景嘉微 JM9100**，内核 **6.6.143-arm64-desktop-hwe (Deepin 25)**。
 > 目标：把闭源 **jmgpu 1.7.0** 内核驱动移植到 6.6 并**同时**点亮显示与打通 VA-API 硬解。
 >
-> **最终结果：四项关键问题全部解决 ✅**
-> （1–3 于 2026-09-10，4 于 2026-09-14，详见 §3.5）
+> **最终结果：1–5 已解决，6 已定位根因 ✅**
+> （1–3 于 2026-09-10；4–6 于 2026-09-14，详见 §3.5 / §3.6 / §3.7）
 
 | # | 问题 | 状态 | 主要修复位置 |
 |---|---|---|---|
@@ -12,6 +12,8 @@
 | 2 | 显示灰蒙蒙（低对比度） | ✅ | `jmgpu_package.c`（GAMMA_LUT 契约 768 → 256） |
 | 3 | VA-API 直通画面全绿 | ✅ | `mpv_dmabuf_oes_image.patch` + `jmgpu_bullets.c` / `jmgpu_setlayout.c` |
 | 4 | EasyTier GUI 白屏（提权进程丢 GL vendor 变量） | ✅ | `/etc/environment`（§3.5，**非仓库代码**） |
+| 5 | 未打补丁应用无法 VA-API 零拷贝直通 | ✅ | `jm_gl_compat.c`（用户态 GL 兼容层，§3.6） |
+| 6 | 硬件 GL 栈黑窗 | 🔍 已定位 | `jm_egl_visual_probe.c` 定位根因，修复在应用侧（§3.7） |
 
 - 部署流程见 **§4**，日常使用见 **§5**。
 - 历史排查全过程（含大量已排除方案、实验数据）见 `backup/FIXLOG.2026-09-10.md`
@@ -462,6 +464,95 @@ __GLX_VENDOR_LIBRARY_NAME=mwv207      # 写入 /etc/environment
 
 ---
 
+### 3.6 用户态 GL 兼容层：补齐 `GL_EXT_EGL_image_storage`（2026-09-14）✅
+
+**问题**（purelive 审计 §10.1/§10.2）：景美桌面 GL 的用户态实现存在不对称：
+
+- ✅ 声明 `GL_OES_EGL_image`，`glEGLImageTargetTexture2DOES()` **能真正**把 dmabuf 挂到纹理；
+- ❌ **未声明** `GL_EXT_EGL_image_storage`，而 `glEGLImageTargetTexStorageEXT()` 这个入口
+  「存在却不真正挂接 dmabuf」（纹理恒为全零）。
+
+后果：走 storage 路径的客户端（mpv 的 `vaapi_gl_mapper`、Chromium 等）在桌面 GL 下**主动拒绝**
+VA-API dmabuf 零拷贝 —— 回落 `vaapi-copy`（收益被搬运吃光）或软解；在 Mesa/llvmpipe 上更会
+**静默产出全零帧**（深绿绿屏）。此前只能给 mpv 打补丁（§3.3 的
+`mpv_dmabuf_oes_image.patch`），属于**逐应用修**。
+
+**方案：一次性覆盖所有应用的 LD_PRELOAD 兼容层**（`jm_gl_compat.c`）
+
+| 动作 | 说明 |
+|---|---|
+| 广告 `GL_EXT_EGL_image_storage` | `glGetString(GL_EXTENSIONS)`、`glGetStringi()`、`glGetIntegerv(GL_NUM_EXTENSIONS)` **三条路径都覆盖** |
+| storage → OES 重定向 | `glEGLImageTargetTexStorageEXT()` / `glEGLImageTargetTextureStorageEXT()` → `glEGLImageTargetTexture2DOES()`（语义等价，都作用于当前绑定纹理） |
+| `getProcAddress` 拦截 | `glXGetProcAddress(ARB)` / `eglGetProcAddress` 也返回上述重定向 —— **epoxy / glad / GLEW 绕过动态链接器符号表**，只做符号插入抓不到它们 |
+| 防御式生效 | 仅当 `GL_VENDOR` 含 `Jingjia` **且** `glEGLImageTargetTexture2DOES` 真实存在（能力判据）时介入；其它栈原样透传 |
+| 开关 | `JMGPU_GL_COMPAT=0` 关闭；`JMGPU_GL_COMPAT_DEBUG=1` 打印日志 |
+
+```bash
+./build_gl_compat.sh              # 编译到 build-cli/libjm_gl_compat.so
+./build_gl_compat.sh install      # 安装到 /usr/lib/aarch64-linux-gnu/
+./test_gl_compat.sh               # 一键验证（三步）
+LD_PRELOAD=.../libjm_gl_compat.so LIBVA_DRIVER_NAME=jmgpu mpv --vo=gpu --hwdec=vaapi 视频.mp4
+```
+
+**验证（2026-09-14，系统 `mpv v0.40.0`，**未打任何补丁**，720p 纯红片源）**
+
+| 检查项 | 无兼容层 | 有兼容层 |
+|---|---|---|
+| `GL_EXT_EGL_image_storage` | 不在扩展列表 | **在** |
+| mpv `vo/gpu/vaapi` 判定 | `VAAPI hwdec only works with OpenGL or Vulkan backends.`（拒绝 direct） | **`Using EGL dmabuf interop via GL_EXT_EGL_image_storage`**（进入 direct） |
+| 直通画面像素 | — | `avg=(255,0,64)`，绿色占比 0.0%（非全零绿屏） |
+| 重定向日志 | — | `redirect glEGLImageTargetTexStorageEXT(target=0xde1) -> glEGLImageTargetTexture2DOES` |
+
+即：**未打补丁的应用也能零拷贝直通**。兼容层不替换任何厂商库，可随时用 `JMGPU_GL_COMPAT=0` 或
+不设 `LD_PRELOAD` 停用。
+
+---
+
+### 3.7 硬件 GL 栈黑窗根因：景美 EGL 的 config 只覆盖一个 visual（2026-09-14）✅ 已定位
+
+**症状**：purelive 在 `PURELIVE_JM9100_GL=hardware` 下窗口**纯黑**（`mean=0 std=0`），
+引擎持续刷：
+
+```
+[ERROR:flutter/.../embedder.cc(939)]  Could not wrap embedder supplied frame-buffer.
+[ERROR:flutter/.../embedder.cc(1538)] Could not create a surface from an embedder provided render target.
+```
+
+**排查（按证据逐项排除）**
+
+| 实验 | 结果 | 排除的假设 |
+|---|---|---|
+| `glxgears`（厂商 GLX）640x480 | 正常 | 厂商 GLX 窗口化呈现本身 |
+| `glxgears` **1920x1030**（与应用同尺寸） | 正常 100 FPS | **窗口尺寸/显存不足** |
+| Xorg 日志 glamor 记录 | `Failed to allocate 1920x1030 FBO due to GL_OUT_OF_MEMORY` **全局仅 1 次**，复跑不再出现 | **不是稳定阻塞点**（该次瞬时 OOM 会引发 `GLXBadPixmap` 崩溃，属一次性资源事件） |
+| `jm_egl_visual_probe`（本仓库新增） | 景美 EGL 的 **40 个 config 只覆盖 `0x21` 一个 visual**；其余 **89 个** visual（含应用选的 `0x7c`、全部 32 位 ARGB）**无 config** → `eglCreateWindowSurface` 必然失败 | **根因** |
+
+```
+$ ./jm_egl_visual_probe
+EGL_VENDOR  = Jingjia Micro
+EGL 共 40 个 config，覆盖 1 个 X visual
+  visual   depth  class      EGL config   window surface
+  0x21     24     TrueColor  40个         OK
+  0x7c     32     TrueColor  -            （无匹配 config，引擎必然失败）
+  ...（其余 88 个同理）...
+屏幕默认 visual = 0x21
+```
+
+**根因**：Flutter(GTK embedder) 最终用 **EGL** 给窗口建 surface；而窗口 visual 是应用按
+「**32 位 ARGB 优先**」挑的（本机 `0x7c`），该 visual 不在景美 EGL 的 config 覆盖范围内
+→ 引擎建不出 surface → 黑窗。**唯一可用的 `0x21` 恰好就是屏幕默认 visual。**
+
+**修复方向（应用侧，一处）**：visual 选择必须以「**EGL 能否建出 window surface**」为准，
+而不是「`gdk_window_create_gl_context` 成功」（后者只验 GLX 路径，会误选 `0x7c`）。
+在景美栈上等价于：**硬件模式下不要覆盖窗口 visual**，沿用默认 `0x21`，
+只保留会话 GL 环境（`__GLX_VENDOR_LIBRARY_NAME=mwv207`）。
+
+> **对 purelive 审计 §10.1 的更正**：其中「屏幕默认 visual `0x21` 能建上下文但呈现阶段崩溃、
+> 只有 32 位 ARGB `0x7c` 能出图」的规则来自 GLX 路径观测，且被首次 glamor OOM 污染。
+> 以本节的 EGL 实测为准：`0x21` 是**唯一**能让景美 EGL 建出 window surface 的 visual。
+
+---
+
 ## 4. 部署
 
 ### 4.1 首次部署 / 持久化 / 回滚
@@ -660,6 +751,10 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | `force_mode_test.sh` | 强制点屏验证与持久化接管 / 回滚（`boot` / `boot-undo`） |
 | `test_passthrough.sh` | **直通一键自检**（纯色片源判定 + 导出诊断 + 环境体检） |
 | `/etc/environment`（**系统配置，非本仓库文件**） | 追加 `__GLX_VENDOR_LIBRARY_NAME=mwv207`：修复 pkexec 提权应用（EasyTier GUI 等）白屏（§3.5） |
+| `jm_gl_compat.c` | **用户态 GL 兼容层**（LD_PRELOAD）：补齐 `GL_EXT_EGL_image_storage` 并把 storage 入口重定向到可用的 OES 入口，使**未打补丁**的应用也能 VA-API 零拷贝直通（§3.6） |
+| `build_gl_compat.sh` | 编译/安装/卸载上述兼容层（含导出符号自检） |
+| `test_gl_compat.sh` | **兼容层一键验证**：扩展广告 → 未打补丁 mpv 的 direct 判定 → 直通画面像素（区分全零绿屏） |
+| `jm_egl_visual_probe.c` | **EGL visual 能力探针**：枚举 X visual 并实测景美 EGL 能否为其建出 window surface（定位硬件栈黑窗根因用，§3.7） |
 | `drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 以及当前 `GAMMA_LUT` blob 的项数与内容（定位灰蒙蒙根因用，§3.2） |
 | `jmgpu_reload_test.sh` | **卸载/重载 + S3 验证脚本**（须在 SSH/TTY 中跑，自带恢复桌面与回滚，§3.4） |
 | `jm_dmabuf_cycle.c` | dmabuf 导出→同驱动导入→释放 循环压测与泄漏检查（无需 root，§3.3 相关） |
@@ -691,7 +786,12 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 1. **保持本仓库栈**：DKMS 已装补丁版 `jmgpu.ko`；持久化 = `force_mode_test.sh boot`
    （blacklist mwv207 + modules-load 强制加载 jmgpu），回滚 = `boot-undo`。
    改驱动源码后务必 `./sync_dkms.sh build` 再重启（含 initramfs 重建）。
-2. **mpv 补丁不可丢**：直通依赖 `mpv_dmabuf_oes_image.patch`，升级 mpv 后需重新应用。
+2. **直通的两条路（二选一即可）**：
+   - **系统级（推荐）**：`./build_gl_compat.sh install`，再用
+     `LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjm_gl_compat.so` 启动播放器 ——
+     未打补丁的应用也能进入 direct（§3.6）；
+   - **应用级**：给 mpv 打 `mpv_dmabuf_oes_image.patch` 后重编（§4.3），
+     升级 mpv 后需重新应用。
 3. **`/etc/environment` 不可丢**（§3.5）：`__GLX_VENDOR_LIBRARY_NAME=mwv207`
    必须**同时**存在于
    - `/etc/profile.d/mwv207_glvnd.sh`（登录 shell / 桌面会话应用），与
@@ -699,9 +799,10 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 
    驱动的安装脚本目前**只写了前者**，凡"自我提权"的应用（EasyTier GUI 等）
    都会白屏。重装系统或重装驱动包后需重新确认这两处都在。
-4. **向景美反馈的四点**（附本 README §3.3 / §3.5 数据即可复现）：
+4. **向景美反馈的五点**（附本 README §3.3 / §3.5 / §3.7 数据即可复现）：
    - `glEGLImageTargetTexStorageEXT` 入口存在但未真正挂接 dmabuf，建议实现或
-     不要声明 `GL_EXT_EGL_image_storage`；
+     不要声明 `GL_EXT_EGL_image_storage`（本仓库已用 `jm_gl_compat.c` 从
+     客户端侧兜底，§3.6）；
    - reserved-mem（VRAM）分配器的 `.GetSGT` 为空桩，导致标准 `map_dma_buf`
      导入必然失败；
    - 解码 surface 池整体按"一块连续显存"申请，在可见窗口碎片化时整组回退到
@@ -709,7 +810,12 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
    - **X 驱动应通过 `GLX_EXT_libglvnd` 通告 libglvnd vendor 名 `mwv207`**（当前
      报的是 Xorg 默认的 `mesa`）。否则凡经 `pkexec`/纯净环境启动的 WebKit、
      Chromium、GTK 程序都会让 glvnd 回落到 Mesa 而崩溃（§3.5 有完整复现与对照）；
-     另外驱动安装脚本应把 `__GLX_VENDOR_LIBRARY_NAME` 同时写入 `/etc/environment`。
+     另外驱动安装脚本应把 `__GLX_VENDOR_LIBRARY_NAME` 同时写入 `/etc/environment`；
+   - **EGL 的 config 集合只覆盖屏幕的 1 个 visual（实测 `0x21`，其余 89 个 visual
+     全部无 config）**，建议覆盖屏幕的全部 visual（至少 24/32 位 TrueColor 全部）。
+     这是「任何用 EGL 给窗口建 surface 的客户端」（Flutter/GTK/Chromium…）在
+     景美栈上黑窗的直接原因，且 `0x21` 恰好是屏幕默认 visual —— 用别的 visual
+     必挂（§3.7）。
 5. **向景美/deepin/飞腾反馈 SCDC 修复**：同源代码在所有 6.x 内核上都有该问题，
    §3.1 的补丁可直接回给厂商。
 6. （可选）纯开源路线：Icenowy / 官方 6.6 内核显示可用但解码用户态仍缺失，
