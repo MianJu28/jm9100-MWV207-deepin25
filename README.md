@@ -3,8 +3,8 @@
 > 平台：**飞腾 D3000 + 景嘉微 JM9100**，内核 **6.6.143-arm64-desktop-hwe (Deepin 25)**。
 > 目标：把闭源 **jmgpu 1.7.0** 内核驱动移植到 6.6 并**同时**点亮显示与打通 VA-API 硬解。
 >
-> **最终结果：1–5 已解决，6 已定位根因 ✅**
-> （1–3 于 2026-09-10；4–6 于 2026-09-14，详见 §3.5 / §3.6 / §3.7）
+> **最终结果：1–5 已解决，6 已定位根因，7 阶段成果 ✅**
+> （1–3 于 2026-09-10；4–7 于 2026-09-14，详见 §3.5 / §3.6 / §3.7 / §3.9）
 
 | # | 问题 | 状态 | 主要修复位置 |
 |---|---|---|---|
@@ -14,6 +14,7 @@
 | 4 | EasyTier GUI 白屏（提权进程丢 GL vendor 变量） | ✅ | `/etc/environment`（§3.5，**非仓库代码**） |
 | 5 | 未打补丁应用无法 VA-API 零拷贝直通 | ✅ | `jm_gl_compat.c`（用户态 GL 兼容层，§3.6） |
 | 6 | 硬件 GL 栈黑窗 | 🔍 已定位 | `jm_egl_visual_probe.c` 定位根因，修复在应用侧（§3.7） |
+| 7 | X11 呈现错位（专有 X 驱动无法加载） | 🚧 阶段成果 | `patch_xorg_abi.py` 补 ABI 24→25，已过门禁；PreInit 仍崩（§3.9） |
 
 - 部署流程见 **§4**，日常使用见 **§5**。
 - 历史排查全过程（含大量已排除方案、实验数据）见 `backup/FIXLOG.2026-09-10.md`
@@ -625,6 +626,80 @@ config↔visual 映射**（现在 40 个 config 只有一个 visual），属重�
 
 ---
 
+### 3.9 X11 呈现错位（带状/三角状斑块）：专有 X 驱动 ABI 补丁——已过门禁，PreInit 仍崩（2026-09-14）🚧
+
+> 对应 `VENDOR_FEEDBACK_PRESENTATION.md`（Pure Live 侧反馈）。根因链：专有 X 驱动
+> `mwv207_drv.so` 按 **DDx ABI 24** 编译，Xorg 1.21.1.16 要求 **25** → 加载失败 →
+> 服务器回落 `modeset(0)` + 软件路径，DRI3 共享 pixmap 拷到显示缓冲与扫描输出之间
+> **无 vblank 同步** → 30 fps 源错位斑块严重、60 fps 偶发。
+
+**阶段 1：解析模块版本结构（4 字节补丁过 ABI 门禁）**
+
+`mwv207_drv.so`（140 KB，**stripped**）的加载入口 `mwv207ModuleData` 在
+`.data 0x317b8`，指向 `XF86ModuleVersionInfo`@`0x317d0`：
+
+| 偏移 | 值 | 字段 |
+|---|---|---|
+| +0 | →`"mwv207"` | modname |
+| +8 | →`"X.Org Foundation"` | vendor |
+| +16/+20/+24/+28 | 4×u32 | `_modinfo` / major / minor / patch（驱动自身版本） |
+| +32 | →`"X.Org Video Driver"` | **abiclass**（ABI_CLASS_VIDEODRV）|
+| **+40** | **`0x00180000`** | **abiversion = (24<<16)\|0 = 24.0** ← 病灶 |
+| +44 | 0 | 对齐 |
+| +48 | →`"X.Org Video Driver"` | moduleclass |
+| +56 | 0 | checksum |
+
+ABI 编码是 `major<<16 | minor`（加载器按 `值>>16` 打印 "major version"）。
+所以修复只需把文件偏移 **`0x217f8`** 处的 u32 从 `0x00180000` 改为 `0x00190000`。
+
+```bash
+python3 patch_xorg_abi.py /usr/lib/xorg/modules/drivers/mwv207_drv.so \
+                          build-cli/mwv207_drv.so.abi25
+```
+
+**阶段 2：隔离验证（不污染当前会话）**
+
+用 `ModulePath` 指向补丁副本、`Xorg :99 -config …` 起独立实例（当前 X 占着 DRM master，
+测试实例必然失败退出，因此**对现网会话零影响**）：
+
+| | 现象 |
+|---|---|
+| 原版模块（对照） | `ABI class: X.Org Video Driver, version 24.0` → `(EE) module ABI major version (24) doesn't match the server's version (25)` → `Failed to load module` → `No drivers available` |
+| **补丁模块** | `ABI class: X.Org Video Driver, version **25.0**` → **ABI 门禁通过**，进入 Probe，且被识别为 `MWV207: Driver for jmgpu chipsets: JMGPU JM9200 8018` |
+| 但随后 | `(EE) Backtrace: …` **`Segmentation fault at address 0x48`**（Probe/PreInit 阶段；backtrace 因无 unwind 信息无法展开） |
+
+**结论**：**4 字节补丁已让驱动通过 ABI 门禁并被识别**；但 ABI 24→25 之间 DDX 结构
+（`ScrnInfoRec`/`EntityInfoRec` 等）确有变化，PreInit 里出现 `NULL+0x48` 解引用崩溃。
+（`NULL + 0x48` 这种形态更像「某接口返回 NULL 后按偏移取字段」，而非单纯字段偏移错位。）
+
+**下一步（按风险/收益排序）**
+
+1. ~~先上合成器缓解错位~~ **实测走不通（2026-09-14）**：合成器其实**一直在开**
+   （KWin `active=true`，后端为 **XRender** 软件合成——反馈文档"无合成器"的说法需更正）。
+   三种强制 OpenGL 合成的手段**全部回落 XRender**：kwinrc `[Compositing] Backend=OpenGL`
+   + `reconfigure`、`Compositing.suspend/resume` 完整重建、`KWIN_COMPOSE=O2` 重启；
+   且 Deepin 的 `kwin_x11` 完全抑制自身日志（`QT_LOGGING_RULES="*.debug=true"` 也只吐
+   Qt 内部噪音），拿不到失败原因。GLX 侧实测**存在** visual `0x7c`（depth32 / RGBA8888 /
+   depth24+stencil8）的 FBConfig——**更正审计 §10.1**（其称 GLX 只覆盖
+   `0x21/0x22/0x113…0x14c`）。→ **错位的止血在合成器层面走不通**；根治仍指向专有 X
+   驱动（本节 ABI 补丁路线）或厂商。注：kwinrc 已还原；开关合成的 A/B 对照可用
+   `qdbus org.kde.KWin /Compositor org.kde.kwin.Compositing.suspend` / `resume`。
+2. 继续逆向 ABI 24→25 的结构差异，逐个修 PreInit 崩溃点（工作量大、且修完后
+   仍可能有更多不兼容点，需要可回滚环境反复重启 X 验证）。
+3. 等厂商出 ABI 25 的 `mwv207_drv.so`（反馈文档 §6.1 的根治路径）。
+
+**复现命令**（隔离环境，安全）
+
+```bash
+mkdir -p /tmp/xabi_modules/drivers
+cp build-cli/mwv207_drv.so.abi25 /tmp/xabi_modules/drivers/mwv207_drv.so
+# /tmp/x99.conf 里用 ModulePath "/tmp/xabi_modules" + Driver "mwv207" + BusID "PCI:7:0:0"
+Xorg :99 -config /tmp/x99.conf -logfile /tmp/x99.log -novtswitch -sharevts
+grep -aiE "mwv207|ABI|Backtrace|Segmentation" /tmp/x99.log
+```
+
+---
+
 ## 4. 部署
 
 ### 4.1 首次部署 / 持久化 / 回滚
@@ -826,7 +901,8 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | `jm_gl_compat.c` | **用户态 GL 兼容层**（LD_PRELOAD）：补齐 `GL_EXT_EGL_image_storage` 并把 storage 入口重定向到可用的 OES 入口，使**未打补丁**的应用也能 VA-API 零拷贝直通（§3.6） |
 | `build_gl_compat.sh` | 编译/安装/卸载上述兼容层（含导出符号自检） |
 | `test_gl_compat.sh` | **兼容层一键验证**：扩展广告 → 未打补丁 mpv 的 direct 判定 → 直通画面像素（区分全零绿屏） |
-| `jm_egl_visual_probe.c` | **EGL visual 能力探针**：枚举 X visual 并实测景美 EGL 能否为其建出 window surface（定位硬件栈黑窗根因用，§3.7） |
+| `jm_egl_visual_probe.c` | **EGL visual 能力探针**：枚举 X visual 并实测景美 EGL 能否为其建出 window surface（定位硬件栈黑窗根因用，§3.7）；`-a` 额外 dump 全部 config 属性 |
+| `patch_xorg_abi.py` | **X 驱动 ABI 补丁**：把 `mwv207_drv.so` 的 `XF86ModuleVersionInfo.abiversion` 从 24.0 补到 25.0（对副本操作，4 字节），使其能被 Xorg 1.21 加载（§3.9） |
 | `drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 以及当前 `GAMMA_LUT` blob 的项数与内容（定位灰蒙蒙根因用，§3.2） |
 | `jmgpu_reload_test.sh` | **卸载/重载 + S3 验证脚本**（须在 SSH/TTY 中跑，自带恢复桌面与回滚，§3.4） |
 | `jm_dmabuf_cycle.c` | dmabuf 导出→同驱动导入→释放 循环压测与泄漏检查（无需 root，§3.3 相关） |
