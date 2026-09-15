@@ -3,8 +3,8 @@
 > 平台：**飞腾 D3000 + 景嘉微 JM9100**，内核 **6.6.143-arm64-desktop-hwe (Deepin 25)**。
 > 目标：把闭源 **jmgpu 1.7.0** 内核驱动移植到 6.6 并**同时**点亮显示与打通 VA-API 硬解。
 >
-> **最终结果：1–5 已解决，6 已定位根因，7 阶段成果 ✅**
-> （1–3 于 2026-09-10；4–7 于 2026-09-14，详见 §3.5 / §3.6 / §3.7 / §3.9）
+> **最终结果：1–5、7 已解决，6 已定位根因 ✅**
+> （1–3 于 2026-09-10；4–7 于 2026-09-14；7 的收尾与显示/GL 性能调优于 2026-09-15，详见 §3.5 / §3.6 / §3.7 / §3.9 / **§8**）
 
 | # | 问题 | 状态 | 主要修复位置 |
 |---|---|---|---|
@@ -14,7 +14,7 @@
 | 4 | EasyTier GUI 白屏（提权进程丢 GL vendor 变量） | ✅ | `/etc/environment`（§3.5，**非仓库代码**） |
 | 5 | 未打补丁应用无法 VA-API 零拷贝直通 | ✅ | `jm_gl_compat.c`（用户态 GL 兼容层，§3.6） |
 | 6 | 硬件 GL 栈黑窗 | 🔍 已定位 | `jm_egl_visual_probe.c` 定位根因，修复在应用侧（§3.7） |
-| 7 | X11 呈现错位（专有 X 驱动无法加载） | 🚧 阶段成果 | `patch_xorg_abi.py` 补 ABI 24→25，已过门禁；PreInit 仍崩（§3.9） |
+| 7 | X11 呈现错位（专有 X 驱动无法加载） | ✅ | `patch_xorg_abi.py` + `patch_abi_layout.py`（ABI 24→25 + `ScrnInfoRec` 布局偏移），见 **§8** |
 
 - 部署流程见 **§4**，日常使用见 **§5**。
 - 历史排查全过程（含大量已排除方案、实验数据）见 `backup/FIXLOG.2026-09-10.md`
@@ -968,3 +968,110 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
    §3.1 的补丁可直接回给厂商。
 6. （可选）纯开源路线：Icenowy / 官方 6.6 内核显示可用但解码用户态仍缺失，
    需自写 VA driver 对接 `pipe_dec`，工作量大，现阶段无必要。
+
+---
+
+## 8. 2026-09-15 续：专有 X 驱动打通、GL 可用性与显示性能调优
+
+> 承接 **§3.9**（ABI 24→25 已过门禁，但清理路径仍崩）。
+> 本节记录当日完成的修复、**系统改动清单**、实测数据与已排除方案；所有改动均给出回退方式。
+
+### 8.1 结果概览
+
+| # | 问题 | 状态 | 关键动作 |
+|---|---|---|---|
+| 7 | 专有 X 驱动无法加载（崩溃） | ✅ 已解决 | `mwv207_drv.so.abi25.fixed3`（ABI + `ScrnInfoRec` 布局双补丁） |
+| 8 | 桌面/应用卡顿：GL 垂直同步等待每帧超时 ~1s | ✅ 已规避 | `/etc/environment` 追加 `vblank_mode=0` |
+| 9 | KWin GL(`gl2`) 合成送显仅 ≈8fps | ✅ 已规避 | dconfig `user_type=4`（XRender 合成，实测 47–60fps） |
+| 10 | 任务栏（dde-shell）掉帧 | ✅ 已规避 | `/usr/bin/dde-shell` 包装：GLX/EGL 改走 Mesa(CPU) |
+
+**结论**：专有 DDX 正常工作、GL 应用硬件加速可用（1.3–1.8 万 FPS）；仍有两类厂商驱动缺陷只能绕过（§8.5）。
+
+### 8.2 系统改动清单（当前生效）
+
+| 位置 | 改动 | 原因 | 回退 |
+|---|---|---|---|
+| `/usr/lib/xorg/modules/drivers/mwv207_drv.so` | 替换为 `build-cli/mwv207_drv.so.abi25.fixed3`（md5 `297aee83…`） | ① ABI 版本 24→25（`patch_xorg_abi.py`）；② Xorg 1.21 删除 `xf86str.h` 的 `Bool flipPixels` → 其后字段整体 **−8 字节**，回调槽错位使 `xf86DeleteScreen` 误调 LeaveVT，读未初始化的 `pScrn->pScreen` → `NULL+0x48` 段错误（`build-cli/patch_abi_layout.py`） | 从驱动包恢复原始 `mwv207_drv.so` |
+| `/etc/environment` | 追加 `vblank_mode=0` | 厂商 GL 等待 vblank 的事件流约 1Hz：开启垂直同步的 GL 应用恒定 **1.000 FPS**；自写 GLX 测试 20s 内 19 次 ≈1005ms 卡死 | 删除该行（备份：`/etc/environment.bak-20260915-113720`） |
+| `/etc/profile.d/zz-vblank.sh` | 新增 `export vblank_mode=0` | 同上，覆盖终端/命令行启动的 GL 程序 | `sudo rm /etc/profile.d/zz-vblank.sh` |
+| dconfig `org.kde.kwin.compositing:user_type` | `1`(OpenGL) → **`4`**(XRender) | 同款应用 1920×1080 录屏逐帧去重实测：`gl2` 合成 **40/301 帧（≈8fps）** vs `XRender` **237/301（≈47fps）** | `dde-dconfig set -a org.kde.kwin -r org.kde.kwin.compositing -k user_type -v 1` |
+| `/usr/bin/dde-shell` | 改为包装脚本（原厂二进制备份为 `dde-shell.real`，md5 `03e036d3…`） | 任务栏是 Qt Quick 高频重绘，走厂商 GL 明显掉帧；且厂商 EGL 建窗口 surface 必然失败（§3.7）。包装内设 `__GLX_VENDOR_LIBRARY_NAME=mesa`、`__EGL_VENDOR_LIBRARY_FILENAMES=…/50_mesa.json`、`QT_XCB_GL_INTEGRATION=xcb_glx` → GLX/EGL 全部改走 Mesa(CPU) | `sudo bash ~/fix_dock_mesa.sh revert` 后注销重登 |
+
+> 说明：以上改动**均在系统层，不涉及本仓库源码**；`/usr/share/X11/xorg.conf.d/10-mwv207.conf`
+> 保持原厂默认（实验用的 `Option "TearFree" "off"` 已还原）。
+> 另：X11 会话的 `DISPLAY` 会随会话重启递增（曾出现 `:2` / `:4`），脚本请勿硬编码，
+> 应从 `kwin_x11` 进程的 `/proc/<pid>/environ` 读取。
+
+### 8.3 实测数据（关键对照）
+
+| 场景 | 结果 |
+|---|---|
+| `glxgears`（`vblank_mode=0`） | **13,800–18,000 FPS** ✓ |
+| `glxgears`（默认开启垂直同步） | **1.000 FPS** ✗（每帧超时 1s） |
+| 自写 GLX 交换测试（默认，20s） | 1758 次交换，19 次 ≈1005ms 卡死 ✗ |
+| 同上 + `vblank_mode=0`（20s） | 1,292,401 次交换，**0 次卡死**，最差帧间隔 7.8ms ✓ |
+| KWin 合成对照（同款应用、逐帧去重） | `gl2` **40/301** vs `XRender` **237/301** ✓ |
+| 屏幕可见帧率（XRender 合成） | ≥60 fps ✓ |
+| `vainfo` | jmgpu 驱动正常（H264 等 VLD）✓ |
+| `jmgpu_int_ctlr` 中断（2s 采样） | 532 次 ≈266Hz —— GPU 中断本身正常 ✓ |
+
+### 8.4 尝试过但无效 / 已回退（避免重复踩坑）
+
+| 尝试 | 结果 |
+|---|---|
+| 模块参数 `fake_vblank=1`（`modinfo`：0x1=软件定时器产生 vblank） | 显式重载后确实为 1，但**驱动运行中自动改回 0** ✗（GL 仍 1 FPS） |
+| DDX `Option "TearFree" "off"` | 对客户端垂直同步超时无改善 ✗（已还原） |
+| `/usr/bin/kwin_x11` 包装（只让合成器 `vblank_mode=1`） | `gl2` 送显仍 0.5fps ✗（包装已卸载） |
+| 单独 `__EGL_VENDOR_LIBRARY_FILENAMES=…50_mesa.json` | EGL 报错依旧 ✗（需与 `__GLX_VENDOR_LIBRARY_NAME=mesa` 同时生效才见改善） |
+| `__GL_SYNC_TO_VBLANK=0` / `GL_SYNC_TO_VBLANK=0` | 厂商 GL **不识别** ✗（只有 `vblank_mode` 有效） |
+| DDX `EnablePageFlip` / `VSync` 选项 | **未测**（如需可加 `Option` 后重启 X 复测） |
+| 抓崩溃 shim（`/usr/local/lib/libsegv_real.so`）、登录自检、lightdm 包装 | 仅诊断用，**均已清理** ✓ |
+
+> ⚠️ 教训：**不要用 `sed`/文本编辑工具处理 ELF 二进制**。曾误将一行 `export` 插入
+> `/usr/bin/dde-shell` 开头（81 字节），内核无法执行该文件，导致桌面壳与任务栏消失；
+> 恢复方式：按 ELF 魔数偏移截断（`tail -c +82`），再用 `dpkg` 记录的 md5 校验
+> （`/var/lib/dpkg/info/dde-shell.md5sums`）。要改环境变量，一律改**包装脚本**。
+
+### 8.5 向景美反馈的驱动缺陷（新增/印证，建议随 §7.4 一并提交）
+
+1. **GL 客户端垂直同步等待超时**：vblank 事件流约 1Hz（而非 60Hz）。GPU 中断本身正常
+   （2s 内 532 次 ≈266Hz）。表现：任何开启垂直同步的 GL 应用恒定 1.000 FPS。
+2. **GL 合成路径性能异常**：同场景 `gl2` 合成 8fps vs `XRender` 47fps，约为 1/6。
+3. **印证 §3.7**：厂商 EGL 的 config 集合只覆盖 1 个 visual（实测 `0x21`），
+   任何用 EGL 给窗口建 surface 的客户端都会报 `Failed to initialize EglDisplay`
+   （本机 `dde-shell` 每次会话复现）。
+
+### 8.6 保留脚本（家目录）
+
+| 脚本 | 用途 |
+|---|---|
+| `~/feel.sh`（依赖 `~/anim3`） | 屏幕真实可见帧率自测：`bash ~/feel.sh 6` |
+| `~/fix_dock_mesa.sh` | dde-shell 的 Mesa 渲染包装：安装 / `revert` 还原 |
+| `~/fix_dock_egl.sh`、`~/fix_dock_glx.sh` | 前两版包装（已被 mesa 版取代，可删） |
+| `~/fix_kwin_vsync.sh` | kwin 包装的安装/回退（当前未使用） |
+| `~/apply_restore.sh` | 按 dpkg md5 还原被文本损坏的 `dde-shell` |
+
+### 8.7 日常自检
+
+```bash
+# 1) GL 应用是否正常（应上万 FPS）
+vblank_mode=0 glxgears
+# 2) 桌面合成是否满帧（≈18–20 为采样上限，实际 60）
+bash ~/feel.sh 6
+# 3) 合成器是否处于可用模式（期望 xrender）
+qdbus org.kde.KWin /Compositor org.kde.kwin.Compositing.compositingType
+# 4) VA-API 是否正常
+vainfo | head -8
+```
+
+### 8.8 遗留事项
+
+- 若将来厂商更新驱动（内核 `jmgpu.ko` / 用户态 `libGLX_mwv207.so`），可按下表复测并**回退规避项**：
+
+  | 复测项 | 期望 | 通过后回退 |
+  |---|---|---|
+  | `glxgears`（开垂直同步） | ≈60 FPS | 删除 `/etc/environment` 的 `vblank_mode=0` 与 `zz-vblank.sh` |
+  | `user_type=1`（gl2 合成） | ≥47 fps | 保持 `user_type=1`，删除 kwin 相关规避 |
+  | `~/feel.sh` 下任务栏/启动器动画 | 明显顺滑 | `sudo bash ~/fix_dock_mesa.sh revert` |
+
+- DDX 的 `EnablePageFlip` / `VSync` 两个选项尚未验证，可作为下一步实验方向。
