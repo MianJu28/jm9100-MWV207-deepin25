@@ -339,7 +339,15 @@ _DmabufMmap(IN jmkALLOCATOR Allocator,
 		goto OnError;
 	}
 
-	JMM_kASSERT(skipPages + numPages <= Mdl->numPages);
+	/*
+	 * Real bounds check - the vendor only had a JMM_kASSERT() here, which is
+	 * compiled out in release builds.  skipPages/numPages are derived from
+	 * the node placement and the mmap() length; without this, dma_buf_mmap()
+	 * would be asked to remap past the end of the imported buffer.
+	 */
+	if (skipPages >= Mdl->numPages ||
+	    numPages > Mdl->numPages - skipPages)
+		j9_recaution(J9_HANDLE_J9MENU_HOMOGONIES);
 
 	ret = dma_buf_mmap(dmabuf, vma, skipPages);
 	if (ret)

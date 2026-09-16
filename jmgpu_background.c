@@ -453,7 +453,18 @@ j9_settled(IN jmkALLOCATOR Allocator,
 
 	BUG_ON(!mdlPriv);
 
-	JMM_kASSERT(Offset + Bytes <= Mdl->numPages << PAGE_SHIFT);
+	/*
+	 * Real bounds check - the vendor only had a JMM_kASSERT() here, which is
+	 * compiled out in release builds.  Offset/Bytes arrive from callers that
+	 * may have been given user input (jmkVIDMEM_NODE_GetSGT() forwards the
+	 * node offset straight from a DRM ioctl); without the check
+	 * "Bytes - Offset" below goes negative and is handed to
+	 * jmgpu_setup_dma_sgt() as a huge count.  Bytes is an *end* extent here.
+	 */
+	if (Offset > (Mdl->numPages << PAGE_SHIFT) ||
+	    Bytes > (Mdl->numPages << PAGE_SHIFT) ||
+	    (Offset && Offset >= Bytes))
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	if (!Offset) {
 		*SGT = (jmtPOINTER)&mdlPriv->sgt;
@@ -584,7 +595,15 @@ j9_antic(IN jmkALLOCATOR Allocator,
 
 	j9_tympanichord("Allocator=%p Mdl=%p vma=%p", Allocator, Mdl, vma);
 
-	JMM_kASSERT(skipPages + numPages <= Mdl->numPages);
+	/*
+	 * Real bounds check - the vendor only had a JMM_kASSERT() here, which is
+	 * compiled out in release builds.  skipPages/numPages come from the node
+	 * placement and the mmap() length; without this the DMA mapping below
+	 * (skipPages << PAGE_SHIFT) would run past the end of the allocation.
+	 */
+	if (skipPages >= Mdl->numPages ||
+	    numPages > Mdl->numPages - skipPages)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 #if !J9_HANDLE_J9MIN_POLITICISE
 	if (Allocator->os->enableWriteCombine)

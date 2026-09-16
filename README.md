@@ -1648,3 +1648,137 @@ if ((args->offset >= size) ||
 | `jmgpu_dec: IRQ irq[0] not in use!`（§3.4） | 解码器走轮询/共享 IRQ，硬解实测正常（600 帧 1080p30 仅 0.70s CPU）；补 IRQ 注册风险大于收益，待有负载疑虑时再深查 |
 | gl2 合成 1–11fps、GL vsync 不真正节流 | 在厂商 **GL 用户态**实现内（§8.10），非内核可修 |
 | 解码 surface 池"整块连续申请" | 在厂商 **VA 用户态** `jmgpu_drv_video.so` 内；内核侧已有 `prefer_visible_pool` 系列参数作为缓解 |
+
+---
+
+## 11. 2026-09-16 续：把 `JMM_kASSERT` 当边界检查的 8 处缺陷（含**用户可控 `ChannelId` 越界写**）
+
+### 11.1 根因：这一族的"检查"在发行构建里根本不存在
+
+断言在 `jmgpu_standard.h` 里是**条件定义**的，而条件实际是"全有全无"：
+
+```c
+#define J9_VERSIONIST    (1 << 0)
+#define J9_AUTOBIOGRAPHY (1 << 4)     /* 断言族 */
+#define J9_MISDATING(flag)  (J9_NOONED & ((flag) | J9_VERSIONIST))   /* 注意 |1 */
+
+#ifndef J9_NOONED
+# if (defined(DBG) && DBG) || defined(DEBUG) || defined(_DEBUG)
+#  define J9_NOONED  J9_VERSIONIST   /* = 1  ⇒ 全开 */
+# else
+#  define J9_NOONED  J9_OPILIACEOUS  /* = 0  ⇒ 全关 */
+# endif
+#endif
+
+#if J9_MISDATING(J9_AUTOBIOGRAPHY)
+# define JMM_kASSERT(exp)  _JMM_ASSERT(JMM_k, exp)
+#else
+# define JMM_kASSERT(exp)                       /* ← 展开为**空** */
+#endif
+```
+
+本仓库构建用 `-DDBG=0` ⇒ `J9_NOONED = 0` ⇒ `J9_MISDATING(...)` 恒 `0` ⇒
+**`JMM_kASSERT(...)` 一律展开为空**。凡是用它"代替 `if + return`"的位置，发行版里
+**既没有检查、也没有那个 `return`**。§10 的缺陷 4 只碰到其中一处，本轮把同族的
+内存安全相关项**全部清出**。
+
+### 11.2 缺陷 5（最严重）：用户可控 `ChannelId` → 越界内核**写**
+
+`jmkMCFE_Execute()`（`jmgpu_register.c`）的 `ChannelId` 直接来自**用户提交的命令缓冲**
+（`jmgpu_middleware.c` 的 `#[mcfe-command: user]` 路径 ⇒ `CommandBuffer->channelId`）：
+
+```c
+	JMM_kASSERT(mcFE && ChannelId < mcFE->channelCount);   /* 发行版：空 */
+	channel = &mcFE->channels[ChannelId];                  /* 越界指针 */
+	ringBuf = Priority ? &channel->priRingBuf : &channel->stdRingBuf;
+	...
+	ringBuf->readPtr = data;                               /* 越界写内核内存 */
+```
+
+`channels[]` 只按 `mcFE->channelCount`（本机 4）分配，越界 id 会得到一个**数组之外的指针**，
+随后 `priRingBuf/stdRingBuf` 里的 `readPtr` 被**写入**；调用方还有一处
+`1ull << CommandBuffer->channelId`（`syncChannel` 是 u64 位图，≥64 即移位 UB）。
+现改为真实检查：
+
+```c
+	if (!mcFE || ChannelId >= mcFE->channelCount)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
+```
+
+同族的 `jmkMCFE_HardwareIdle()` 一并处理（该断言的 `mcFE` 非空判断本也依赖它，
+`mcFE == NULL` 时会直接解引用空指针）；上游 `j9_handle_j_remodified()` 增加
+`ChannelId >= 64` 提前拒绝，使位图移位良定义。（`J9_SPARKPLUGGED = 0`，已确认 sink 确被调用。）
+
+### 11.3 缺陷 6–9：`.Mmap` / `.GetSGT` 的 `skipPages` / `numPages` / `Offset`
+
+四处形如 `JMM_kASSERT(skipPages + numPages <= Mdl->numPages)` 的"检查"全部失效：
+
+| 位置 | 函数 | 被编译掉后的后果 |
+|---|---|---|
+| `jmgpu_marketing.c` GFP `.Mmap` | `j9_handle_j9ma_unwilled` | `nonContiguousPages[i + skipPages]` 越界；`remap_pfn_range()` **把不属于该缓冲的物理页映射进用户态** |
+| `jmgpu_crosstab.c` Dmabuf `.Mmap` | `j9_pathopsychosis` | `dma_buf_mmap(dmabuf, vma, skipPages)` 越界重映射 |
+| `jmgpu_background.c` DMA `.Mmap` | `j9_antic` | `(skipPages << PAGE_SHIFT)` 越过分配末尾 |
+| `jmgpu_background.c` DMA `.GetSGT` | `j9_settled` | `Bytes - Offset` 变负，作为巨大计数交给 `jmgpu_setup_dma_sgt()` |
+| `jmgpu_marketing.c` GFP `.GetSGT` | `j9_lactant` | `(Bytes >> PAGE_SHIFT) - skip_pages` 变负 + `nonContiguousPages[skip_pages]` 越界 |
+
+守卫写法（**`Bytes` 是"末端偏移"不是长度**——由 `jmkVIDMEM_NODE_GetSGT()` 传
+`node->VidMem.bytes` 定契约，`j9_lactant`/`j9_settled` 都用 `Bytes - Offset` 作长度）：
+
+```c
+	/* .GetSGT 族 */
+	if (Offset > (Mdl->numPages << PAGE_SHIFT) ||
+	    Bytes > (Mdl->numPages << PAGE_SHIFT) ||
+	    (Offset && Offset >= Bytes))
+		return J9_HANDLE_J9MENU_HOMOGONIES;
+
+	/* .Mmap 族 */
+	if (skipPages >= Mdl->numPages || numPages > Mdl->numPages - skipPages)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
+```
+
+合法调用恒满足（`skipPages` 来自节点在父块内的位置、`numPages` 来自 mmap 长度且
+已被 `drm_gem_mmap_obj()` 按对象大小卡住），故**只对越界参数生效**，无行为变化。
+
+### 11.4 同族但**不动**的项（附核查结论）
+
+| 项 | 核查结论 |
+|---|---|
+| `jmgpu_program.c`（MMU/STLB 的 `mCursor/mStart`）、`jmgpu_refactor.c`（内核堆空闲链表）、`jmgpu_symbol.c`（由指针算出的 STLB offset）等 | 值**不受用户控制**，是内部不变量；改成运行时检查收益低、回归面大 |
+| `j9_handle_blinkingly()` / `J9MIRROR_RETURNABLE()`（`_JMM_VERIFY_ARGUMENT`） | **不受影响**：该宏**无条件定义**，`if (!(arg)) return` 是真实的（只有其中的 `ASSERT` 被裁掉）⇒ 各处 ioctl 入参校验在发行版**真实生效** |
+| `j9_handle_j9min_outweighed()` / `J9_HANDLE_J9MA_OWNERSHIPS()` | `#if J9_NOONED` 下 release 展开为空，但**全代码库零引用**（且 `_JMM_kVERIFY_ARGUMENT` 是不存在的拼写）⇒ 死宏，无影响 |
+
+### 11.5 验证与部署（2026-09-16 重启后实测）
+
+```bash
+cd ~/Desktop/Git/jm9100
+sudo ./sync_dkms.sh build      # 0 error / 0 warning
+sudo reboot                    # jmgpu 引用计数 61（Xorg+kwin），无法热重载
+```
+
+| 项 | 实测 |
+|---|---|
+| 模块指纹 | 运行态 `/sys/module/jmgpu/srcversion` = 磁盘 = initramfs = `4F7DF0E62A8B543D743D5F9`（旧 `0167E828EB8B4BFB60CE487` 已替换）✅ |
+| 桌面/GL | `direct rendering: Yes` / `Jingjia JM9100` / `GL 4.0 V1.7.0` ✅ |
+| VA-API 零拷贝直通 | `直通(vaapi) 640x360 avg=(255,0,64) 绿色占比 0.0%`，与软解**逐通道一致**；`Using hardware decoding (vaapi)` ✅ |
+| 内核日志 | 本 boot 无 `BUG:` / `oops` / `WARNING:` / `Call trace`（`journalctl -b` 全量核对，命中项均为应用日志误报）✅ |
+| 加固是否影响合法路径 | 直通与 2D 路径全绿（§10.4 的 `pattern match=8160 mismatch=0` 结论继续成立）✅ |
+
+### 11.6 用户态补丁（§9）本轮复验：**双路径均通过**
+
+补丁需**重启应用**才生效，本次重启正好提供了干净验证：
+
+```
+# GLX 路径（jm_gl_storage_test.c，glXGetProcAddressARB = 补丁的 libGLX 别名表）
+GL_EXT_EGL_image_storage advertised = YES
+[proc ] OES=0xffffbb9a3b80 storage=0xffffbb9a3b00        ← 两者均非 NULL
+  A) glEGLImageTargetTexture2DOES    level0=256x128  err=0
+  B) glEGLImageTargetTexStorageEXT   level0=256x128  err=0   ← 补丁前为 0x0
+```
+
+另外用 EGL 侧入口（`eglGetProcAddress`）复核：`glEGLImageTargetTexStorageEXT` 与
+`glEGLImageTargetTextureStorageEXT` **均能解析出非 NULL**；`GL_EXT_EGL_image_storage`
+在 `glGetString(GL_EXTENSIONS)`（3535 B）与 `glGetStringi`（142 个）**两条路径都已广告**。
+
+> **应用侧注意**：本厂商栈上 `eglCreateImageKHR()` 走 dma-buf（`EGL_LINUX_DMA_BUF_EXT`）时
+> **必须传 `EGL_NO_CONTEXT`**；传当前 context 会返回 `EGL_BAD_CONTEXT (0x3006)`
+> （`jm_gl_storage_test.c` 用的正是 `EGL_NO_CONTEXT`）。

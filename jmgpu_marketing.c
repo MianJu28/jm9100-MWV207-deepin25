@@ -644,7 +644,19 @@ j9_lactant(IN jmkALLOCATOR Allocator,
 	int ret;
 	j9_duopoly status = J9_FLUTTERING;
 
-	JMM_kASSERT(Offset <= Mdl->numPages << PAGE_SHIFT);
+	/*
+	 * Offset/Bytes are caller supplied and reach here from user-space driven
+	 * paths: jmkVIDMEM_NODE_GetSGT() forwards the node offset, which the
+	 * DRM_JM_GEM_XFER_RECT ioctl takes straight from user memory.  The vendor
+	 * guarded this with a JMM_kASSERT(), which expands to nothing in a release
+	 * build (J9_AUTOBIOGRAPHY off), leaving skip_pages free to index past
+	 * nonContiguousPages[] and (Bytes >> PAGE_SHIFT) - skip_pages free to go
+	 * negative.  Note Bytes is an *end* extent here, not a length.
+	 */
+	if (Offset > (Mdl->numPages << PAGE_SHIFT) ||
+	    Bytes > (Mdl->numPages << PAGE_SHIFT) ||
+	    (Offset && Offset >= Bytes))
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	BUG_ON(!mdlPriv);
 
@@ -823,8 +835,17 @@ j9_sprod(IN jmkALLOCATOR Allocator,
 		platform->ops->adjustProt(vma);
 
 
-	JMM_kASSERT(skipPages + numPages <= Mdl->numPages);
-
+	/*
+	 * Real bounds check - the vendor only had a JMM_kASSERT() here, which is
+	 * compiled out in release builds.  skipPages comes from the node's
+	 * placement inside its parent block and numPages from the mmap() length,
+	 * so without this the non-contiguous case walks off
+	 * nonContiguousPages[i + skipPages] and remap_pfn_range() happily maps
+	 * physical pages that do not belong to this buffer into user space.
+	 */
+	if (skipPages >= Mdl->numPages ||
+	    numPages > Mdl->numPages - skipPages)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	if (mdlPriv->contiguous) {
 

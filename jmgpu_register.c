@@ -584,7 +584,17 @@ jmkMCFE_Execute(IN jmk_HARDWARE Hardware,
 	     Hardware, Priority, ChannelId, Address, Bytes);
 
 
-	JMM_kASSERT(mcFE && ChannelId < mcFE->channelCount);
+	/*
+	 * Real bounds check - the vendor only had a JMM_kASSERT() here and it
+	 * compiles to nothing in a release build, yet ChannelId is fed straight
+	 * from a user command buffer (jmgpu_middleware.c, "#[mcfe-command: user]"
+	 * -> CommandBuffer->channelId).  channels[] holds channelCount entries,
+	 * so an out-of-range id used to yield an out-of-bounds pointer whose
+	 * priRingBuf/stdRingBuf fields are then *written* (ringBuf->readPtr) plus
+	 * an unchecked "1ull << channelId" shift in the caller.
+	 */
+	if (!mcFE || ChannelId >= mcFE->channelCount)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	channel = &mcFE->channels[ChannelId];
 
@@ -685,7 +695,10 @@ jmkMCFE_HardwareIdle(IN jmk_HARDWARE Hardware, OUT jmtBOOL_PTR isIdle)
 	j9_quincunx();
 
 
-	JMM_kASSERT(mcFE && ChannelId < mcFE->channelCount);
+	/* Same as jmkMCFE_Execute(): make the assert real, it also covered the
+	 * mcFE == NULL case, which would otherwise dereference NULL below. */
+	if (!mcFE || ChannelId >= mcFE->channelCount)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	channel = &mcFE->channels[ChannelId];
 	ringBuf = Priority ? &channel->priRingBuf : &channel->stdRingBuf;

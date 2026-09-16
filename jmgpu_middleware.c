@@ -642,6 +642,15 @@ j9_handle_j_remodified(jmk_COMMAND Command,
 
 	j9_tympanichord("priority=%d channelId=%d", Priority, ChannelId);
 
+	/*
+	 * ChannelId comes from the submitted command buffer.  syncChannel[] is a
+	 * 64-bit bitmap, so a larger id would make "1ull << ChannelId" undefined
+	 * (and could spuriously match a pending bit); reject it before the shift.
+	 * jmkMCFE_Execute() bounds-checks the id it is given for real as well.
+	 */
+	if (ChannelId >= 64)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
+
 	if (!(Command->syncChannel[Priority ? 1 : 0] & (1ull << ChannelId))) {
 
 		return J9_FLUTTERING;
