@@ -16,7 +16,7 @@
 | 5 | 未打补丁应用无法 VA-API 零拷贝直通 | ✅ | `jm_gl_compat.c`（用户态 GL 兼容层，§3.6） |
 | 6 | 硬件 GL 栈黑窗 | 🔁 归因已推翻，待重查 | `jm_egl_visual_probe.c` 的「EGL 只覆盖 1 个 visual」推断被 `egl_force_visual.c` 实测推翻（**90/90 visual 都能建面渲染**，§3.7 更正） |
 | 7 | X11 呈现错位（专有 X 驱动无法加载） | ✅ | `patch_xorg_abi.py` + `patch_abi_layout.py`（ABI 24→25 + `ScrnInfoRec` 布局偏移），见 **§8** |
-| 8 | `glEGLImageTargetTexStorageEXT` **原生未实现**（VA-API 零拷贝必须挂 `LD_PRELOAD` 兼容层） | ✅ **已原生修复**（兼容层可退役） | `patch_gl_storage.py`：`jmgpu_dri.so` 扩展广告 + `libEGL_mwv207.so` / `libGLX_mwv207.so` 入口别名，见 **§9** |
+| 8 | `glEGLImageTargetTexStorageEXT` **原生未实现**（VA-API 零拷贝必须挂 `LD_PRELOAD` 兼容层） | ✅ **已原生修复**（兼容层**已卸载**，§9.7） | `patch_gl_storage.py`：`jmgpu_dri.so` 扩展广告 + `libEGL_mwv207.so` / `libGLX_mwv207.so` 入口别名，见 **§9** |
 | 9 | 内核 Dmabuf（外部 dmabuf 导入）分配器 `.GetSGT` **空桩** → 导入缓冲永远取不到 sg_table | ✅ | `jmgpu_crosstab.c` `_DmabufGetSGT()`，见 **§9.3** |
 
 - 部署流程见 **§4**，日常使用见 **§5**。
@@ -943,6 +943,7 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | `install_gl_storage.sh` | 上述补丁的**安装 / 回退 / 状态**脚本（`install` / `revert` / `status`），始终从原件生成补丁（幂等），备份于 `/var/backups/jm9100-glstorage/` |
 | `jm_gl_storage_test.c` | **A/B 端到端探针**：EGL+pbuffer + jmgpu dumb buffer→dmabuf→EGLImage，对照 `glEGLImageTargetTexture2DOES` 与 `glEGLImageTargetTexStorageEXT` 的纹理绑定结果（补丁后两者均 `256x128`） |
 | `jm_gl_ext_dump.c` | 扩展广告探针：打印 `GL_EXTENSIONS` 串与 `GL_NUM_EXTENSIONS`，用于确认补丁只等价替换了 1 个重复扩展、总数与串长不变 |
+| `jm_gl_glx_path_test.c` | **GLX 路径探针（2026-09-16 新增，§9.8）**：用真实 VA-API 导出 dmabuf 建 EGLImage；`oes` / `storage` / `both` 分进程跑像素判据，`errcheck` 模式用"参数校验置错码"判别入口是否已接上厂商实现（规避 GLX 下厂商 OES 实现崩溃） |
 | `jmgpu_crosstab.c`（`_DmabufGetSGT`） | **内核第二处 `.GetSGT` 空桩修复（2026-09-16，§9.2）**：Dmabuf（外部 dmabuf 导入）分配器按 `j9_lactant()` 约定派生子区间 sg_table，缓存于 `j9_camaron->sub_sgt` 并在 Free 时释放 |
 | `docs/应用侧交付与测试清单.md` | **交付给应用侧的说明与测试清单**：测试环境基线、系统层改动清单（含回退）、应用侧三项注意（GL vendor 变量 / vsync 语义 / VA-API 零拷贝接入）、逐项测试项与判据、黑窗问题采集模板、已知限制与问题回报模板 |
 | `patch_xorg_abi.py` | **X 驱动 ABI 补丁**：把 `mwv207_drv.so` 的 `XF86ModuleVersionInfo.abiversion` 从 24.0 补到 25.0（对副本操作，4 字节），使其能被 Xorg 1.21 加载（§3.9） |
@@ -1310,7 +1311,7 @@ visual   depth class       surface  eglGetError  渲染(glClear+swap)
 
 | # | 缺陷 | 位置 | 状态 |
 |---|---|---|---|
-| A | Dmabuf（外部 dmabuf **导入**）分配器 `.GetSGT` 是无条件错误返回 | 内核 `jmgpu_crosstab.c` | ✅ **已实现**（源码，`dkms build` 通过） |
+| A | Dmabuf（外部 dmabuf **导入**）分配器 `.GetSGT` 是无条件错误返回 | 内核 `jmgpu_crosstab.c` | ✅ **已实现**，并已 `dkms install` + 重启验证（`srcversion 408B5B6F…`） |
 | B | `glEGLImageTargetTexStorageEXT` 原生未实现（glvnd 空桩 → 纹理恒全零） | 厂商 `jmgpu_dri.so` + `libEGL_mwv207.so` + `libGLX_mwv207.so` | ✅ **已原生修复**（三库字节补丁，实测通过） |
 
 **端到端证明**（**无 `LD_PRELOAD`、系统原版未打补丁 `mpv` 0.40**）：
@@ -1357,7 +1358,15 @@ _DmabufGetSGT(IN jmkALLOCATOR Allocator,
 （`DRM_JM_GEM_XFER_RECT` ioctl 喂 2D/解码引擎、dma-buf core 经 `j9_cibarious()`）都用不了导入缓冲。
 修复后语义与系统内存分配器（`j9_lactant`）一致。
 
-> 部署状态：**已 `dkms build --force` 编译通过（含 `-Werror`），未 `install`、未重启**，运行态模块未变。
+> **部署与验证状态（2026-09-16 已完成）**：`./sync_dkms.sh build` 一条龙执行
+> （dkms build/install + `update-initramfs -u` + 指纹校验），重启后运行态与磁盘/initramfs
+> 三处 `srcversion` 一致（`408B5B6FBD8F38CB9843915`）；桌面正常、GL 正常、VA-API 直通正常、
+> 内核日志无 `BUG/WARNING/Call trace`、`jm_dmabuf_cycle 500×1MB` 无失败无泄漏。
+>
+> 说明：本函数的调用点（Dmabuf 分配器 → 外部 dmabuf **导入**且需要 sg_table）在日常桌面/播放中
+> **未必被走到** —— 重启验证主要确认「模块正常加载 + 桌面/GL/硬解无回归」；实测 dmesg 里
+> VA 解码面的导出均为 `alloc=reserved-mem`（走 reserved-mem 分配器与同驱动导入快捷路径），
+> 未出现 `map_dma_buf failed` / `refusing CPU mmap`。
 
 ### 9.3 缺陷 B（用户态）：把 `glEGLImageTargetTexStorageEXT` 接回可用的 OES 实现
 
@@ -1460,8 +1469,74 @@ sudo ./install_gl_storage.sh revert     # 从 /var/backups/jm9100-glstorage/ 还
    表上*确实无法小补丁（表已满、func 运行时填充、需新增重定位）；但把修复落在
    **`libEGL` / `libGLX` 的别名表（名字改写）** 上就只需改数据与既有 addend —— 本轮已完成。
 2. **§7.4 第 3 条可关闭**（`glEGLImageTargetTexStorageEXT` 未实现 → 兼容层兜底）：原生已可用，
-   `jm_gl_compat.c`（`LD_PRELOAD`）降级为**可选冗余**，可整体退役。
+   `jm_gl_compat.c`（`LD_PRELOAD`）已**从系统卸载**（见 §9.7），源码保留作兜底。
 3. §3.6 兼容层的保留价值：仅剩"更老/特殊应用直连 `glXGetProcAddress` 且自行判缓存"的边角场景；
    日常播放（mpv / Chromium / GTK）已不再需要。
 4. 新增交付物见 §6 清单（`patch_gl_storage.py` / `install_gl_storage.sh` /
-   `jm_gl_storage_test.c` / `jm_gl_ext_dump.c`）。
+   `jm_gl_storage_test.c` / `jm_gl_ext_dump.c` / `jm_gl_glx_path_test.c`）。
+
+### 9.7 兼容层退役（`libjm_gl_compat.so` 已卸载）
+
+原生补丁验证通过后，`LD_PRELOAD` 兼容层已**从系统移除**：
+
+```bash
+sudo ./build_gl_compat.sh uninstall      # 已执行；/usr/lib/aarch64-linux-gnu/libjm_gl_compat.so 已不存在
+```
+
+- 该层**从未**写入 `/etc/ld.so.preload`（无全局强制），`/etc/environment` 亦无相关条目
+  ⇒ 卸载即彻底生效，无需 `ldconfig`、不影响任何已配置应用。
+- 卸载后复验（无任何 `LD_PRELOAD`、系统原版 mpv）：
+
+  ```
+  直通(vaapi): 1280x720 avg=(255,0,64) 绿色占比 0.0%
+  ==> 直通【正常】：画面是片源原色(红)
+  mpv 实际使用: Using hardware decoding (vaapi)
+  ```
+
+- `jm_gl_compat.c` / `build_gl_compat.sh` / `test_gl_compat.sh` **源码与脚本保留在仓库**，
+  作为"原生补丁未安装时"的兜底手段（§7.2 的两条路仍成立，只是不再需要）。
+
+### 9.8 GLX 路径如何实测：`errcheck` 判别法（含 A/B 证据）
+
+**为什么不能沿用"合法 image + 看纹理尺寸"**：厂商的 `glEGLImageTargetTexture2DOES`
+在 **GLX 上下文**里对任何 EGLImage 都会段错误 —— 包括本探针改用**真实 VA-API 导出 dmabuf**
+（`vaExportSurfaceHandle(DRM_PRIME_2)`，NV12 的 `layer0=R8 / layer1=GR88` 两 layer 表示法）之后
+**仍然崩**：
+
+```
+export: objects=1 layers=2
+  layer[0] fmt=0x20203852 planes=1 obj=0 off=0 pitch=256     ← R8 (Y)
+  layer[1] fmt=0x38385247 planes=1 obj=0 off=32768 pitch=256 ← GR88 (UV)
+advertised storage=YES  OES=YES
+EGLImage ok
+  [A] call OES...        ← 段错误（rc=139）
+```
+
+这是厂商栈的**既有局限（GLX 上下文不支持该互操作）**，与补丁无关（补丁不触碰 OES 实现本身）。
+
+**改用参数校验作判别（不需要合法 image）**：
+
+```bash
+# 无需合法 image；厂商实现会对非法 image 置 GL_INVALID_OPERATION(0x502)，
+# 而 glvnd 空桩"什么都不做"，错误保持 GL_NO_ERROR。分进程跑，崩溃可单独取证。
+gcc -O2 -I/usr/include/libdrm -o /tmp/jm_glx jm_gl_glx_path_test.c \
+    -lva -lva-drm -lEGL -lGL -lX11 -ldrm -ldl
+DISPLAY=:N XAUTHORITY=... LIBVA_DRIVER_NAME=jmgpu __GLX_VENDOR_LIBRARY_NAME=mwv207 \
+    /tmp/jm_glx errcheck
+```
+
+| 状态 | 命令 | 结果 |
+|---|---|---|
+| **补丁前** | `sudo ./install_gl_storage.sh revert` 后跑 `errcheck` | `advertised storage=NO`；`E) storage(NULL) err=0`（空桩）、`F) OES(NULL) err=0x502` |
+| **补丁后** | `sudo ./install_gl_storage.sh install` 后跑 `errcheck` | `advertised storage=YES`；`E) storage(NULL) err=0x502` **与 OES 完全一致** |
+
+⇒ **GLX 路径的 storage 入口确实已接到厂商实现**（修补前是空桩），非"看起来没报错"的假象。
+
+**结论**：
+
+1. GLX 路径补丁有效且必要（补丁前该入口是空桩）；
+2. 但 GLX 路径**无法做像素级实测**：厂商 OES 实现在 GLX 上下文里本就不可用，
+   任何"GLX + EGLImage"的应用会先崩在 OES 上 ⇒ 该补丁在真实场景中属**无害的完整性修复**；
+3. **真实应用只走 EGL**：本机 mpv 的 `--gpu-context` 可选值只有
+   `x11egl / wayland / drm`（**没有 GLX context**），实测 `Initializing GPU context 'x11egl'`
+   ⇒ §9.3.3 的 EGL 实测已覆盖真实路径。

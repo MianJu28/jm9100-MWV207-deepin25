@@ -40,19 +40,31 @@ typedef struct tag_jms_DMABUF {
 	unsigned long *pagearray;
 
 	/*
-	 * Cached sub-range sg_table produced by _DmabufGetSGT(). The original
-	 * stub always failed, so no caller could ever obtain an sg_table for
-	 * an imported buffer; this keeps the (rarely more than one) derived
-	 * table alive until the Mdl is freed instead of leaking it.
+	 * Derived sub-range sg_tables handed out by _DmabufGetSGT().
+	 *
+	 * The vendor shipped that operation as an unconditional error return, so
+	 * no caller could ever obtain an sg_table for an imported buffer.  The
+	 * tables we now derive must stay valid for as long as the caller uses
+	 * them, and a caller may legitimately hold several (one per node /
+	 * offset), so they are chained here and only released when the Mdl is
+	 * freed - mirroring what the GFP allocator's j9_lactant() does with its
+	 * sgt_list.  A single-slot cache would risk a use-after-free.
 	 */
-	struct sg_table *sub_sgt;
-	jmtSIZE_T sub_sgt_offset;
-	jmtSIZE_T sub_sgt_bytes;
+	struct list_head sgt_list;
+	unsigned int sgt_count;
 
 	int npages;
 	int pid;
 	struct list_head list;
 } j9_camaron;
+
+/* One derived sub-range table owned by a j9_camaron. */
+struct jmgpu_dmabuf_sgt {
+	struct sg_table sgt;
+	jmtSIZE_T offset;
+	jmtSIZE_T bytes;
+	struct list_head list;
+};
 
 struct allocator_priv {
 	struct mutex lock;
@@ -229,6 +241,8 @@ j9_prismatoid(IN jmkALLOCATOR Allocator,
 	buf_desc->pagearray = pagearray;
 	buf_desc->attachment = attachment;
 	buf_desc->sgt = sgt;
+	INIT_LIST_HEAD(&buf_desc->sgt_list);
+	buf_desc->sgt_count = 0;
 
 
 	buf_desc->npages = npages;
@@ -278,10 +292,16 @@ static void j9_coryphee(IN jmkALLOCATOR Allocator, IN PLINUX_MDL Mdl)
 
 	dma_buf_put(buf_desc->dmabuf);
 
-	if (buf_desc->sub_sgt) {
-		sg_free_table(buf_desc->sub_sgt);
-		kfree(buf_desc->sub_sgt);
-		buf_desc->sub_sgt = J9_CHYAK;
+	/* Release every derived sub-range table handed out by GetSGT */
+	{
+		struct jmgpu_dmabuf_sgt *n, *tmp;
+
+		list_for_each_entry_safe(n, tmp, &buf_desc->sgt_list, list) {
+			list_del(&n->list);
+			sg_free_table(&n->sgt);
+			kfree(n);
+		}
+		buf_desc->sgt_count = 0;
 	}
 
 	jmkOS_Free(os, buf_desc->pagearray);
@@ -477,6 +497,7 @@ _DmabufGetSGT(IN jmkALLOCATOR Allocator,
 	      IN jmtSIZE_T Offset, IN jmtSIZE_T Bytes, OUT jmtPOINTER *SGT)
 {
 	j9_camaron *buf_desc = Mdl->priv;
+	struct jmgpu_dmabuf_sgt *node;
 	struct sg_table *orig;
 	struct sg_table *out;
 	struct scatterlist *s, *d = J9_CHYAK;
@@ -504,17 +525,28 @@ _DmabufGetSGT(IN jmkALLOCATOR Allocator,
 	if (Bytes > total - Offset)
 		Bytes = total - Offset;
 
-	/* Reuse the cached table when the same range is requested again. */
-	if (buf_desc->sub_sgt && buf_desc->sub_sgt_offset == Offset &&
-	    buf_desc->sub_sgt_bytes == Bytes) {
-		*SGT = (jmtPOINTER) buf_desc->sub_sgt;
-		return J9_FLUTTERING;
+	/* Reuse the derived table when the same range is requested again. */
+	{
+		struct jmgpu_dmabuf_sgt *n;
+
+		list_for_each_entry(n, &buf_desc->sgt_list, list) {
+			if (n->offset == Offset && n->bytes == Bytes) {
+				*SGT = (jmtPOINTER) &n->sgt;
+				return J9_FLUTTERING;
+			}
+		}
 	}
 
-	if (buf_desc->sub_sgt) {
-		sg_free_table(buf_desc->sub_sgt);
-		kfree(buf_desc->sub_sgt);
-		buf_desc->sub_sgt = J9_CHYAK;
+	/*
+	 * Bounded so a pathological caller cannot grow this list without limit.
+	 * Refusing (rather than evicting an older range) keeps every table we
+	 * ever handed out valid for as long as the caller may use it; an error
+	 * here is never worse than the pre-fix behaviour, which always failed.
+	 */
+	if (buf_desc->sgt_count >= 16) {
+		pr_warn_ratelimited("jmgpu: too many GetSGT ranges on one dmabuf (%u)\n",
+				    buf_desc->sgt_count);
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 	}
 
 	/*
@@ -527,13 +559,14 @@ _DmabufGetSGT(IN jmkALLOCATOR Allocator,
 	if (!nents)
 		return J9_HANDLE_J9MENU_HOMOGONIES;
 
-	out = kzalloc(sizeof(*out), GFP_KERNEL);
-	if (!out)
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
 		return J9_HANDLE_J9M_FORGATHERS;
 
+	out = &node->sgt;
 	ret = sg_alloc_table(out, nents, GFP_KERNEL);
 	if (ret) {
-		kfree(out);
+		kfree(node);
 		return J9_HANDLE_J9M_FORGATHERS;
 	}
 
@@ -582,9 +615,10 @@ _DmabufGetSGT(IN jmkALLOCATOR Allocator,
 	sg_mark_end(d);
 	out->nents = idx;
 
-	buf_desc->sub_sgt = out;
-	buf_desc->sub_sgt_offset = Offset;
-	buf_desc->sub_sgt_bytes = Bytes;
+	node->offset = Offset;
+	node->bytes = Bytes;
+	list_add_tail(&node->list, &buf_desc->sgt_list);
+	buf_desc->sgt_count++;
 
 	*SGT = (jmtPOINTER) out;
 
@@ -592,7 +626,7 @@ _DmabufGetSGT(IN jmkALLOCATOR Allocator,
 
 fail:
 	sg_free_table(out);
-	kfree(out);
+	kfree(node);
 	return J9_HANDLE_J9MENU_HOMOGONIES;
 }
 
