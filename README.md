@@ -11,18 +11,48 @@
 |---|---|---|---|
 | 1 | HDMI 无信号（内核 oops） | ✅ | `jmgpu_nicely.c` |
 | 2 | 显示灰蒙蒙（低对比度） | ✅ | `jmgpu_package.c`（GAMMA_LUT 契约 768 → 256） |
-| 3 | VA-API 直通画面全绿 | ✅ | `mpv_dmabuf_oes_image.patch` + `jmgpu_bullets.c` / `jmgpu_setlayout.c` |
+| 3 | VA-API 直通画面全绿 | ✅ | `patches/mpv_dmabuf_oes_image.patch` + `jmgpu_bullets.c` / `jmgpu_setlayout.c` |
 | 4 | EasyTier GUI 白屏（提权进程丢 GL vendor 变量） | ✅ | `/etc/environment`（§3.5，**非仓库代码**） |
-| 5 | 未打补丁应用无法 VA-API 零拷贝直通 | ✅ | `jm_gl_compat.c`（用户态 GL 兼容层，§3.6） |
-| 6 | 硬件 GL 栈黑窗 | 🔁 归因已推翻，待重查 | `jm_egl_visual_probe.c` 的「EGL 只覆盖 1 个 visual」推断被 `egl_force_visual.c` 实测推翻（**90/90 visual 都能建面渲染**，§3.7 更正） |
-| 7 | X11 呈现错位（专有 X 驱动无法加载） | ✅ | `patch_xorg_abi.py` + `patch_abi_layout.py`（ABI 24→25 + `ScrnInfoRec` 布局偏移），见 **§8** |
-| 8 | `glEGLImageTargetTexStorageEXT` **原生未实现**（VA-API 零拷贝必须挂 `LD_PRELOAD` 兼容层） | ✅ **已原生修复**（兼容层**已卸载**，§9.7） | `patch_gl_storage.py`：`jmgpu_dri.so` 扩展广告 + `libEGL_mwv207.so` / `libGLX_mwv207.so` 入口别名，见 **§9** |
+| 5 | 未打补丁应用无法 VA-API 零拷贝直通 | ✅ | `tools/jm_gl_compat.c`（用户态 GL 兼容层，§3.6） |
+| 6 | 硬件 GL 栈黑窗 | 🔁 归因已推翻，待重查 | `tools/jm_egl_visual_probe.c` 的「EGL 只覆盖 1 个 visual」推断被 `tools/egl_force_visual.c` 实测推翻（**90/90 visual 都能建面渲染**，§3.7 更正） |
+| 7 | X11 呈现错位（专有 X 驱动无法加载） | ✅ | `tools/patch_xorg_abi.py` + `patch_abi_layout.py`（ABI 24→25 + `ScrnInfoRec` 布局偏移），见 **§8** |
+| 8 | `glEGLImageTargetTexStorageEXT` **原生未实现**（VA-API 零拷贝必须挂 `LD_PRELOAD` 兼容层） | ✅ **已原生修复**（兼容层**已卸载**，§9.7） | `tools/patch_gl_storage.py`：`jmgpu_dri.so` 扩展广告 + `libEGL_mwv207.so` / `libGLX_mwv207.so` 入口别名，见 **§9** |
 | 9 | 内核 Dmabuf（外部 dmabuf 导入）分配器 `.GetSGT` **空桩** → 导入缓冲永远取不到 sg_table | ✅ | `jmgpu_crosstab.c` `_DmabufGetSGT()`，见 **§9.3** |
 | 10 | 内核用户态接口加固：`DRM_JM_GEM_XFER_RECT` 范围校验**整数溢出** + 第二缓冲未校验；三处分配器 `.Physical` **缺 `Offset` 越界检查** | ✅ | `jmgpu_garbage.c` / `jmgpu_crosstab.c` / `jmgpu_setlayout.c` / `jmgpu_background.c`，见 **§10** |
 
 - 部署流程见 **§4**，日常使用见 **§5**。
 - 历史排查全过程（含大量已排除方案、实验数据）见 `backup/FIXLOG.2026-09-10.md`
   与 `backup/README.2026-09-10.md`。
+
+---
+
+## 0. 仓库结构（2026-09-16 按功能分目录重组）
+
+```
+jm9100/
+├── kernel/     内核驱动源码与构建配置（DKMS 只从这里取源码）
+│               jmgpu_*.c/.h、mwv207_*.c/.h、Makefile*、Kconfig*、dkms.conf
+├── scripts/    部署 / 测试 / 诊断脚本（全部 .sh，清单见 §6）
+├── tools/      探针与辅助工具（*.c 探针、*.py 补丁与统计脚本）
+├── patches/    对外补丁（mpv 直通补丁）
+├── docs/       交付与测试清单、应用侧反馈、厂商反馈材料
+├── build-cli/  生成物（GL 兼容层 .so、glstorage 补丁产物、X 驱动补丁产物）
+├── backup/     历史修复记录与基线备份
+└── README.md
+```
+
+**约定与注意**：
+
+- **下文正文中出现的 `jmgpu_*.c` / `mwv207_*.c` / `Makefile` / `Kconfig*` / `dkms.conf`
+  一律位于 `kernel/`**（为免正文过度加前缀，此处统一声明一次）；脚本、探针、补丁则写全
+  `scripts/`、`tools/`、`patches/` 前缀。
+- `scripts/sync_dkms.sh` 把 `kernel/` 内的源码与构建配置**平铺**拷到 DKMS 源目录
+  `/usr/src/mwv207-1.7.0.uos/`；DKMS 侧仍是"所有文件同目录"，因此 `Makefile` 中的裸对象名
+  列表（`jmgpu-y := a.o b.o …`）与 `-I.` **不受仓库目录结构影响**（实测同步 76 个 `.c` /
+  147 个 `.h`，与 `kernel/` 内容一一对应）。
+- 所有脚本用 `HERE` / `REPO`（`REPO = 脚本所在目录/..`）自定位，**可在任意 cwd 下调用**，
+  例如 `sudo ./scripts/sync_dkms.sh build`；生成物固定落在仓库根的 `build-cli/`。
+- 内核源码与 DKMS 是**唯一**的路径敏感处；探针与工具之间无交叉引用（探针不 include 驱动头）。
 
 ---
 
@@ -124,7 +154,7 @@ DRM 的契约是「`gamma_lut_size` 个表项，每项自带 r/g/b」，不是�
 `0,21,42,64,85` = `in/3` —— 整屏被压到 1/3 动态范围，表现为"黑发灰、白不白、
 色相正确"，且亮度值只剩应有的 1/3。
 
-**证据**（本轮新增探针 `drm_gamma_probe.c`，读 CRTC 的真实属性）：
+**证据**（本轮新增探针 `tools/drm_gamma_probe.c`，读 CRTC 的真实属性）：
 
 ```
 $ ./drm_gamma_probe /dev/dri/card0
@@ -202,13 +232,13 @@ WIN+0x38 WIN_CONTRAST        @0x990038 = 0x800000f0   <-- 128*15/8：LUT 装的�
    挂接到纹理**，纹理恒为全零（JM9100 只声明 `GL_OES_EGL_image`，不声明
    `GL_EXT_EGL_image_storage`）。
    > §3.8 反编译更正：驱动里**根本没有**该符号，入口是 glvnd 生成的 no-op stub 顶替的，
-   > 即"未实现"而非"实现错误"；客户端侧由 §3.6 的 `jm_gl_compat.c` 兜底。
+   > 即"未实现"而非"实现错误"；客户端侧由 §3.6 的 `tools/jm_gl_compat.c` 兜底。
 
 **修复**
 
 | 侧 | 改动 |
 |---|---|
-| mpv（`mpv_dmabuf_oes_image.patch`） | `video/out/hwdec/dmabuf_interop_gl.c`：desktop GL 分支在未声明 `GL_EXT_EGL_image_storage` 时改用 `glEGLImageTargetTexture2DOES`(GL_OES_EGL_image)（init/map/unmap 三处生命周期判断随之自动走 OES 路径）；扩展检查放宽为 OES / storage 任一。补丁同时适配 mpv 0.40 与 0.41 |
+| mpv（`patches/mpv_dmabuf_oes_image.patch`） | `video/out/hwdec/dmabuf_interop_gl.c`：desktop GL 分支在未声明 `GL_EXT_EGL_image_storage` 时改用 `glEGLImageTargetTexture2DOES`(GL_OES_EGL_image)（init/map/unmap 三处生命周期判断随之自动走 OES 路径）；扩展检查放宽为 OES / storage 任一。补丁同时适配 mpv 0.40 与 0.41 |
 | 内核（dmabuf 导出链） | ① 导出尺寸改 `PAGE_ALIGN()` 向上对齐；② `.map_dma_buf` 失败改返回 `ERR_PTR`（原返回 NULL 会被解引用）；③ `mmap`/导出补越界防御（clamp 到池尾）与限流诊断日志；④ reserved-mem `.Mmap` 对**非宿主可寻址**池（`cpuAccessible=FALSE` 的不可见池）直接拒绝——见下方「补」 |
 | 内核（同驱动导入） | 新增 `jmgpu_dmabuf_peek_node()`：dmabuf 由本驱动导出时（`dmabuf->ops == &_dmabuf_ops`），`j9_handle_j9_dumbbeller()` 直接复用原 VIDMEM 节点包装成 GEM 对象，绕开 reserved-mem 缺失的 `.GetSGT`（该空桩会让标准 `map_dma_buf` 导入永远失败） |
 
@@ -292,7 +322,7 @@ jmgpu: refusing CPU mmap of 16384 pages in pool 'jmExtMem0' @0x100000000
 > 不可见池，可见池是 BAR2 的 `0x1000000000`。
 
 **验证**（2026-09-11 复测：内核 `718BB943…` + 打过补丁的 mpv 0.41 CLI，
-`./test_passthrough.sh -s 1080p`，纯红片源）：
+`./scripts/test_passthrough.sh -s 1080p`，纯红片源）：
 
 ```
 本次播放新增的导出池归属：
@@ -313,7 +343,7 @@ jmgpu: refusing CPU mmap of 16384 pages in pool 'jmExtMem0' @0x100000000
 curl -sL -o /tmp/mpv-0.41.0.tar.gz \
   https://codeload.github.com/mpv-player/mpv/tar.gz/refs/tags/v0.41.0
 tar xf /tmp/mpv-0.41.0.tar.gz -C /tmp && cd /tmp/mpv-0.41.0
-patch -p1 < ~/Desktop/Git/jm9100/mpv_dmabuf_oes_image.patch
+patch -p1 < ~/Desktop/Git/jm9100/patches/mpv_dmabuf_oes_image.patch
 meson setup build -Dlibmpv=true -Dcplayer=true -Dvulkan=disabled -Dgpl=true \
       -Dlua=disabled -Djavascript=disabled && ninja -C build
 LD_LIBRARY_PATH=$PWD/build PATH=$PWD/build:$PATH \
@@ -332,7 +362,7 @@ LD_LIBRARY_PATH=$PWD/build PATH=$PWD/build:$PATH \
 
 ### 3.4 卸载/重载 与 S3 挂起恢复（2026-09-11 实测 ✅）
 
-用 `jmgpu_reload_test.sh` 在 **SSH 会话**里执行（图形会话会被停掉，所以发起
+用 `scripts/jmgpu_reload_test.sh` 在 **SSH 会话**里执行（图形会话会被停掉，所以发起
 通道必须独立于桌面）：
 
 | 检查项 | 结果 |
@@ -353,7 +383,7 @@ LD_LIBRARY_PATH=$PWD/build PATH=$PWD/build:$PATH \
    **`-9` 后强制清锁/socket**；restore 改为**轮询等待 30s**（原先 4s 就判死并
    restart，越帮越忙），失败时自动把 `systemctl status lightdm` /
    `journalctl -u lightdm` / Xorg 日志收进测试日志。
-   同样的陷阱在既有 `verify_jmgpu_probe_ssh.sh` 里也有，已一并修正。
+   同样的陷阱在既有 `scripts/verify_jmgpu_probe_ssh.sh` 里也有，已一并修正。
    修复后同一脚本能自动把桌面带回来（`lightdm=active`）。
 
 2. **SCDC 日志级别**（`jmgpu_nicely.c`）：普通 1080p sink 不支持 SCDC，
@@ -482,9 +512,9 @@ __GLX_VENDOR_LIBRARY_NAME=mwv207      # 写入 /etc/environment
 后果：走 storage 路径的客户端（mpv 的 `vaapi_gl_mapper`、Chromium 等）在桌面 GL 下**主动拒绝**
 VA-API dmabuf 零拷贝 —— 回落 `vaapi-copy`（收益被搬运吃光）或软解；在 Mesa/llvmpipe 上更会
 **静默产出全零帧**（深绿绿屏）。此前只能给 mpv 打补丁（§3.3 的
-`mpv_dmabuf_oes_image.patch`），属于**逐应用修**。
+`patches/mpv_dmabuf_oes_image.patch`），属于**逐应用修**。
 
-**方案：一次性覆盖所有应用的 LD_PRELOAD 兼容层**（`jm_gl_compat.c`）
+**方案：一次性覆盖所有应用的 LD_PRELOAD 兼容层**（`tools/jm_gl_compat.c`）
 
 | 动作 | 说明 |
 |---|---|
@@ -495,9 +525,9 @@ VA-API dmabuf 零拷贝 —— 回落 `vaapi-copy`（收益被搬运吃光）或
 | 开关 | `JMGPU_GL_COMPAT=0` 关闭；`JMGPU_GL_COMPAT_DEBUG=1` 打印日志 |
 
 ```bash
-./build_gl_compat.sh              # 编译到 build-cli/libjm_gl_compat.so
-./build_gl_compat.sh install      # 安装到 /usr/lib/aarch64-linux-gnu/
-./test_gl_compat.sh               # 一键验证（三步）
+./scripts/build_gl_compat.sh              # 编译到 build-cli/libjm_gl_compat.so
+./scripts/build_gl_compat.sh install      # 安装到 /usr/lib/aarch64-linux-gnu/
+./scripts/test_gl_compat.sh               # 一键验证（三步）
 LD_PRELOAD=.../libjm_gl_compat.so LIBVA_DRIVER_NAME=jmgpu mpv --vo=gpu --hwdec=vaapi 视频.mp4
 ```
 
@@ -564,7 +594,7 @@ EGL 共 40 个 config，覆盖 1 个 X visual
 
 > 结论先行：**§3.6 的扩展/入口缺失与 §3.7 的 EGL visual 缺失，都不是"实现错了"，而是
 > "没有实现"或"结构性缺失"**。在闭源二进制上做等价补丁需要**新增可执行段 + 运行时表项**，
-> 风险大于收益。因此修复落点保持在**客户端侧**（§3.6 的 `jm_gl_compat.c` + §3.7 的
+> 风险大于收益。因此修复落点保持在**客户端侧**（§3.6 的 `tools/jm_gl_compat.c` + §3.7 的
 > visual 选择），反编译结果转为**给厂商的精确缺陷报告**（含地址与结构）。
 
 **方法与可分析性**：三个厂商用户态库**均未 strip**（符号表完整），用 `objdump` / `nm` /
@@ -630,7 +660,7 @@ config↔visual 映射**（现在 40 个 config 只有一个 visual），属重�
 
 > #### ❌ 更正（2026-09-15）：上面「EGL config 覆盖率是黑窗根因」结论**被实验推翻**
 >
-> **实验**（`egl_force_visual.c`，本仓库新增）：无视 config 报告的 visual，直接拿
+> **实验**（`tools/egl_force_visual.c`，本仓库新增）：无视 config 报告的 visual，直接拿
 > `config[0]` 到**屏幕全部 90 个 visual** 上建 EGL window surface，并真正执行
 > `eglMakeCurrent` + `glClear` + `eglSwapBuffers`：
 >
@@ -659,7 +689,7 @@ config↔visual 映射**（现在 40 个 config 只有一个 visual），属重�
 >    必须用 `eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS)` 查询。
 > 4. 因此**不需要**为 EGL 侧做「重建 config↔visual 映射表」的补丁（原本的厂商需求项作废）。
 >
-> 复现：`gcc -O2 -o /tmp/egl_force_visual egl_force_visual.c -lEGL -lX11 -lGLESv2 && /tmp/egl_force_visual`
+> 复现：`gcc -O2 -o /tmp/egl_force_visual tools/egl_force_visual.c -lEGL -lX11 -lGLESv2 && /tmp/egl_force_visual`
 
 ---
 
@@ -690,7 +720,7 @@ ABI 编码是 `major<<16 | minor`（加载器按 `值>>16` 打印 "major version
 所以修复只需把文件偏移 **`0x217f8`** 处的 u32 从 `0x00180000` 改为 `0x00190000`。
 
 ```bash
-python3 patch_xorg_abi.py /usr/lib/xorg/modules/drivers/mwv207_drv.so \
+python3 tools/patch_xorg_abi.py /usr/lib/xorg/modules/drivers/mwv207_drv.so \
                           build-cli/mwv207_drv.so.abi25
 ```
 
@@ -748,16 +778,16 @@ cd ~/Desktop/Git/jm9100
 lsmod | grep -E 'jmgpu|mwv207'
 
 # jmgpu 接管持久化（blacklist mwv207 进 initramfs + modules-load 强制加载）
-sudo ./force_mode_test.sh boot && sudo reboot
+sudo ./scripts/force_mode_test.sh boot && sudo reboot
 
 # 回滚到 deepin mwv207 开源栈
-sudo ./force_mode_test.sh boot-undo && sudo reboot
+sudo ./scripts/force_mode_test.sh boot-undo && sudo reboot
 ```
 
 ### 4.2 修改驱动源码后的标准部署流程
 
 ```bash
-./sync_dkms.sh build    # = 同步源码 + dkms build --force + install --force
+./scripts/sync_dkms.sh build    # = 同步源码 + dkms build --force + install --force
                         #   + update-initramfs -u（一条龙，缺一不可）
 sudo reboot
 ```
@@ -773,7 +803,7 @@ sudo reboot
 > initramfs 重建时 dracut 会偶发 `failed with 139` / `Segmentation fault`
 > （`dracut-install` 调用的 `cp` 段错误，本机常见于 `pata_opti`、`hid-ezkey`、
 > `ti-am65-cpsw-nuss`、`xhci-mtk-hcd` 等**与显存无关**的模块）——
-> 它**不一定导致命令失败**，却可能静默漏拷。因此 `sync_dkms.sh build`
+> 它**不一定导致命令失败**，却可能静默漏拷。因此 `scripts/sync_dkms.sh build`
 > 现在会自动重试一次，并**校验 initramfs 里的 `jmgpu.ko` 与磁盘模块同指纹**，
 > 不一致时以非零码退出并给出处理建议。
 
@@ -792,14 +822,14 @@ find /tmp/ir -name 'jmgpu.ko' -exec modinfo -F srcversion {} \;
 
 ### 4.3 重装系统后需重做的两件事
 
-1. 内核模块：`./sync_dkms.sh build`（+ `force_mode_test.sh boot` 持久化接管）。
-2. **mpv**：应用 `mpv_dmabuf_oes_image.patch` 后重编安装（§3.3，直通必需）。
+1. 内核模块：`./scripts/sync_dkms.sh build`（+ `scripts/force_mode_test.sh boot` 持久化接管）。
+2. **mpv**：应用 `patches/mpv_dmabuf_oes_image.patch` 后重编安装（§3.3，直通必需）。
    补丁同时适用于 mpv 0.40（系统包）与 0.41：
 
 ```bash
 sudo apt-get install -y build-essential devscripts dpkg-dev
 cd /tmp && apt-get source mpv && cd mpv-0.40.0
-patch -p1 --fuzz=3 < ~/Desktop/Git/jm9100/mpv_dmabuf_oes_image.patch
+patch -p1 --fuzz=3 < ~/Desktop/Git/jm9100/patches/mpv_dmabuf_oes_image.patch
 dpkg-buildpackage -b -uc -us -j$(nproc)
 sudo dpkg -i ../mpv_*.deb
 ```
@@ -853,11 +883,11 @@ ffmpeg -hwaccel vaapi -vaapi_device /dev/dri/renderD128 -i in.mp4 -f rawvideo \
 
 ```bash
 cd ~/Desktop/Git/jm9100
-./test_passthrough.sh            # 纯红片源自动判定直通是否正常
-./test_passthrough.sh -s 720p    # 换片源分辨率（720p/360p/WxH）
-./test_passthrough.sh -x         # 附加导出诊断（mmap 内容 / vaGetImage 对比）
-./test_passthrough.sh -n         # 只做环境体检（模块版本、显存池占用）
-./test_passthrough.sh -e '--hwdec-extra-frames=0'   # 追加任意 mpv 参数
+./scripts/test_passthrough.sh            # 纯红片源自动判定直通是否正常
+./scripts/test_passthrough.sh -s 720p    # 换片源分辨率（720p/360p/WxH）
+./scripts/test_passthrough.sh -x         # 附加导出诊断（mmap 内容 / vaGetImage 对比）
+./scripts/test_passthrough.sh -n         # 只做环境体检（模块版本、显存池占用）
+./scripts/test_passthrough.sh -e '--hwdec-extra-frames=0'   # 追加任意 mpv 参数
 ```
 
 判定规则：
@@ -912,9 +942,9 @@ sudo dmesg | grep "gamma_lut updated"   # 期望线性 0,64,128,192,255
 ### 5.6 显示诊断工具
 
 ```bash
-sudo ./dump_display_regs.sh -o /tmp/reg.txt    # 关键寄存器（VA/LUT/HDMI）
-sudo ./dump_full_regs.sh -o /tmp/full.txt      # 显示域全量寄存器
-sudo ./fix_win_contrast.sh f0                  # WIN_CONTRAST 写回（诊断）
+sudo ./scripts/dump_display_regs.sh -o /tmp/reg.txt    # 关键寄存器（VA/LUT/HDMI）
+sudo ./scripts/dump_full_regs.sh -o /tmp/full.txt      # 显示域全量寄存器
+sudo ./scripts/fix_win_contrast.sh f0                  # WIN_CONTRAST 写回（诊断）
 modetest -D /dev/dri/card0 -c                  # 查 connector
                                                # （本栈 modetest 直亮彩条点不亮属已知问题，非故障）
 ```
@@ -930,35 +960,35 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | `jmgpu_package.c` | 灰蒙蒙修复：`JMGPU_LUT_ENTRIES_PER_CHANNEL` 统一 gamma LUT 契约（768→256）+ blob 长度校验 + `gamma_norm` 采样日志 |
 | `jmgpu_setlayout.c` / `jmgpu_bullets.c` | dmabuf 导出链修复（尺寸对齐/NULL-SGT/越界）+ **拒绝不可见池的 CPU mmap** + 同驱动导入快捷路径 `jmgpu_dmabuf_peek_node()` + 诊断日志（`jmgpu-exp` / `jmgpu-mmap` / `jmgpu-diag` / `refusing CPU mmap`） |
 | `jmgpu_insert.c` / `jmgpu_detect.c` | 可选参数 `allow_invisible_mmap` / `no_exclusive_pool` / `prefer_visible_pool` |
-| `mpv_dmabuf_oes_image.patch` | **mpv 直通必需补丁**（desktop GL 改走 `glEGLImageTargetTexture2DOES`；适配 0.40 / 0.41） |
-| `sync_dkms.sh` | 同步源码到 DKMS + build + install + update-initramfs（一条龙） |
-| `force_mode_test.sh` | 强制点屏验证与持久化接管 / 回滚（`boot` / `boot-undo`） |
-| `test_passthrough.sh` | **直通一键自检**（纯色片源判定 + 导出诊断 + 环境体检） |
+| `patches/mpv_dmabuf_oes_image.patch` | **mpv 直通必需补丁**（desktop GL 改走 `glEGLImageTargetTexture2DOES`；适配 0.40 / 0.41） |
+| `scripts/sync_dkms.sh` | 同步源码到 DKMS + build + install + update-initramfs（一条龙） |
+| `scripts/force_mode_test.sh` | 强制点屏验证与持久化接管 / 回滚（`boot` / `boot-undo`） |
+| `scripts/test_passthrough.sh` | **直通一键自检**（纯色片源判定 + 导出诊断 + 环境体检） |
 | `/etc/environment`（**系统配置，非本仓库文件**） | 追加 `__GLX_VENDOR_LIBRARY_NAME=mwv207`：修复 pkexec 提权应用（EasyTier GUI 等）白屏（§3.5） |
-| `jm_gl_compat.c` | **用户态 GL 兼容层**（LD_PRELOAD）：补齐 `GL_EXT_EGL_image_storage` 并把 storage 入口重定向到可用的 OES 入口，使**未打补丁**的应用也能 VA-API 零拷贝直通（§3.6） |
-| `build_gl_compat.sh` | 编译/安装/卸载上述兼容层（含导出符号自检） |
-| `test_gl_compat.sh` | **兼容层一键验证**：扩展广告 → 未打补丁 mpv 的 direct 判定 → 直通画面像素（区分全零绿屏） |
-| `jm_egl_visual_probe.c` | **EGL visual 能力探针**：枚举 X visual 并 dump config 属性（`-a`）。⚠️ 其输出中的「无匹配 config，引擎必然失败」是**探针自身推断**，已于 2026-09-15 被实测推翻（§3.7 文末更正），勿再作为结论使用 |
-| `egl_force_visual.c` | **EGL visual 强制建面探针（2026-09-15 新增）**：无视 config 报告的 visual，用 `config[0]` 在屏幕**全部 visual** 上建 window surface 并真正 `glClear`+`eglSwapBuffers`。实测 **90/90 全通过** —— 据此推翻 §3.7 原结论 |
-| `patch_gl_storage.py` | **原生 `GL_EXT_EGL_image_storage` 补丁（2026-09-16 新增，§9）**：给 `jmgpu_dri.so`（扩展广告）+ `libGLX_mwv207.so` / `libEGL_mwv207.so`（入口别名）做纯字节补丁，把 `glEGLImageTargetTexStorageEXT` 接回可用的 OES 实现。内置空区/唯一重定位/文件尺寸三类断言 |
-| `install_gl_storage.sh` | 上述补丁的**安装 / 回退 / 状态**脚本（`install` / `revert` / `status`），始终从原件生成补丁（幂等），备份于 `/var/backups/jm9100-glstorage/` |
-| `jm_gl_storage_test.c` | **A/B 端到端探针**：EGL+pbuffer + jmgpu dumb buffer→dmabuf→EGLImage，对照 `glEGLImageTargetTexture2DOES` 与 `glEGLImageTargetTexStorageEXT` 的纹理绑定结果（补丁后两者均 `256x128`） |
-| `jm_gl_ext_dump.c` | 扩展广告探针：打印 `GL_EXTENSIONS` 串与 `GL_NUM_EXTENSIONS`，用于确认补丁只等价替换了 1 个重复扩展、总数与串长不变 |
-| `jm_gl_glx_path_test.c` | **GLX 路径探针（2026-09-16 新增，§9.8）**：用真实 VA-API 导出 dmabuf 建 EGLImage；`oes` / `storage` / `both` 分进程跑像素判据，`errcheck` 模式用"参数校验置错码"判别入口是否已接上厂商实现（规避 GLX 下厂商 OES 实现崩溃） |
+| `tools/jm_gl_compat.c` | **用户态 GL 兼容层**（LD_PRELOAD）：补齐 `GL_EXT_EGL_image_storage` 并把 storage 入口重定向到可用的 OES 入口，使**未打补丁**的应用也能 VA-API 零拷贝直通（§3.6） |
+| `scripts/build_gl_compat.sh` | 编译/安装/卸载上述兼容层（含导出符号自检） |
+| `scripts/test_gl_compat.sh` | **兼容层一键验证**：扩展广告 → 未打补丁 mpv 的 direct 判定 → 直通画面像素（区分全零绿屏） |
+| `tools/jm_egl_visual_probe.c` | **EGL visual 能力探针**：枚举 X visual 并 dump config 属性（`-a`）。⚠️ 其输出中的「无匹配 config，引擎必然失败」是**探针自身推断**，已于 2026-09-15 被实测推翻（§3.7 文末更正），勿再作为结论使用 |
+| `tools/egl_force_visual.c` | **EGL visual 强制建面探针（2026-09-15 新增）**：无视 config 报告的 visual，用 `config[0]` 在屏幕**全部 visual** 上建 window surface 并真正 `glClear`+`eglSwapBuffers`。实测 **90/90 全通过** —— 据此推翻 §3.7 原结论 |
+| `tools/patch_gl_storage.py` | **原生 `GL_EXT_EGL_image_storage` 补丁（2026-09-16 新增，§9）**：给 `jmgpu_dri.so`（扩展广告）+ `libGLX_mwv207.so` / `libEGL_mwv207.so`（入口别名）做纯字节补丁，把 `glEGLImageTargetTexStorageEXT` 接回可用的 OES 实现。内置空区/唯一重定位/文件尺寸三类断言 |
+| `scripts/install_gl_storage.sh` | 上述补丁的**安装 / 回退 / 状态**脚本（`install` / `revert` / `status`），始终从原件生成补丁（幂等），备份于 `/var/backups/jm9100-glstorage/` |
+| `tools/jm_gl_storage_test.c` | **A/B 端到端探针**：EGL+pbuffer + jmgpu dumb buffer→dmabuf→EGLImage，对照 `glEGLImageTargetTexture2DOES` 与 `glEGLImageTargetTexStorageEXT` 的纹理绑定结果（补丁后两者均 `256x128`） |
+| `tools/jm_gl_ext_dump.c` | 扩展广告探针：打印 `GL_EXTENSIONS` 串与 `GL_NUM_EXTENSIONS`，用于确认补丁只等价替换了 1 个重复扩展、总数与串长不变 |
+| `tools/jm_gl_glx_path_test.c` | **GLX 路径探针（2026-09-16 新增，§9.8）**：用真实 VA-API 导出 dmabuf 建 EGLImage；`oes` / `storage` / `both` 分进程跑像素判据，`errcheck` 模式用"参数校验置错码"判别入口是否已接上厂商实现（规避 GLX 下厂商 OES 实现崩溃） |
 | `jmgpu_crosstab.c`（`_DmabufGetSGT`） | **内核第二处 `.GetSGT` 空桩修复（2026-09-16，§9.2）**：Dmabuf（外部 dmabuf 导入）分配器按 `j9_lactant()` 约定派生子区间 sg_table，缓存于 `j9_camaron->sub_sgt` 并在 Free 时释放 |
 | `docs/应用侧交付与测试清单.md` | **交付给应用侧的说明与测试清单**：测试环境基线、系统层改动清单（含回退）、应用侧三项注意（GL vendor 变量 / vsync 语义 / VA-API 零拷贝接入）、逐项测试项与判据、黑窗问题采集模板、已知限制与问题回报模板 |
-| `patch_xorg_abi.py` | **X 驱动 ABI 补丁**：把 `mwv207_drv.so` 的 `XF86ModuleVersionInfo.abiversion` 从 24.0 补到 25.0（对副本操作，4 字节），使其能被 Xorg 1.21 加载（§3.9） |
-| `drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 以及当前 `GAMMA_LUT` blob 的项数与内容（定位灰蒙蒙根因用，§3.2） |
-| `jmgpu_reload_test.sh` | **卸载/重载 + S3 验证脚本**（须在 SSH/TTY 中跑，自带恢复桌面与回滚，§3.4） |
-| `jm_dmabuf_cycle.c` | dmabuf 导出→同驱动导入→释放 循环压测与泄漏检查（无需 root，§3.3 相关） |
-| `va_export_probe.c` | VA 导出保真度探针（`vaPutImage`→导出→逐字节比对） |
-| `va_export_diag.c` | LD_PRELOAD 导出诊断（mmap 内容 vs `vaGetImage`） |
-| `jm_gem_probe.c` | 内核 GEM 导出双向校验（CPU↔dmabuf 交叉比对、pagemap） |
-| `jm_dumb_probe.c` | dumb/GEM `mmap()` 通路探针（`CREATE_DUMB`/`MAP_DUMB`/`mmap` 三态 + 读写回环），用于区分「滑动窗口可用」与「dmabuf 路径静默全零」（§3.3 补） |
-| `bar_probe.c` | 验证其它 PCI BAR 是否也是显存窗口 |
-| `ppm_stats.py` / `passthrough_verify.py` | 截图取色判定直通画面 |
-| `dump_display_regs.sh` / `dump_full_regs.sh` / `fix_win_contrast.sh` | 显示域寄存器 dump 与写回（诊断） |
-| `color_bisect.sh` / `check_jmgpu_display.sh` / `diag_jmgpu_fail.sh` | 色彩/显示排查辅助脚本 |
+| `tools/patch_xorg_abi.py` | **X 驱动 ABI 补丁**：把 `mwv207_drv.so` 的 `XF86ModuleVersionInfo.abiversion` 从 24.0 补到 25.0（对副本操作，4 字节），使其能被 Xorg 1.21 加载（§3.9） |
+| `tools/drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 以及当前 `GAMMA_LUT` blob 的项数与内容（定位灰蒙蒙根因用，§3.2） |
+| `scripts/jmgpu_reload_test.sh` | **卸载/重载 + S3 验证脚本**（须在 SSH/TTY 中跑，自带恢复桌面与回滚，§3.4） |
+| `tools/jm_dmabuf_cycle.c` | dmabuf 导出→同驱动导入→释放 循环压测与泄漏检查（无需 root，§3.3 相关） |
+| `tools/va_export_probe.c` | VA 导出保真度探针（`vaPutImage`→导出→逐字节比对） |
+| `tools/va_export_diag.c` | LD_PRELOAD 导出诊断（mmap 内容 vs `vaGetImage`） |
+| `tools/jm_gem_probe.c` | 内核 GEM 导出双向校验（CPU↔dmabuf 交叉比对、pagemap） |
+| `tools/jm_dumb_probe.c` | dumb/GEM `mmap()` 通路探针（`CREATE_DUMB`/`MAP_DUMB`/`mmap` 三态 + 读写回环），用于区分「滑动窗口可用」与「dmabuf 路径静默全零」（§3.3 补） |
+| `tools/bar_probe.c` | 验证其它 PCI BAR 是否也是显存窗口 |
+| `tools/ppm_stats.py` / `tools/passthrough_verify.py` | 截图取色判定直通画面 |
+| `scripts/dump_display_regs.sh` / `scripts/dump_full_regs.sh` / `scripts/fix_win_contrast.sh` | 显示域寄存器 dump 与写回（诊断） |
+| `scripts/color_bisect.sh` / `scripts/check_jmgpu_display.sh` / `scripts/diag_jmgpu_fail.sh` | 色彩/显示排查辅助脚本 |
 | `backup/README.2026-09-10.md`、`backup/FIXLOG.2026-09-10.md` | **合并前的原始文档备份**（完整排查过程与已排除方案） |
 
 > 参考仓库：
@@ -976,14 +1006,14 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 
 后续建议：
 
-1. **保持本仓库栈**：DKMS 已装补丁版 `jmgpu.ko`；持久化 = `force_mode_test.sh boot`
+1. **保持本仓库栈**：DKMS 已装补丁版 `jmgpu.ko`；持久化 = `scripts/force_mode_test.sh boot`
    （blacklist mwv207 + modules-load 强制加载 jmgpu），回滚 = `boot-undo`。
-   改驱动源码后务必 `./sync_dkms.sh build` 再重启（含 initramfs 重建）。
+   改驱动源码后务必 `./scripts/sync_dkms.sh build` 再重启（含 initramfs 重建）。
 2. **直通的两条路（二选一即可）**：
-   - **系统级（推荐）**：`./build_gl_compat.sh install`，再用
+   - **系统级（推荐）**：`./scripts/build_gl_compat.sh install`，再用
      `LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjm_gl_compat.so` 启动播放器 ——
      未打补丁的应用也能进入 direct（§3.6）；
-   - **应用级**：给 mpv 打 `mpv_dmabuf_oes_image.patch` 后重编（§4.3），
+   - **应用级**：给 mpv 打 `patches/mpv_dmabuf_oes_image.patch` 后重编（§4.3），
      升级 mpv 后需重新应用。
 3. **`/etc/environment` 不可丢**（§3.5）：`__GLX_VENDOR_LIBRARY_NAME=mwv207`
    必须**同时**存在于
@@ -1036,7 +1066,7 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 
 | 位置 | 改动 | 原因 | 回退 |
 |---|---|---|---|
-| `/usr/lib/xorg/modules/drivers/mwv207_drv.so` | 替换为 `build-cli/mwv207_drv.so.abi25.fixed3`（md5 `297aee83…`） | ① ABI 版本 24→25（`patch_xorg_abi.py`）；② Xorg 1.21 删除 `xf86str.h` 的 `Bool flipPixels` → 其后字段整体 **−8 字节**，回调槽错位使 `xf86DeleteScreen` 误调 LeaveVT，读未初始化的 `pScrn->pScreen` → `NULL+0x48` 段错误（`build-cli/patch_abi_layout.py`） | 从驱动包恢复原始 `mwv207_drv.so` |
+| `/usr/lib/xorg/modules/drivers/mwv207_drv.so` | 替换为 `build-cli/mwv207_drv.so.abi25.fixed3`（md5 `297aee83…`） | ① ABI 版本 24→25（`tools/patch_xorg_abi.py`）；② Xorg 1.21 删除 `xf86str.h` 的 `Bool flipPixels` → 其后字段整体 **−8 字节**，回调槽错位使 `xf86DeleteScreen` 误调 LeaveVT，读未初始化的 `pScrn->pScreen` → `NULL+0x48` 段错误（`build-cli/patch_abi_layout.py`） | 从驱动包恢复原始 `mwv207_drv.so` |
 | `/etc/tmpfiles.d/drm-vblank.conf` + `/etc/systemd/system/drm-vblank-fix.service` | 每次开机把 `drm` 模块参数 `vblankoffdelay` 写为 **0** | **缺陷#1 的根治**：内核默认在最后一个 vblank 使用者释放后 5000ms 关闭 vblank 中断，厂商驱动无法重新使能 → 客户端等待永远超时（1s）。写 0 = 永不自动关闭（见 §8.9） | `sudo systemctl disable --now drm-vblank-fix.service`；`rm /etc/systemd/system/drm-vblank-fix.service /etc/tmpfiles.d/drm-vblank.conf`；`echo 5000 > /sys/module/drm/parameters/vblankoffdelay` |
 | `/etc/environment` | 追加 `vblank_mode=0` | **缺陷#1 的旧规避**（已被 §8.9 的内核修复取代，可保留作双保险） | 删除该行（备份：`/etc/environment.bak-20260915-113720`） |
 | `/etc/profile.d/zz-vblank.sh` | 新增 `export vblank_mode=0` | 同上，覆盖终端/命令行启动的 GL 程序 | `sudo rm /etc/profile.d/zz-vblank.sh` |
@@ -1087,7 +1117,7 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 2. **GL 合成路径性能异常**：同场景 `gl2` 合成 8fps vs `XRender` 47fps，约为 1/6。
 3. ~~**印证 §3.7**：厂商 EGL 的 config 集合只覆盖 1 个 visual（实测 `0x21`），任何用
    EGL 给窗口建 surface 的客户端都会报 `Failed to initialize EglDisplay`……~~
-   → **本条已撤回（2026-09-15）**：`egl_force_visual.c` 实测 **90/90 个 visual 均可建面 +
+   → **本条已撤回（2026-09-15）**：`tools/egl_force_visual.c` 实测 **90/90 个 visual 均可建面 +
    渲染 + 交换**（§3.7 文末更正），EGL 表面本身不是瓶颈。`dde-shell` 历史上的
    `Failed to initialize EglDisplay` **真因待重查**（现已由 Mesa 包装规避）。
 
@@ -1232,7 +1262,7 @@ present 是否走了未优化路径？为何同一硬件上"XRender 拷贝"能�
 厂商 EGL **不是** `mesa-mwv207` 构建的（那个 Mesa 22.3.7 分支自带独立 `mwv207` gallium 驱动）；
 厂商库是自研实现，UOS GCC 8.3.0 编译，走 DRI3/Present + Wayland，`NEEDED: libdrm_jmgpu.so.1.0.0`。
 
-#### 决定性实验：`egl_force_visual.c`（本轮新增）
+#### 决定性实验：`tools/egl_force_visual.c`（本轮新增）
 
 **方法**：无视 config 报告的 visual，直接拿 `config[0]` 到屏幕**全部 90 个 visual** 上
 `eglCreateWindowSurface`，并真正执行 `eglMakeCurrent` + `glClear` + `eglSwapBuffers`。
@@ -1247,7 +1277,7 @@ visual   depth class       surface  eglGetError  渲染(glClear+swap)
 小结: visual 总数 90，surface 建立失败 0，可完整渲染 90
 ```
 
-（复现：`gcc -O2 -o /tmp/egl_force_visual egl_force_visual.c -lEGL -lX11 -lGLESv2 && /tmp/egl_force_visual`）
+（复现：`gcc -O2 -o /tmp/egl_force_visual tools/egl_force_visual.c -lEGL -lX11 -lGLESv2 && /tmp/egl_force_visual`）
 
 **结论**：`eglCreateWindowSurface` **不做 config↔visual 匹配校验**，任何 visual 都能建面并正常
 渲染/交换。`EGL_NATIVE_VISUAL_ID` 的"显示级返回 `0x21`"只是**查询语义的简化**，不是能力限制。
@@ -1306,7 +1336,7 @@ visual   depth class       surface  eglGetError  渲染(glClear+swap)
 ## 9. 2026-09-16 续：反编译补齐两处「厂商需修」缺陷（原生 `GL_EXT_EGL_image_storage` + 内核第二处 `.GetSGT` 空桩）
 
 > 承接 **§3.6 / §3.8 / §4.4**（`glEGLImageTargetTexStorageEXT` 属"未实现，只能客户端兜底"）与
-> **§7.4 厂商缺陷清单**。本轮把两处缺陷**直接在二进制/内核源码层补齐**，兼容层（`jm_gl_compat.c`）因此可退役。
+> **§7.4 厂商缺陷清单**。本轮把两处缺陷**直接在二进制/内核源码层补齐**，兼容层（`tools/jm_gl_compat.c`）因此可退役。
 
 ### 9.1 结果概览
 
@@ -1320,7 +1350,7 @@ visual   depth class       surface  eglGetError  渲染(glClear+swap)
 ```
 [vo/gpu/opengl] Initializing GPU context 'x11egl'          ← mpv 默认走的是 EGL，不是 GLX
 [vo/gpu/vaapi]  Using EGL dmabuf interop via GL_EXT_EGL_image_storage
-$ ./test_passthrough.sh -s 720p
+$ ./scripts/test_passthrough.sh -s 720p
   直通(vaapi): 1280x720 avg=(255,0,64) 绿色占比 0.0%
   ==> 直通【正常】：画面是片源原色(红)
   mpv 实际使用: Using hardware decoding (vaapi)
@@ -1359,7 +1389,7 @@ _DmabufGetSGT(IN jmkALLOCATOR Allocator,
 （`DRM_JM_GEM_XFER_RECT` ioctl 喂 2D/解码引擎、dma-buf core 经 `j9_cibarious()`）都用不了导入缓冲。
 修复后语义与系统内存分配器（`j9_lactant`）一致。
 
-> **部署与验证状态（2026-09-16 已完成）**：`./sync_dkms.sh build` 一条龙执行
+> **部署与验证状态（2026-09-16 已完成）**：`./scripts/sync_dkms.sh build` 一条龙执行
 > （dkms build/install + `update-initramfs -u` + 指纹校验），重启后运行态与磁盘/initramfs
 > 三处 `srcversion` 一致（`408B5B6FBD8F38CB9843915`）；桌面正常、GL 正常、VA-API 直通正常、
 > 内核日志无 `BUG/WARNING/Call trace`、`jm_dmabuf_cycle 500×1MB` 无失败无泄漏。
@@ -1374,7 +1404,7 @@ _DmabufGetSGT(IN jmkALLOCATOR Allocator,
 #### 9.3.1 两条**互不相通**的入口解析链（本轮关键发现）
 
 §3.8 只看了 `jmgpu_dri.so` 的 getproc 表，因此得出"必须新增代码段 + trampoline"的结论。
-本轮把**实际解析链**钉死为两条（`jm_gl_storage_test.c` 实测 mpv 走的是 ②EGL 链）：
+本轮把**实际解析链**钉死为两条（`tools/jm_gl_storage_test.c` 实测 mpv 走的是 ②EGL 链）：
 
 **① GLX 链**（`libGLX_mwv207.so.1.2.0`）
 
@@ -1407,7 +1437,7 @@ libEGL.so.1 → 厂商 eglGetProcAddress(0x17700)
 **由此得到可行补丁思路**：不动函数入口、不加代码段，只做两件"数据"事 ——
 **扩展广告**（`__glExtension` name_ptr 指向的字符串）与**名字改写**（别名表 pattern/replacement）。
 
-#### 9.3.2 补丁设计（`patch_gl_storage.py`）
+#### 9.3.2 补丁设计（`tools/patch_gl_storage.py`）
 
 | # | 库 | 改动 | 为什么可行 |
 |---|---|---|---|
@@ -1424,7 +1454,7 @@ libEGL.so.1 → 厂商 eglGetProcAddress(0x17700)
 
 #### 9.3.3 验证
 
-**A/B 对照探针 `jm_gl_storage_test.c`**（EGL + pbuffer + jmgpu dumb buffer 导出 dmabuf → EGLImage）：
+**A/B 对照探针 `tools/jm_gl_storage_test.c`**（EGL + pbuffer + jmgpu dumb buffer 导出 dmabuf → EGLImage）：
 
 ```
 GL_EXT_EGL_image_storage advertised = YES
@@ -1437,7 +1467,7 @@ GL_OES_EGL_image advertised         = YES
 即 **B 与 A 行为完全一致**；补丁前后唯一差别就是"纹理被真正挂上了 dmabuf"。
 
 **mpv 端到端（无 `LD_PRELOAD`、系统原版）**：见 §9.1 的 `x11egl` +
-`Using EGL dmabuf interop via GL_EXT_EGL_image_storage`，且 `test_passthrough.sh` 判定直通正常、画面为片源原色。
+`Using EGL dmabuf interop via GL_EXT_EGL_image_storage`，且 `scripts/test_passthrough.sh` 判定直通正常、画面为片源原色。
 
 **回归检查**：`glxinfo -B` → `direct rendering: Yes` / `Jingjia JM9100` / `GL 4.0 V1.7.0`；
 扩展总数仍 **142**、扩展串仍 **3535 B**（等长替换的直接结果）。
@@ -1454,9 +1484,9 @@ GL_OES_EGL_image advertised         = YES
 
 ```bash
 cd ~/Desktop/Git/jm9100
-sudo ./install_gl_storage.sh            # 生成补丁 + 备份原件 + 安装三库
-sudo ./install_gl_storage.sh status     # 查看三库是否已打补丁（含 md5 对照）
-sudo ./install_gl_storage.sh revert     # 从 /var/backups/jm9100-glstorage/ 还原原件
+sudo ./scripts/install_gl_storage.sh            # 生成补丁 + 备份原件 + 安装三库
+sudo ./scripts/install_gl_storage.sh status     # 查看三库是否已打补丁（含 md5 对照）
+sudo ./scripts/install_gl_storage.sh revert     # 从 /var/backups/jm9100-glstorage/ 还原原件
 ```
 
 脚本**始终从原件（备份）生成补丁**（幂等），并自动同步硬链接副本 `/usr/lib/dri/jmgpu_dri.so`。
@@ -1470,18 +1500,18 @@ sudo ./install_gl_storage.sh revert     # 从 /var/backups/jm9100-glstorage/ 还
    表上*确实无法小补丁（表已满、func 运行时填充、需新增重定位）；但把修复落在
    **`libEGL` / `libGLX` 的别名表（名字改写）** 上就只需改数据与既有 addend —— 本轮已完成。
 2. **§7.4 第 3 条可关闭**（`glEGLImageTargetTexStorageEXT` 未实现 → 兼容层兜底）：原生已可用，
-   `jm_gl_compat.c`（`LD_PRELOAD`）已**从系统卸载**（见 §9.7），源码保留作兜底。
+   `tools/jm_gl_compat.c`（`LD_PRELOAD`）已**从系统卸载**（见 §9.7），源码保留作兜底。
 3. §3.6 兼容层的保留价值：仅剩"更老/特殊应用直连 `glXGetProcAddress` 且自行判缓存"的边角场景；
    日常播放（mpv / Chromium / GTK）已不再需要。
-4. 新增交付物见 §6 清单（`patch_gl_storage.py` / `install_gl_storage.sh` /
-   `jm_gl_storage_test.c` / `jm_gl_ext_dump.c` / `jm_gl_glx_path_test.c`）。
+4. 新增交付物见 §6 清单（`tools/patch_gl_storage.py` / `scripts/install_gl_storage.sh` /
+   `tools/jm_gl_storage_test.c` / `tools/jm_gl_ext_dump.c` / `tools/jm_gl_glx_path_test.c`）。
 
 ### 9.7 兼容层退役（`libjm_gl_compat.so` 已卸载）
 
 原生补丁验证通过后，`LD_PRELOAD` 兼容层已**从系统移除**：
 
 ```bash
-sudo ./build_gl_compat.sh uninstall      # 已执行；/usr/lib/aarch64-linux-gnu/libjm_gl_compat.so 已不存在
+sudo ./scripts/build_gl_compat.sh uninstall      # 已执行；/usr/lib/aarch64-linux-gnu/libjm_gl_compat.so 已不存在
 ```
 
 - 该层**从未**写入 `/etc/ld.so.preload`（无全局强制），`/etc/environment` 亦无相关条目
@@ -1494,7 +1524,7 @@ sudo ./build_gl_compat.sh uninstall      # 已执行；/usr/lib/aarch64-linux-gn
   mpv 实际使用: Using hardware decoding (vaapi)
   ```
 
-- `jm_gl_compat.c` / `build_gl_compat.sh` / `test_gl_compat.sh` **源码与脚本保留在仓库**，
+- `tools/jm_gl_compat.c` / `scripts/build_gl_compat.sh` / `scripts/test_gl_compat.sh` **源码与脚本保留在仓库**，
   作为"原生补丁未安装时"的兜底手段（§7.2 的两条路仍成立，只是不再需要）。
 
 ### 9.8 GLX 路径如何实测：`errcheck` 判别法（含 A/B 证据）
@@ -1520,7 +1550,7 @@ EGLImage ok
 ```bash
 # 无需合法 image；厂商实现会对非法 image 置 GL_INVALID_OPERATION(0x502)，
 # 而 glvnd 空桩"什么都不做"，错误保持 GL_NO_ERROR。分进程跑，崩溃可单独取证。
-gcc -O2 -I/usr/include/libdrm -o /tmp/jm_glx jm_gl_glx_path_test.c \
+gcc -O2 -I/usr/include/libdrm -o /tmp/jm_glx tools/jm_gl_glx_path_test.c \
     -lva -lva-drm -lEGL -lGL -lX11 -ldrm -ldl
 DISPLAY=:N XAUTHORITY=... LIBVA_DRIVER_NAME=jmgpu __GLX_VENDOR_LIBRARY_NAME=mwv207 \
     /tmp/jm_glx errcheck
@@ -1528,8 +1558,8 @@ DISPLAY=:N XAUTHORITY=... LIBVA_DRIVER_NAME=jmgpu __GLX_VENDOR_LIBRARY_NAME=mwv2
 
 | 状态 | 命令 | 结果 |
 |---|---|---|
-| **补丁前** | `sudo ./install_gl_storage.sh revert` 后跑 `errcheck` | `advertised storage=NO`；`E) storage(NULL) err=0`（空桩）、`F) OES(NULL) err=0x502` |
-| **补丁后** | `sudo ./install_gl_storage.sh install` 后跑 `errcheck` | `advertised storage=YES`；`E) storage(NULL) err=0x502` **与 OES 完全一致** |
+| **补丁前** | `sudo ./scripts/install_gl_storage.sh revert` 后跑 `errcheck` | `advertised storage=NO`；`E) storage(NULL) err=0`（空桩）、`F) OES(NULL) err=0x502` |
+| **补丁后** | `sudo ./scripts/install_gl_storage.sh install` 后跑 `errcheck` | `advertised storage=YES`；`E) storage(NULL) err=0x502` **与 OES 完全一致** |
 
 ⇒ **GLX 路径的 storage 入口确实已接到厂商实现**（修补前是空桩），非"看起来没报错"的假象。
 
@@ -1606,7 +1636,7 @@ if ((args->offset >= size) ||
 ### 10.4 验证与部署
 
 ```bash
-./sync_dkms.sh build     # dkms build(-Werror 通过) + install + update-initramfs + 指纹校验
+./scripts/sync_dkms.sh build     # dkms build(-Werror 通过) + install + update-initramfs + 指纹校验
 # 磁盘模块    srcversion: 0167E828EB8B4BFB60CE487
 # initramfs  srcversion: 0167E828EB8B4BFB60CE487   → 校验通过
 ```
@@ -1751,7 +1781,7 @@ if ((args->offset >= size) ||
 
 ```bash
 cd ~/Desktop/Git/jm9100
-sudo ./sync_dkms.sh build      # 0 error / 0 warning
+sudo ./scripts/sync_dkms.sh build      # 0 error / 0 warning
 sudo reboot                    # jmgpu 引用计数 61（Xorg+kwin），无法热重载
 ```
 
@@ -1768,7 +1798,7 @@ sudo reboot                    # jmgpu 引用计数 61（Xorg+kwin），无法�
 补丁需**重启应用**才生效，本次重启正好提供了干净验证：
 
 ```
-# GLX 路径（jm_gl_storage_test.c，glXGetProcAddressARB = 补丁的 libGLX 别名表）
+# GLX 路径（tools/jm_gl_storage_test.c，glXGetProcAddressARB = 补丁的 libGLX 别名表）
 GL_EXT_EGL_image_storage advertised = YES
 [proc ] OES=0xffffbb9a3b80 storage=0xffffbb9a3b00        ← 两者均非 NULL
   A) glEGLImageTargetTexture2DOES    level0=256x128  err=0
@@ -1781,4 +1811,4 @@ GL_EXT_EGL_image_storage advertised = YES
 
 > **应用侧注意**：本厂商栈上 `eglCreateImageKHR()` 走 dma-buf（`EGL_LINUX_DMA_BUF_EXT`）时
 > **必须传 `EGL_NO_CONTEXT`**；传当前 context 会返回 `EGL_BAD_CONTEXT (0x3006)`
-> （`jm_gl_storage_test.c` 用的正是 `EGL_NO_CONTEXT`）。
+> （`tools/jm_gl_storage_test.c` 用的正是 `EGL_NO_CONTEXT`）。
