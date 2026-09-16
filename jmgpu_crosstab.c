@@ -39,6 +39,16 @@ typedef struct tag_jms_DMABUF {
 	struct sg_table *sgt;
 	unsigned long *pagearray;
 
+	/*
+	 * Cached sub-range sg_table produced by _DmabufGetSGT(). The original
+	 * stub always failed, so no caller could ever obtain an sg_table for
+	 * an imported buffer; this keeps the (rarely more than one) derived
+	 * table alive until the Mdl is freed instead of leaking it.
+	 */
+	struct sg_table *sub_sgt;
+	jmtSIZE_T sub_sgt_offset;
+	jmtSIZE_T sub_sgt_bytes;
+
 	int npages;
 	int pid;
 	struct list_head list;
@@ -268,6 +278,12 @@ static void j9_coryphee(IN jmkALLOCATOR Allocator, IN PLINUX_MDL Mdl)
 
 	dma_buf_put(buf_desc->dmabuf);
 
+	if (buf_desc->sub_sgt) {
+		sg_free_table(buf_desc->sub_sgt);
+		kfree(buf_desc->sub_sgt);
+		buf_desc->sub_sgt = J9_CHYAK;
+	}
+
 	jmkOS_Free(os, buf_desc->pagearray);
 
 	jmkOS_Free(os, buf_desc);
@@ -437,12 +453,146 @@ j9_predeserving(IN jmkALLOCATOR Allocator,
 	return J9_FLUTTERING;
 }
 
+/*
+ * Build an sg_table describing the [Offset, Offset+Bytes) byte range of a
+ * buffer imported through dma_buf_attach()/dma_buf_map_attachment().
+ *
+ * The vendor shipped this operation as an unconditional error return even
+ * though Mdl->priv (j9_camaron) already holds the exporter's sg_table in
+ * buf_desc->sgt.  j9_prismatoid() obtained it from dma_buf_map_attachment(),
+ * so sg_page()/sg->offset/sg->length are still the exporter's real pages
+ * (dma_map_sgtable() only rewrites sg_dma_address(), it leaves the page
+ * pointer untouched).  We therefore derive a sub-range table by re-slicing
+ * those scatterlist entries, which is exactly what the GFP allocator's
+ * j9_lactant() does for system memory.
+ *
+ * Consequences of the old stub: jmkOS_MemoryGetSGT() -> allocator->GetSGT
+ * always failed for imported buffers, so any consumer needing an sg_table
+ * (the DRM_JM_GEM_XFER_RECT ioctl feeding the 2D/decoder engine, or the
+ * dma-buf core via j9_cibarious()) could not work with them at all.
+ */
 static j9_duopoly
 _DmabufGetSGT(IN jmkALLOCATOR Allocator,
 	      IN PLINUX_MDL Mdl,
 	      IN jmtSIZE_T Offset, IN jmtSIZE_T Bytes, OUT jmtPOINTER *SGT)
 {
+	j9_camaron *buf_desc = Mdl->priv;
+	struct sg_table *orig;
+	struct sg_table *out;
+	struct scatterlist *s, *d = J9_CHYAK;
+	jmtSIZE_T pos = 0;
+	jmtSIZE_T cur;
+	jmtSIZE_T total = 0;
+	jmtSIZE_T left;
+	jmtSIZE_T take;
+	unsigned int idx = 0;
+	unsigned int nents;
+	int i;
+	int ret;
 
+	if (!buf_desc || !buf_desc->sgt || !SGT)
+		return J9_HANDLE_J9M_UNFEMINISE;
+
+	orig = buf_desc->sgt;
+
+	for_each_sg(orig->sgl, s, orig->orig_nents, i)
+		total += s->length;
+
+	if (!total || !Bytes || Offset >= total)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
+
+	if (Bytes > total - Offset)
+		Bytes = total - Offset;
+
+	/* Reuse the cached table when the same range is requested again. */
+	if (buf_desc->sub_sgt && buf_desc->sub_sgt_offset == Offset &&
+	    buf_desc->sub_sgt_bytes == Bytes) {
+		*SGT = (jmtPOINTER) buf_desc->sub_sgt;
+		return J9_FLUTTERING;
+	}
+
+	if (buf_desc->sub_sgt) {
+		sg_free_table(buf_desc->sub_sgt);
+		kfree(buf_desc->sub_sgt);
+		buf_desc->sub_sgt = J9_CHYAK;
+	}
+
+	/*
+	 * One derived entry per source entry is enough: the region described by
+	 * a single scatterlist entry is physically contiguous (that is what the
+	 * entry means), so the requested sub-range of it can be expressed by a
+	 * single sg_set_page() with an adjusted offset/length.
+	 */
+	nents = (unsigned int) orig->orig_nents;
+	if (!nents)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
+
+	out = kzalloc(sizeof(*out), GFP_KERNEL);
+	if (!out)
+		return J9_HANDLE_J9M_FORGATHERS;
+
+	ret = sg_alloc_table(out, nents, GFP_KERNEL);
+	if (ret) {
+		kfree(out);
+		return J9_HANDLE_J9M_FORGATHERS;
+	}
+
+	cur = Offset;
+	left = Bytes;
+	for_each_sg(orig->sgl, s, orig->orig_nents, i) {
+		jmtSIZE_T sstart = pos;
+		jmtSIZE_T slen = s->length;
+		jmtSIZE_T in_off;
+		jmtSIZE_T avail;
+
+		pos += slen;
+
+		/* Skip entries entirely before the requested range. */
+		if (cur >= pos)
+			continue;
+		if (!left)
+			break;
+
+		if (idx >= nents || !sg_page(s))
+			goto fail;
+
+		in_off = cur - sstart;
+		avail = slen - in_off;
+		take = avail < left ? avail : left;
+
+		if (!d)
+			d = out->sgl;
+		else
+			d = sg_next(d);
+
+		if (!d)
+			goto fail;
+
+		sg_set_page(d, sg_page(s), (unsigned int) take,
+			    s->offset + (unsigned int) in_off);
+
+		cur += take;
+		left -= take;
+		idx++;
+	}
+
+	if (left || !d)
+		goto fail;
+
+	sg_mark_end(d);
+	out->nents = idx;
+
+	buf_desc->sub_sgt = out;
+	buf_desc->sub_sgt_offset = Offset;
+	buf_desc->sub_sgt_bytes = Bytes;
+
+	*SGT = (jmtPOINTER) out;
+
+	return J9_FLUTTERING;
+
+fail:
+	sg_free_table(out);
+	kfree(out);
 	return J9_HANDLE_J9MENU_HOMOGONIES;
 }
 

@@ -3,8 +3,9 @@
 > 平台：**飞腾 D3000 + 景嘉微 JM9100**，内核 **6.6.143-arm64-desktop-hwe (Deepin 25)**。
 > 目标：把闭源 **jmgpu 1.7.0** 内核驱动移植到 6.6 并**同时**点亮显示与打通 VA-API 硬解。
 >
-> **最终结果：1–5、7 已解决，6 已定位根因 ✅**
-> （1–3 于 2026-09-10；4–7 于 2026-09-14；7 的收尾与显示/GL 性能调优于 2026-09-15，详见 §3.5 / §3.6 / §3.7 / §3.9 / **§8**）
+> **最终结果：1–5、7 已解决，6 已定位根因 ✅；8、9 于 2026-09-16 反编译修复 ✅**
+> （1–3 于 2026-09-10；4–7 于 2026-09-14；7 的收尾与显示/GL 性能调优于 2026-09-15，详见 §3.5 / §3.6 / §3.7 / §3.9 / **§8**；
+> 8–9 为反编译厂商用户态/补全内核缺陷，见 **§9**）
 
 | # | 问题 | 状态 | 主要修复位置 |
 |---|---|---|---|
@@ -13,8 +14,10 @@
 | 3 | VA-API 直通画面全绿 | ✅ | `mpv_dmabuf_oes_image.patch` + `jmgpu_bullets.c` / `jmgpu_setlayout.c` |
 | 4 | EasyTier GUI 白屏（提权进程丢 GL vendor 变量） | ✅ | `/etc/environment`（§3.5，**非仓库代码**） |
 | 5 | 未打补丁应用无法 VA-API 零拷贝直通 | ✅ | `jm_gl_compat.c`（用户态 GL 兼容层，§3.6） |
-| 6 | 硬件 GL 栈黑窗 | 🔍 已定位 | `jm_egl_visual_probe.c` 定位根因，修复在应用侧（§3.7） |
+| 6 | 硬件 GL 栈黑窗 | 🔁 归因已推翻，待重查 | `jm_egl_visual_probe.c` 的「EGL 只覆盖 1 个 visual」推断被 `egl_force_visual.c` 实测推翻（**90/90 visual 都能建面渲染**，§3.7 更正） |
 | 7 | X11 呈现错位（专有 X 驱动无法加载） | ✅ | `patch_xorg_abi.py` + `patch_abi_layout.py`（ABI 24→25 + `ScrnInfoRec` 布局偏移），见 **§8** |
+| 8 | `glEGLImageTargetTexStorageEXT` **原生未实现**（VA-API 零拷贝必须挂 `LD_PRELOAD` 兼容层） | ✅ **已原生修复**（兼容层可退役） | `patch_gl_storage.py`：`jmgpu_dri.so` 扩展广告 + `libEGL_mwv207.so` / `libGLX_mwv207.so` 入口别名，见 **§9** |
+| 9 | 内核 Dmabuf（外部 dmabuf 导入）分配器 `.GetSGT` **空桩** → 导入缓冲永远取不到 sg_table | ✅ | `jmgpu_crosstab.c` `_DmabufGetSGT()`，见 **§9.3** |
 
 - 部署流程见 **§4**，日常使用见 **§5**。
 - 历史排查全过程（含大量已排除方案、实验数据）见 `backup/FIXLOG.2026-09-10.md`
@@ -511,7 +514,7 @@ LD_PRELOAD=.../libjm_gl_compat.so LIBVA_DRIVER_NAME=jmgpu mpv --vo=gpu --hwdec=v
 
 ---
 
-### 3.7 硬件 GL 栈黑窗根因：景美 EGL 的 config 只覆盖一个 visual（2026-09-14）✅ 已定位
+### 3.7 硬件 GL 栈黑窗根因：景美 EGL 的 config 只覆盖一个 visual（2026-09-14）❌ 结论已更正（见本章文末 2026-09-15）
 
 **症状**：purelive 在 `PURELIVE_JM9100_GL=hardware` 下窗口**纯黑**（`mean=0 std=0`），
 引擎持续刷：
@@ -623,6 +626,39 @@ libEGL_mwv207: eglGetConfigAttrib @0x19d70
 config↔visual 映射**（现在 40 个 config 只有一个 visual），属重建数据表，不是改一个字段。
 
 **因此**：两处都转为厂商侧需求（见 §7 反馈清单），客户端侧继续用 §3.6/§3.7 的方案兜底。
+
+> #### ❌ 更正（2026-09-15）：上面「EGL config 覆盖率是黑窗根因」结论**被实验推翻**
+>
+> **实验**（`egl_force_visual.c`，本仓库新增）：无视 config 报告的 visual，直接拿
+> `config[0]` 到**屏幕全部 90 个 visual** 上建 EGL window surface，并真正执行
+> `eglMakeCurrent` + `glClear` + `eglSwapBuffers`：
+>
+> ```
+> 厂商 EGL：共 40 个 config，统一使用 config[0]（其 EGL_NATIVE_VISUAL_ID=0x21）
+> visual   depth class       surface  eglGetError  渲染(glClear+swap)
+>   0x21     24    TrueColor   OK       -            OK
+>   0x22     24    DirectColor OK       -            OK
+>   0x6c     32    TrueColor   OK       -            OK     ← Flutter/GTK 偏好的 32 位 ARGB
+>   ...（其余 87 个同样 OK）...
+> 小结: visual 总数 90，surface 建立失败 0，可完整渲染 90
+> ```
+>
+> **结论**：`eglCreateWindowSurface` **不做 config↔visual 匹配校验**，任何 visual 都能建成
+> surface 并正常渲染/交换。`EGL_NATIVE_VISUAL_ID` 的「显示级返回 0x21」只是**查询语义的
+> 简化**，并非能力限制。由此：
+>
+> 1. `jm_egl_visual_probe` 输出里的「无匹配 config，引擎必然失败」是**探针自身的推断**
+>    （它按 `EGL_NATIVE_VISUAL_ID` 匹配后就跳过，从未真正尝试建面）——该推断不成立，
+>    探针输出需按此理解（建议后续版本改为「强制用 config[0] 试建面」）。
+> 2. **§3.7 的黑窗根因需重新排查** ✗：不是 EGL visual 覆盖问题；`0x7c`/`0x6c` 这类
+>    ARGB visual 上的 EGL 表面实测完全可用。
+> 3. 附带更正：探针报「含 `EGL_EXT_platform_x11`: no」也是**查询方式错误** ——
+>    `EGL_KHR_platform_x11` / `EGL_EXT_platform_x11` 实际**存在**，但位于**客户端扩展**
+>    串（`EGL_EXT_client_extensions … EGL_KHR_platform_x11 EGL_EXT_platform_x11`），
+>    必须用 `eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS)` 查询。
+> 4. 因此**不需要**为 EGL 侧做「重建 config↔visual 映射表」的补丁（原本的厂商需求项作废）。
+>
+> 复现：`gcc -O2 -o /tmp/egl_force_visual egl_force_visual.c -lEGL -lX11 -lGLESv2 && /tmp/egl_force_visual`
 
 ---
 
@@ -901,7 +937,14 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | `jm_gl_compat.c` | **用户态 GL 兼容层**（LD_PRELOAD）：补齐 `GL_EXT_EGL_image_storage` 并把 storage 入口重定向到可用的 OES 入口，使**未打补丁**的应用也能 VA-API 零拷贝直通（§3.6） |
 | `build_gl_compat.sh` | 编译/安装/卸载上述兼容层（含导出符号自检） |
 | `test_gl_compat.sh` | **兼容层一键验证**：扩展广告 → 未打补丁 mpv 的 direct 判定 → 直通画面像素（区分全零绿屏） |
-| `jm_egl_visual_probe.c` | **EGL visual 能力探针**：枚举 X visual 并实测景美 EGL 能否为其建出 window surface（定位硬件栈黑窗根因用，§3.7）；`-a` 额外 dump 全部 config 属性 |
+| `jm_egl_visual_probe.c` | **EGL visual 能力探针**：枚举 X visual 并 dump config 属性（`-a`）。⚠️ 其输出中的「无匹配 config，引擎必然失败」是**探针自身推断**，已于 2026-09-15 被实测推翻（§3.7 文末更正），勿再作为结论使用 |
+| `egl_force_visual.c` | **EGL visual 强制建面探针（2026-09-15 新增）**：无视 config 报告的 visual，用 `config[0]` 在屏幕**全部 visual** 上建 window surface 并真正 `glClear`+`eglSwapBuffers`。实测 **90/90 全通过** —— 据此推翻 §3.7 原结论 |
+| `patch_gl_storage.py` | **原生 `GL_EXT_EGL_image_storage` 补丁（2026-09-16 新增，§9）**：给 `jmgpu_dri.so`（扩展广告）+ `libGLX_mwv207.so` / `libEGL_mwv207.so`（入口别名）做纯字节补丁，把 `glEGLImageTargetTexStorageEXT` 接回可用的 OES 实现。内置空区/唯一重定位/文件尺寸三类断言 |
+| `install_gl_storage.sh` | 上述补丁的**安装 / 回退 / 状态**脚本（`install` / `revert` / `status`），始终从原件生成补丁（幂等），备份于 `/var/backups/jm9100-glstorage/` |
+| `jm_gl_storage_test.c` | **A/B 端到端探针**：EGL+pbuffer + jmgpu dumb buffer→dmabuf→EGLImage，对照 `glEGLImageTargetTexture2DOES` 与 `glEGLImageTargetTexStorageEXT` 的纹理绑定结果（补丁后两者均 `256x128`） |
+| `jm_gl_ext_dump.c` | 扩展广告探针：打印 `GL_EXTENSIONS` 串与 `GL_NUM_EXTENSIONS`，用于确认补丁只等价替换了 1 个重复扩展、总数与串长不变 |
+| `jmgpu_crosstab.c`（`_DmabufGetSGT`） | **内核第二处 `.GetSGT` 空桩修复（2026-09-16，§9.2）**：Dmabuf（外部 dmabuf 导入）分配器按 `j9_lactant()` 约定派生子区间 sg_table，缓存于 `j9_camaron->sub_sgt` 并在 Free 时释放 |
+| `docs/应用侧交付与测试清单.md` | **交付给应用侧的说明与测试清单**：测试环境基线、系统层改动清单（含回退）、应用侧三项注意（GL vendor 变量 / vsync 语义 / VA-API 零拷贝接入）、逐项测试项与判据、黑窗问题采集模板、已知限制与问题回报模板 |
 | `patch_xorg_abi.py` | **X 驱动 ABI 补丁**：把 `mwv207_drv.so` 的 `XF86ModuleVersionInfo.abiversion` 从 24.0 补到 25.0（对副本操作，4 字节），使其能被 Xorg 1.21 加载（§3.9） |
 | `drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 以及当前 `GAMMA_LUT` blob 的项数与内容（定位灰蒙蒙根因用，§3.2） |
 | `jmgpu_reload_test.sh` | **卸载/重载 + S3 验证脚本**（须在 SSH/TTY 中跑，自带恢复桌面与回滚，§3.4） |
@@ -948,9 +991,9 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
    驱动的安装脚本目前**只写了前者**，凡"自我提权"的应用（EasyTier GUI 等）
    都会白屏。重装系统或重装驱动包后需重新确认这两处都在。
 4. **向景美反馈的五点**（附本 README §3.3 / §3.5 / §3.7 数据即可复现）：
-   - `glEGLImageTargetTexStorageEXT` 入口存在但未真正挂接 dmabuf，建议实现或
-     不要声明 `GL_EXT_EGL_image_storage`（本仓库已用 `jm_gl_compat.c` 从
-     客户端侧兜底，§3.6）；
+   - ~~`glEGLImageTargetTexStorageEXT` 入口存在但未真正挂接 dmabuf，建议实现或
+     不要声明 `GL_EXT_EGL_image_storage`~~ → **本仓库已原生补齐（§9，2026-09-16），
+     该项仍建议厂商在源码层实现（当前是二进制补丁，驱动升级后需重打）**；
    - reserved-mem（VRAM）分配器的 `.GetSGT` 为空桩，导致标准 `map_dma_buf`
      导入必然失败；
    - 解码 surface 池整体按"一块连续显存"申请，在可见窗口碎片化时整组回退到
@@ -959,11 +1002,11 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
      报的是 Xorg 默认的 `mesa`）。否则凡经 `pkexec`/纯净环境启动的 WebKit、
      Chromium、GTK 程序都会让 glvnd 回落到 Mesa 而崩溃（§3.5 有完整复现与对照）；
      另外驱动安装脚本应把 `__GLX_VENDOR_LIBRARY_NAME` 同时写入 `/etc/environment`；
-   - **EGL 的 config 集合只覆盖屏幕的 1 个 visual（实测 `0x21`，其余 89 个 visual
-     全部无 config）**，建议覆盖屏幕的全部 visual（至少 24/32 位 TrueColor 全部）。
-     这是「任何用 EGL 给窗口建 surface 的客户端」（Flutter/GTK/Chromium…）在
-     景美栈上黑窗的直接原因，且 `0x21` 恰好是屏幕默认 visual —— 用别的 visual
-     必挂（§3.7）。
+   - ~~**EGL 的 config 集合只覆盖屏幕的 1 个 visual（实测 `0x21`，其余 89 个 visual
+     全部无 config）**，建议覆盖屏幕的全部 visual……~~ → **该项已作废（2026-09-15）**：
+     实测 `eglCreateWindowSurface` **不做** config↔visual 匹配校验，屏幕 **90/90 个 visual**
+     都能建面并完成 `glClear`+`eglSwapBuffers`（见 §3.7 文末更正）。
+     即**不需要**厂商为 EGL 重建 config↔visual 映射表。
 5. **向景美/deepin/飞腾反馈 SCDC 修复**：同源代码在所有 6.x 内核上都有该问题，
    §3.1 的补丁可直接回给厂商。
 6. （可选）纯开源路线：Icenowy / 官方 6.6 内核显示可用但解码用户态仍缺失，
@@ -981,8 +1024,8 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | # | 问题 | 状态 | 关键动作 |
 |---|---|---|---|
 | 7 | 专有 X 驱动无法加载（崩溃） | ✅ 已解决 | `mwv207_drv.so.abi25.fixed3`（ABI + `ScrnInfoRec` 布局双补丁） |
-| 8 | 桌面/应用卡顿：GL 垂直同步等待每帧超时 ~1s | ✅ 已规避 | `/etc/environment` 追加 `vblank_mode=0` |
-| 9 | KWin GL(`gl2`) 合成送显仅 ≈8fps | ✅ 已规避 | dconfig `user_type=4`（XRender 合成，实测 47–60fps） |
+| 8 | 桌面/应用卡顿：GL 垂直同步等待每帧超时 ~1s | ✅ **已修复（内核参数）** | `drm.vblankoffdelay=0`：vblank 中断不再被内核自动关闭 → 1.000 FPS → ~14,000 FPS（详见 §8.9） |
+| 9 | KWin GL(`gl2`) 合成送显仅 ≈8fps | ✅ 已规避 | dconfig `user_type=4`（XRender 合成，实测 60fps；vblank 修复后仍如此，详见 §8.9） |
 | 10 | 任务栏（dde-shell）掉帧 | ✅ 已规避 | `/usr/bin/dde-shell` 包装：GLX/EGL 改走 Mesa(CPU) |
 
 **结论**：专有 DDX 正常工作、GL 应用硬件加速可用（1.3–1.8 万 FPS）；仍有两类厂商驱动缺陷只能绕过（§8.5）。
@@ -992,10 +1035,11 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | 位置 | 改动 | 原因 | 回退 |
 |---|---|---|---|
 | `/usr/lib/xorg/modules/drivers/mwv207_drv.so` | 替换为 `build-cli/mwv207_drv.so.abi25.fixed3`（md5 `297aee83…`） | ① ABI 版本 24→25（`patch_xorg_abi.py`）；② Xorg 1.21 删除 `xf86str.h` 的 `Bool flipPixels` → 其后字段整体 **−8 字节**，回调槽错位使 `xf86DeleteScreen` 误调 LeaveVT，读未初始化的 `pScrn->pScreen` → `NULL+0x48` 段错误（`build-cli/patch_abi_layout.py`） | 从驱动包恢复原始 `mwv207_drv.so` |
-| `/etc/environment` | 追加 `vblank_mode=0` | 厂商 GL 等待 vblank 的事件流约 1Hz：开启垂直同步的 GL 应用恒定 **1.000 FPS**；自写 GLX 测试 20s 内 19 次 ≈1005ms 卡死 | 删除该行（备份：`/etc/environment.bak-20260915-113720`） |
+| `/etc/tmpfiles.d/drm-vblank.conf` + `/etc/systemd/system/drm-vblank-fix.service` | 每次开机把 `drm` 模块参数 `vblankoffdelay` 写为 **0** | **缺陷#1 的根治**：内核默认在最后一个 vblank 使用者释放后 5000ms 关闭 vblank 中断，厂商驱动无法重新使能 → 客户端等待永远超时（1s）。写 0 = 永不自动关闭（见 §8.9） | `sudo systemctl disable --now drm-vblank-fix.service`；`rm /etc/systemd/system/drm-vblank-fix.service /etc/tmpfiles.d/drm-vblank.conf`；`echo 5000 > /sys/module/drm/parameters/vblankoffdelay` |
+| `/etc/environment` | 追加 `vblank_mode=0` | **缺陷#1 的旧规避**（已被 §8.9 的内核修复取代，可保留作双保险） | 删除该行（备份：`/etc/environment.bak-20260915-113720`） |
 | `/etc/profile.d/zz-vblank.sh` | 新增 `export vblank_mode=0` | 同上，覆盖终端/命令行启动的 GL 程序 | `sudo rm /etc/profile.d/zz-vblank.sh` |
 | dconfig `org.kde.kwin.compositing:user_type` | `1`(OpenGL) → **`4`**(XRender) | 同款应用 1920×1080 录屏逐帧去重实测：`gl2` 合成 **40/301 帧（≈8fps）** vs `XRender` **237/301（≈47fps）** | `dde-dconfig set -a org.kde.kwin -r org.kde.kwin.compositing -k user_type -v 1` |
-| `/usr/bin/dde-shell` | 改为包装脚本（原厂二进制备份为 `dde-shell.real`，md5 `03e036d3…`） | 任务栏是 Qt Quick 高频重绘，走厂商 GL 明显掉帧；且厂商 EGL 建窗口 surface 必然失败（§3.7）。包装内设 `__GLX_VENDOR_LIBRARY_NAME=mesa`、`__EGL_VENDOR_LIBRARY_FILENAMES=…/50_mesa.json`、`QT_XCB_GL_INTEGRATION=xcb_glx` → GLX/EGL 全部改走 Mesa(CPU) | `sudo bash ~/fix_dock_mesa.sh revert` 后注销重登 |
+| `/usr/bin/dde-shell` | 改为包装脚本（原厂二进制备份为 `dde-shell.real`，md5 `03e036d3…`） | 任务栏是 Qt Quick 高频重绘，走厂商 GL 明显掉帧（§8.10：`gl2` 仅 1–11 fps）。~~且厂商 EGL 建窗口 surface 必然失败（§3.7）~~ → 该 EGL 归因已于 2026-09-15 实测**推翻**（§3.7 文末更正）。包装内设 `__GLX_VENDOR_LIBRARY_NAME=mesa`、`__EGL_VENDOR_LIBRARY_FILENAMES=…/50_mesa.json`、`QT_XCB_GL_INTEGRATION=xcb_glx` → GLX/EGL 全部改走 Mesa(CPU) | `sudo bash ~/fix_dock_mesa.sh revert` 后注销重登 |
 
 > 说明：以上改动**均在系统层，不涉及本仓库源码**；`/usr/share/X11/xorg.conf.d/10-mwv207.conf`
 > 保持原厂默认（实验用的 `Option "TearFree" "off"` 已还原）。
@@ -1024,8 +1068,10 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | `/usr/bin/kwin_x11` 包装（只让合成器 `vblank_mode=1`） | `gl2` 送显仍 0.5fps ✗（包装已卸载） |
 | 单独 `__EGL_VENDOR_LIBRARY_FILENAMES=…50_mesa.json` | EGL 报错依旧 ✗（需与 `__GLX_VENDOR_LIBRARY_NAME=mesa` 同时生效才见改善） |
 | `__GL_SYNC_TO_VBLANK=0` / `GL_SYNC_TO_VBLANK=0` | 厂商 GL **不识别** ✗（只有 `vblank_mode` 有效） |
-| DDX `EnablePageFlip` / `VSync` 选项 | **未测**（如需可加 `Option` 后重启 X 复测） |
+| DDX `EnablePageFlip` / `VSync` 选项 | **已测 `EnablePageFlip off`**：gl2 合成 1.2 → **11.2 fps**（9 倍提升但仍远低于 XRender 的 60）；再叠加 `TearFree off` 反而降到 1.4 fps。`VSync` 未单独测。结论：**DDX 选项无法把 gl2 修到可用**（详见 §8.10） |
 | 抓崩溃 shim（`/usr/local/lib/libsegv_real.so`）、登录自检、lightdm 包装 | 仅诊断用，**均已清理** ✓ |
+| 怀疑"DDX 只注册了 `Solid`，2D 全走软件回退" | **误判，已排除** —— 日志完整读取后实际注册 5 项：`Solid` / `Copy` / `Composite (RENDER)` / `UploadToScreen` / `DownloadFromScreen`，2D 加速是齐的。（早先误判原因：日志每行都以 `[时间]` 开头，用 `sed '/Driver registered support/,/^\[/p'` 会在下一行就截断） |
+| 怀疑 EXA 结构体在两版 Xorg 间位移导致部分注册失败 | **已排除** —— `exa.h` 的 `ExaDriverRec` 在 1.20.4 与 21.1.16 间布局完全一致（仅注释错别字与 `slave`→`secondary` 改名） |
 
 > ⚠️ 教训：**不要用 `sed`/文本编辑工具处理 ELF 二进制**。曾误将一行 `export` 插入
 > `/usr/bin/dde-shell` 开头（81 字节），内核无法执行该文件，导致桌面壳与任务栏消失；
@@ -1037,9 +1083,11 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 1. **GL 客户端垂直同步等待超时**：vblank 事件流约 1Hz（而非 60Hz）。GPU 中断本身正常
    （2s 内 532 次 ≈266Hz）。表现：任何开启垂直同步的 GL 应用恒定 1.000 FPS。
 2. **GL 合成路径性能异常**：同场景 `gl2` 合成 8fps vs `XRender` 47fps，约为 1/6。
-3. **印证 §3.7**：厂商 EGL 的 config 集合只覆盖 1 个 visual（实测 `0x21`），
-   任何用 EGL 给窗口建 surface 的客户端都会报 `Failed to initialize EglDisplay`
-   （本机 `dde-shell` 每次会话复现）。
+3. ~~**印证 §3.7**：厂商 EGL 的 config 集合只覆盖 1 个 visual（实测 `0x21`），任何用
+   EGL 给窗口建 surface 的客户端都会报 `Failed to initialize EglDisplay`……~~
+   → **本条已撤回（2026-09-15）**：`egl_force_visual.c` 实测 **90/90 个 visual 均可建面 +
+   渲染 + 交换**（§3.7 文末更正），EGL 表面本身不是瓶颈。`dde-shell` 历史上的
+   `Failed to initialize EglDisplay` **真因待重查**（现已由 Mesa 包装规避）。
 
 ### 8.6 保留脚本（家目录）
 
@@ -1075,3 +1123,345 @@ vainfo | head -8
   | `~/feel.sh` 下任务栏/启动器动画 | 明显顺滑 | `sudo bash ~/fix_dock_mesa.sh revert` |
 
 - DDX 的 `EnablePageFlip` / `VSync` 两个选项尚未验证，可作为下一步实验方向。
+
+### 8.9 缺陷#1 的根治：内核 `drm.vblankoffdelay=0`（2026-09-15 晚）
+
+#### 现象指纹
+
+| 观察 | 数值 |
+|---|---|
+| `glxgears`（开启垂直同步） | **前 5 秒 278 FPS → 之后恒定 1.000 FPS** |
+| 自写 GLX 交换测试（20s） | 1758 次交换，其中 **19 次 ≈1005ms** 卡死 |
+| GPU 中断 `jmgpu_int_ctlr` | 2s 内 532 次 ≈266Hz —— **硬件中断本身正常** |
+| 加载了模块参数 `fake_vblank=1` 后 | 驱动运行中自动改回 0，无改善 |
+
+"**恰好 5 秒后崩坏**"是关键指纹：Linux DRM 内核在最后一个 vblank 使用者释放后，
+会等 `drm_vblank_offdelay`（**默认 5000ms**）然后**关闭 vblank 中断**；
+内核文档明确：**该参数设为 0 = 禁用这个延迟关闭（中断长期保持使能）**。
+厂商驱动显然缺少"vblank 中断重新使能"的路径，于是中断一旦被内核关掉就再也回不来，
+后续所有 vblank 等待只能走满超时（1s）——与实测完全吻合。
+
+#### 修复
+
+```bash
+# 查看（root 可读，普通用户不可读）
+sudo cat /sys/module/drm/parameters/vblankoffdelay      # 默认 5000
+# 修复：0 = 永不自动关闭
+sudo sh -c 'echo 0 > /sys/module/drm/parameters/vblankoffdelay'
+```
+
+**持久化（本机采用双保险，见 §8.2）**：
+
+```bash
+# ① tmpfiles（开机早期写入）
+echo 'w /sys/module/drm/parameters/vblankoffdelay - - - - 0' | sudo tee /etc/tmpfiles.d/drm-vblank.conf
+# ② systemd oneshot（等 drm 模块加载后再写一次，防止①时机过早失效）
+sudo bash ~/make_vblank_persistent.sh
+```
+
+#### 修复前后实测对照
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| `glxgears`（开启垂直同步） | **1.000 FPS** ✗ | **13,667 / 14,872 / 14,876 FPS**，二次复测 14,899 / 15,357 FPS ✓ |
+| `glxgears`（`vblank_mode=0`） | 13,800–18,000 FPS | 14,760 FPS（不变）✓ |
+| KWin **XRender** 合成（同款应用 5s 录屏逐帧去重） | 237 / 301（≈47fps） | **301 / 301（60fps 满帧）** ✓ |
+| KWin **gl2** 合成（同款应用） | 40 / 301（≈8fps） | **6 / 301（≈1.2fps）** ✗ 仍不可用 |
+
+#### 结论与边界
+
+- ✅ **缺陷#1 属内核层可控项**，一行参数即根治；`vblank_mode=0` 全局变量从此非必需（本机暂留作双保险）。
+- ⚠️ 修复后 vblank 等待**不再超时，但也不做真正节流**（同步开启仍是上万 FPS）→ 即厂商 GL 的 vsync 仍未真正实现同步语义，仅不再卡死。
+- ❌ **缺陷#2（GL 合成路径）不受此修复影响**：`gl2` 合成仍只有 ≈1.2fps，继续使用 `XRender` 合成（60fps）。两者成因不同，需分别反馈厂商。
+
+#### 复测三连（验证修复是否生效/是否在重启后保持）
+
+```bash
+# ① 应上万 FPS（若为 1.000 FPS 说明参数失效）
+glxgears
+# ② 应 60fps 满帧
+bash ~/feel.sh 6
+# ③ 合成器类型应为 xrender
+qdbus org.kde.KWin /Compositor org.kde.kwin.Compositing.compositingType
+```
+
+### 8.10 缺陷#2（GL/`gl2` 合成送显）专项结论：**DDX 选项无法修复，属厂商侧**
+
+测量方法：KWin 切到 `gl2` 后，用同一段 1920×1080 高速重绘动画录屏 5 秒，逐帧校验和去重
+（每个校验和不同 = 该帧真的被送显）。
+
+| 配置 | 不同画面 / 总帧 | 有效帧率 |
+|---|---|---|
+| 原厂默认（TearFree 默认 on、页翻转 on） | 40 / 301 | ≈8 fps |
+| 内核 vblank 修复后（原厂 DDX） | **6 / 301** | **≈1.2 fps** |
+| `Option "EnablePageFlip" "off"` | **56 / 301** | **≈11.2 fps**（最佳，仍不可用） |
+| `EnablePageFlip off` + `TearFree off` | 7 / 301 | ≈1.4 fps（反而更差） |
+| `/usr/bin/kwin_x11` 包装（合成器单独 `vblank_mode=1`） | — | ≈0.5 fps |
+| 对照：**XRender（CPU）合成** | **301 / 301** | **60 fps** ✓ |
+
+**结论**：
+
+1. 送显路径存在结构性瓶颈：改用"拷贝送显"（关页翻转）能带来 **9 倍** 提升，但仍被卡在 ≈11 fps，
+   而同一台机器上 XRender 的拷贝路径可达 **60 fps 满帧** → 说明瓶颈在**厂商 GL 合成实现本身**
+   （纹理上传/TFP/同步），不是 DDX 的页面翻转策略。
+2. 该现象与缺陷#1（vblank 超时）**相互独立**：内核修复后客户端 GL 从 1.000 → 14,000 FPS，
+   但 `gl2` 合成几乎无变化（8 → 1.2 fps）。
+3. **工程选择**：本机固定使用 `XRender` 合成（60 fps），代价是 KWin 的 **窗口模糊（blur）特效不可用**
+   （blur 需要 GL 合成），其余桌面特效（透明度、缩放、动画）不受影响。
+4. 已排除项见 §8.4：EXA 注册齐全、EXA/`exa.h` 结构体两版一致 → **不是 2D 加速缺失所致**。
+
+**待厂商确认的提问**：`gl2` 合成路径中，窗口纹理的获取（TFP / `glXBindTexImageEXT`）与
+present 是否走了未优化路径？为何同一硬件上"XRender 拷贝"能到 60fps 而"GL 合成"只有 1–11fps。
+
+### 8.11 用户态库反编译专项：推翻 §3.7 归因（2026-09-15）
+
+> 目标：在厂商闭源用户态库上寻找可修的缺陷。结论之一是**此前认定的一个"厂商缺陷"并不存在**。
+> 交付给应用侧的文档见 **`docs/应用侧交付与测试清单.md`**。
+
+#### 可分析性（起点）
+
+| 库 | 大小 | strip | 符号数 |
+|---|---|---|---|
+| `jmgpu_dri.so`（GL 实现） | 4.0 MB | **未 strip** | 完整 |
+| `mwv207/libGLX_mwv207.so.1.2.0` | 789 KB | **未 strip** | 完整 |
+| `mwv207/libEGL_mwv207.so.1.5.0` | 421 KB | **未 strip** | 动态 402 / 全部 1073 |
+
+工具链：`objdump` / `readelf` / `nm` / `objcopy` / `patchelf` / `radare2` 均可用（本机）。
+厂商 EGL **不是** `mesa-mwv207` 构建的（那个 Mesa 22.3.7 分支自带独立 `mwv207` gallium 驱动）；
+厂商库是自研实现，UOS GCC 8.3.0 编译，走 DRI3/Present + Wayland，`NEEDED: libdrm_jmgpu.so.1.0.0`。
+
+#### 决定性实验：`egl_force_visual.c`（本轮新增）
+
+**方法**：无视 config 报告的 visual，直接拿 `config[0]` 到屏幕**全部 90 个 visual** 上
+`eglCreateWindowSurface`，并真正执行 `eglMakeCurrent` + `glClear` + `eglSwapBuffers`。
+
+```
+厂商 EGL：共 40 个 config，统一使用 config[0]（其 EGL_NATIVE_VISUAL_ID=0x21）
+visual   depth class       surface  eglGetError  渲染(glClear+swap)
+  0x21     24    TrueColor   OK       -            OK
+  0x22     24    DirectColor OK       -            OK
+  0x6c     32    TrueColor   OK       -            OK     ← Flutter/GTK 偏好的 32 位 ARGB
+  ...（其余 87 个同样 OK）...
+小结: visual 总数 90，surface 建立失败 0，可完整渲染 90
+```
+
+（复现：`gcc -O2 -o /tmp/egl_force_visual egl_force_visual.c -lEGL -lX11 -lGLESv2 && /tmp/egl_force_visual`）
+
+**结论**：`eglCreateWindowSurface` **不做 config↔visual 匹配校验**，任何 visual 都能建面并正常
+渲染/交换。`EGL_NATIVE_VISUAL_ID` 的"显示级返回 `0x21`"只是**查询语义的简化**，不是能力限制。
+
+**§3.7 的「EGL config 只覆盖 1 个 visual → 黑窗」归因据此作废**（详见 §3.7 文末更正块）；
+`jm_egl_visual_probe` 的"必然失败"是其**自身推断**（匹配失败即跳过，从未真正试建面）。
+**黑窗问题回到未定位状态**，需重新排查。
+
+#### 附带更正：`EGL_EXT_platform_x11` 其实存在
+
+`eglQueryString(display, EGL_EXTENSIONS)` 查不到它 → 它是**客户端扩展**，必须用
+`eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS)` 查询，实测该串含
+`EGL_KHR_platform_x11` / `EGL_EXT_platform_x11`。即应用侧用
+`eglGetPlatformDisplayEXT(EGL_PLATFORM_X11_KHR, …)` 是可行的。
+
+#### 已摸清的关键地址（`libEGL_mwv207.so.1.5.0`，供后续补丁使用）
+
+| 项 | 地址/值 |
+|---|---|
+| `eglGetConfigs` / `eglChooseConfig` / `eglGetConfigAttrib` | `0x18e70` / `0x19038` / `0x19d70` |
+| `eglCreateWindowSurface` → `veglCreatePlatformWindowSurface` | `0x20570` → `0x1fac8`（attrib 解析 @`0x1fb88`） |
+| config 记录步长 / 基址 | **220 B** / `display+96`（索引 1-based） |
+| `EGL_NATIVE_VISUAL_ID`(0x302E) 分支 | @`0x1a0a8`（**只传 display**，与 config 无关） |
+| `EGL_NATIVE_VISUAL_TYPE`(0x302F) 分支 | @`0x19e70`（读 `config+48`，是位深/格式代码，非 visual id） |
+| EGL 错误码 `0x3009`(BAD_MATCH) 等 | 见 `re` 记录；全库 `cmp #0x21`/`#0x22` 仅 3 处，均与 visual 白名单无关 |
+
+> 教训（与 §8.4 同源）：**探针/脚本自身的推断必须用"真正执行目标操作"的对照实验验证**。
+> 本轮两条错误结论（EGL visual、`EGL_EXT_platform_x11`）都源于"用查询结果推断能力，而没有真做一次"。
+
+### 8.12 应用侧反馈闭环与 `glEGLImageTargetTexStorageEXT` 架构结论（2026-09-15 晚）
+
+应用侧反馈（见 `docs/应用侧测试反馈_20260915.md`）确认：
+
+1. **黑窗根因闭环**：purelive 历史黑窗**不是** EGL/visual 问题（与 §8.11 一致），而是**窗口未被 KWin
+   接管（`managed=0`，不受合成、不可见）**——窗口管理/合成层问题，应用侧以「WM 接管自愈」修复后消除。
+   `Could not wrap embedder supplied frame-buffer` 从「待定位」改标「**已解决**」。应用侧清单 §6 已同步。
+2. **storage 函数：原生驱动未实现，glvnd 空桩**（反编译 + 运行时 `dladdr` 实测）：
+   - `glXGetProcAddress("glEGLImageTargetTexStorageEXT")` 返回**非 NULL**，但落点是 glvnd
+     `libGLdispatch.so.0` 的分发桩，**不在** `libGLX_mwv207.so` / `jmgpu_dri.so`；
+   - `jmgpu_dri.so` 内**无** `glEGLImageTargetTexStorageEXT` 符号**也无**其函数名字符串；
+     其 `GL_DISPATCH_TABLE` 仅 152 字节（19 槽），非全量分发表；
+   - 原生栈 `glGetString(GL_EXTENSIONS)` **不广告** `GL_EXT_EGL_image_storage`（实测 `advertised = NO`）。
+   → 证实 §3.8「两处缺陷属未实现，无法小补丁修复」：要修得往 `jmgpu_dri.so` getproc 注入名字+重定向，
+   比 glvnd 拦截层（兼容层）更侵入。
+3. **系统兼容层已安装**（2026-09-15）：`/usr/lib/aarch64-linux-gnu/libjm_gl_compat.so` 就位；
+   装后 `glxinfo | grep GL_EXT_EGL_image_storage` 可见该扩展。standalone mpv/Chromium 用
+   `LD_PRELOAD=.../libjm_gl_compat.so LIBVA_DRIVER_NAME=jmgpu` 即零拷贝直通。
+4. **对厂商真正诉求**：实现 `glEGLImageTargetTexStorageEXT`（复用 OES 的 dmabuf 绑定即可），实现后
+  兼容层可退役；GL vsync 不真正节流、gl2 合成 1–11fps 仍属厂商合成缺陷（§7.2 / §8.10）。
+
+> **2026-09-16 更新**：上面第 4 条的 `glEGLImageTargetTexStorageEXT` **已在本轮原生补齐**（§9），
+> 兼容层可退役。以下 §9 记录全部过程、代价与回退方式。
+
+---
+
+## 9. 2026-09-16 续：反编译补齐两处「厂商需修」缺陷（原生 `GL_EXT_EGL_image_storage` + 内核第二处 `.GetSGT` 空桩）
+
+> 承接 **§3.6 / §3.8 / §4.4**（`glEGLImageTargetTexStorageEXT` 属"未实现，只能客户端兜底"）与
+> **§7.4 厂商缺陷清单**。本轮把两处缺陷**直接在二进制/内核源码层补齐**，兼容层（`jm_gl_compat.c`）因此可退役。
+
+### 9.1 结果概览
+
+| # | 缺陷 | 位置 | 状态 |
+|---|---|---|---|
+| A | Dmabuf（外部 dmabuf **导入**）分配器 `.GetSGT` 是无条件错误返回 | 内核 `jmgpu_crosstab.c` | ✅ **已实现**（源码，`dkms build` 通过） |
+| B | `glEGLImageTargetTexStorageEXT` 原生未实现（glvnd 空桩 → 纹理恒全零） | 厂商 `jmgpu_dri.so` + `libEGL_mwv207.so` + `libGLX_mwv207.so` | ✅ **已原生修复**（三库字节补丁，实测通过） |
+
+**端到端证明**（**无 `LD_PRELOAD`、系统原版未打补丁 `mpv` 0.40**）：
+
+```
+[vo/gpu/opengl] Initializing GPU context 'x11egl'          ← mpv 默认走的是 EGL，不是 GLX
+[vo/gpu/vaapi]  Using EGL dmabuf interop via GL_EXT_EGL_image_storage
+$ ./test_passthrough.sh -s 720p
+  直通(vaapi): 1280x720 avg=(255,0,64) 绿色占比 0.0%
+  ==> 直通【正常】：画面是片源原色(红)
+  mpv 实际使用: Using hardware decoding (vaapi)
+```
+
+### 9.2 缺陷 A（内核）：Dmabuf 分配器的 `.GetSGT` 空桩
+
+§3.3 / §7.4 只记录了 **reserved-mem**（VRAM）分配器的 `.GetSGT` 空桩。反编译时发现**还有第二处**：
+`jmgpu_crosstab.c` 的 Dmabuf 分配器（`dma_buf_attach()` / `dma_buf_map_attachment()` 导入外部 dmabuf）
+其分配器表里 `_DmabufGetSGT` 也是**无条件错误返回**，而 `Mdl->priv`（`j9_camaron`）**本来就持有**
+`j9_prismatoid()` 从 `dma_buf_map_attachment()` 得到的真实 `sgt`：
+
+```440:447:jmgpu_crosstab.c
+static j9_duopoly
+_DmabufGetSGT(IN jmkALLOCATOR Allocator,
+	      IN PLINUX_MDL Mdl,
+	      IN jmtSIZE_T Offset, IN jmtSIZE_T Bytes, OUT jmtPOINTER *SGT)
+{
+
+	return J9_HANDLE_J9MENU_HOMOGONIES;
+}
+```
+
+> `dma_map_sgtable()` 只改 `sg_dma_address()`，`sg_page()/offset/length` 仍是导出方的真实页，
+> 所以子区间可以安全地重新切片。
+
+**修复**（`jmgpu_crosstab.c`）：按 GFP 分配器 `j9_lactant()` 的同款约定派生 `[Offset, Offset+Bytes)`
+子区间 sg_table ——
+
+1. 单个源 scatterlist 条目所描述的区域物理连续，因此每个源条目最多对应**一个**派生条目
+   （`sg_set_page(d, sg_page(s), take, s->offset + in_off)`），`nents` 上界即 `orig->orig_nents`；
+2. 结果缓存在 `j9_camaron->sub_sgt`（同区间可复用），在 `j9_coryphee`（Free）里 `sg_free_table()`，不泄漏；
+3. 越界/空页/无条目一律 `goto fail` 释放后返回错误，绝不返回半个表。
+
+**影响面**：修复前 `jmkOS_MemoryGetSGT()` 对导入缓冲必然失败，任何需要 sg_table 的消费方
+（`DRM_JM_GEM_XFER_RECT` ioctl 喂 2D/解码引擎、dma-buf core 经 `j9_cibarious()`）都用不了导入缓冲。
+修复后语义与系统内存分配器（`j9_lactant`）一致。
+
+> 部署状态：**已 `dkms build --force` 编译通过（含 `-Werror`），未 `install`、未重启**，运行态模块未变。
+
+### 9.3 缺陷 B（用户态）：把 `glEGLImageTargetTexStorageEXT` 接回可用的 OES 实现
+
+#### 9.3.1 两条**互不相通**的入口解析链（本轮关键发现）
+
+§3.8 只看了 `jmgpu_dri.so` 的 getproc 表，因此得出"必须新增代码段 + trampoline"的结论。
+本轮把**实际解析链**钉死为两条（`jm_gl_storage_test.c` 实测 mpv 走的是 ②EGL 链）：
+
+**① GLX 链**（`libGLX_mwv207.so.1.2.0`）
+
+```
+glvnd(libGL.so.1) → libGLX.so.0 → 厂商 __glvndGetProcAddress(0x6ee68)
+  → glXGetProcAddress(0x28360) → glXGetProcAddressARB(0x278d8)
+     第一优先：glExtApiAliasTbl @0xaaa08
+               65 条 **16 B `{char *name; void *func}`**，NULL 名结尾
+               （name / func 各 1 条 R_AARCH64_RELATIVE 重定位）
+     回退：    由 GOT 提供表基址/count 的 16 B `{name, func}` 表（表内名字已剥掉 "gl"）
+```
+
+**② EGL 链**（`libEGL_mwv207.so.1.5.0`；**mpv / Chromium / GTK 实际走这条**）
+
+```
+libEGL.so.1 → 厂商 eglGetProcAddress(0x17700)
+  名字以 "egl" 开头 → _LookupProc(表, name, skew=0)
+  否则以 "gl"  开头 →
+      桌面 GL(EGL_OPENGL_API) 分支：
+        1) 先查 "forward_" + name  → _LookupProc(forward 表 @0x67668, skew=10)
+        2) 失败 → LookupGLExtAliasApiProc(name)     ← 名字**原地改写**
+        3) 再用（改写后的）name 查 _LookupProc 表 @0x63450 → @0x65838（skew=2）
+      ── 第 2 步的 glExtApiAliasTbl @0x67d10：214 条 **24 B `{pattern; u64 pad; replacement}`**
+         命中则把 name 改写为 replacement；`replacement == 0` 表示"砍掉末尾 3 字符"
+         （`glTexImage3DOES` → `glTexImage3D`）
+      ── `_LookupProc` 表是 24 B `{char *name; void *func; u64 pad}`（**func 在 +8**，
+         文件内为 0、由运行时填充），按 `name + skew` 比较（skew=2 ⇒ 表内名字已去掉 "gl"）
+```
+
+**由此得到可行补丁思路**：不动函数入口、不加代码段，只做两件"数据"事 ——
+**扩展广告**（`__glExtension` name_ptr 指向的字符串）与**名字改写**（别名表 pattern/replacement）。
+
+#### 9.3.2 补丁设计（`patch_gl_storage.py`）
+
+| # | 库 | 改动 | 为什么可行 |
+|---|---|---|---|
+| 1 | `jmgpu_dri.so` | 把已广告、且与 `GL_ARB_texture_rectangle` 重复的 `GL_EXT_texture_rectangle`（24 B）**等长**替换为 `GL_EXT_EGL_image_storage`（24 B） | 等长 ⇒ 扩展串总长不变、无溢出；`__glExtension[66]` 的 flags 原样保留 ⇒ **必然被广告**（该串仅被 1 条重定位引用：`r_offset=0x37c4a8`） |
+| 2 | `libGLX_mwv207.so` | 牺牲早已废弃的 SGIX 视频通道别名 `glXQueryChannelDeltasSGIX`（记录 @0xaad98）：名字串（@0x6ffe0，槽位 32 B）原地改写为 `glEGLImageTargetTexStorageEXT`；其 func 相对重定位 addend 由 `0x24098` 改为本库自带 `glEGLImageTargetTexture2DOES`（`0x59970`，glapi 分发桩，与 OES 路径同一实现） | 别名表是**唯一可扩展**的 name→func 表，且表项 func 是 RELATIVE 重定位 ⇒ 只需改 addend |
+| 3 | `libEGL_mwv207.so` | 牺牲 `glGetObjectParameterfvARB`（记录 @0x688c8）——该记录的 **replacement 与 pattern 是同一个字符串 ⇒ 改写恒等（空操作）⇒ 牺牲零功能损失**；把它的 pattern / replacement 两条重定位 addend 分别改指新串 `glEGLImageTargetTexStorageEXT` / `glEGLImageTargetTexture2DOES`；两条新串写入 `.rodata` 里 1030 B 零填充区（`0x3f9a0` / `0x3f9c0`） | 改写后名字变成 `glEGLImageTargetTexture2DOES`，而 `_LookupProc` 表 @0x63450（记录 @0x655e0）**已存在**该条目（func 运行时填充）⇒ 直接命中真实 OES 实现 |
+
+三处改动**全部是"改字节 / 改既有重定位 addend"**：不新增或移动任何节、不增删重定位、文件长度不变
+（脚本内置两项断言：文件尺寸不变 + 每次写入前校验目标是空区/唯一重定位）。
+
+> ⚠️ 本轮踩坑（已修）：Python `bytearray` 的**切片赋值长度不等会改变文件长度**，从而位移其后所有
+> 偏移 → 生成的 `.so` 直接损坏（`readelf` 报 `no .dynamic section`、加载即段错误）。
+> 脚本现已统一"等长覆盖 + 文件尺寸断言"。
+
+#### 9.3.3 验证
+
+**A/B 对照探针 `jm_gl_storage_test.c`**（EGL + pbuffer + jmgpu dumb buffer 导出 dmabuf → EGLImage）：
+
+```
+GL_EXT_EGL_image_storage advertised = YES
+GL_OES_EGL_image advertised         = YES
+[eglimg] EGLImage ok (256x128)
+  A) glEGLImageTargetTexture2DOES    level0=256x128  err=0    ← OES 路径（基准）
+  B) glEGLImageTargetTexStorageEXT   level0=256x128  err=0    ← 补丁前为 0x0（空桩）
+```
+
+即 **B 与 A 行为完全一致**；补丁前后唯一差别就是"纹理被真正挂上了 dmabuf"。
+
+**mpv 端到端（无 `LD_PRELOAD`、系统原版）**：见 §9.1 的 `x11egl` +
+`Using EGL dmabuf interop via GL_EXT_EGL_image_storage`，且 `test_passthrough.sh` 判定直通正常、画面为片源原色。
+
+**回归检查**：`glxinfo -B` → `direct rendering: Yes` / `Jingjia JM9100` / `GL 4.0 V1.7.0`；
+扩展总数仍 **142**、扩展串仍 **3535 B**（等长替换的直接结果）。
+
+### 9.4 代价清单（精确到"牺牲了什么"）
+
+| 牺牲项 | 影响评估 |
+|---|---|
+| `GL_EXT_texture_rectangle` 不再广告 | 与 `GL_ARB_texture_rectangle` **功能重复**，ARB 版仍在广告；现代应用查 ARB 名 |
+| `glXQueryChannelDeltasSGIX` 不再能由 getproc 解析 | SGIX **视频通道**（录像/缩放）遗留扩展，1998 年后无使用者；同组其它 SGIX 名仍在 |
+| `glGetObjectParameterfvARB` 别名改写消失 | 该改写**本来就是空操作**（replacement == pattern），**零功能变化** |
+
+### 9.5 部署与回退
+
+```bash
+cd ~/Desktop/Git/jm9100
+sudo ./install_gl_storage.sh            # 生成补丁 + 备份原件 + 安装三库
+sudo ./install_gl_storage.sh status     # 查看三库是否已打补丁（含 md5 对照）
+sudo ./install_gl_storage.sh revert     # 从 /var/backups/jm9100-glstorage/ 还原原件
+```
+
+脚本**始终从原件（备份）生成补丁**（幂等），并自动同步硬链接副本 `/usr/lib/dri/jmgpu_dri.so`。
+
+> 生效范围：替换后**新启动**的进程才加载补丁版（已运行进程仍持有旧 inode）；建议注销重登
+> （`Xorg` / 合成器亦会重新加载）。
+
+### 9.6 对既有文档的更正
+
+1. **§3.8 / §4.4 的「两处缺陷属未实现，无法小补丁修复」需收敛为**：*在 `jmgpu_dri.so` 的 getproc
+   表上*确实无法小补丁（表已满、func 运行时填充、需新增重定位）；但把修复落在
+   **`libEGL` / `libGLX` 的别名表（名字改写）** 上就只需改数据与既有 addend —— 本轮已完成。
+2. **§7.4 第 3 条可关闭**（`glEGLImageTargetTexStorageEXT` 未实现 → 兼容层兜底）：原生已可用，
+   `jm_gl_compat.c`（`LD_PRELOAD`）降级为**可选冗余**，可整体退役。
+3. §3.6 兼容层的保留价值：仅剩"更老/特殊应用直连 `glXGetProcAddress` 且自行判缓存"的边角场景；
+   日常播放（mpv / Chromium / GTK）已不再需要。
+4. 新增交付物见 §6 清单（`patch_gl_storage.py` / `install_gl_storage.sh` /
+   `jm_gl_storage_test.c` / `jm_gl_ext_dump.c`）。
