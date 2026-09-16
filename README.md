@@ -18,6 +18,7 @@
 | 7 | X11 呈现错位（专有 X 驱动无法加载） | ✅ | `patch_xorg_abi.py` + `patch_abi_layout.py`（ABI 24→25 + `ScrnInfoRec` 布局偏移），见 **§8** |
 | 8 | `glEGLImageTargetTexStorageEXT` **原生未实现**（VA-API 零拷贝必须挂 `LD_PRELOAD` 兼容层） | ✅ **已原生修复**（兼容层**已卸载**，§9.7） | `patch_gl_storage.py`：`jmgpu_dri.so` 扩展广告 + `libEGL_mwv207.so` / `libGLX_mwv207.so` 入口别名，见 **§9** |
 | 9 | 内核 Dmabuf（外部 dmabuf 导入）分配器 `.GetSGT` **空桩** → 导入缓冲永远取不到 sg_table | ✅ | `jmgpu_crosstab.c` `_DmabufGetSGT()`，见 **§9.3** |
+| 10 | 内核用户态接口加固：`DRM_JM_GEM_XFER_RECT` 范围校验**整数溢出** + 第二缓冲未校验；三处分配器 `.Physical` **缺 `Offset` 越界检查** | ✅ | `jmgpu_garbage.c` / `jmgpu_crosstab.c` / `jmgpu_setlayout.c` / `jmgpu_background.c`，见 **§10** |
 
 - 部署流程见 **§4**，日常使用见 **§5**。
 - 历史排查全过程（含大量已排除方案、实验数据）见 `backup/FIXLOG.2026-09-10.md`
@@ -1540,3 +1541,110 @@ DISPLAY=:N XAUTHORITY=... LIBVA_DRIVER_NAME=jmgpu __GLX_VENDOR_LIBRARY_NAME=mwv2
 3. **真实应用只走 EGL**：本机 mpv 的 `--gpu-context` 可选值只有
    `x11egl / wayland / drm`（**没有 GLX context**），实测 `Initializing GPU context 'x11egl'`
    ⇒ §9.3.3 的 EGL 实测已覆盖真实路径。
+
+---
+
+## 10. 2026-09-16 续：内核参数校验与地址翻译加固（代码审计发现）
+
+> 承接 §9 的内核复查（当时为修 `_DmabufGetSGT` 而通读了分配器与 ioctl 路径）。
+> 本节记录审计中发现的**另外 4 处内核缺陷**，全部在用户可触达路径上。
+
+### 10.1 结果概览
+
+| # | 缺陷 | 位置 | 性质 | 状态 |
+|---|---|---|---|---|
+| 1 | `DRM_JM_GEM_XFER_RECT` 的矩形范围校验用 32 位运算，**可整数溢出**；且第二个缓冲的 `moffset` **完全未校验** | `jmgpu_garbage.c` `j9_handle_j9ma_arecaceous` | 用户可触达 → 2D/解码引擎越界访问显存 | ✅ 已修 |
+| 2 | Dmabuf 分配器 `.Physical`：`pagearray[index]` **越界读** | `jmgpu_crosstab.c` `j9_predeserving` | 用户可触达（`args->offset`） → 内核堆越界读 + 把垃圾地址交给引擎 | ✅ 已修 |
+| 3 | reserved-mem 分配器 `.Physical`：`res->start + Offset` **无上界** | `jmgpu_setlayout.c` `j9_handle_j9ma_tongueless` | 同上；且与**同文件**的 `.Mmap`（有 `Offset+Bytes > res->size` 检查）自相矛盾 | ✅ 已修 |
+| 4 | DMA-coherent 分配器 `.Physical`：`dmaHandle + Offset` **无上界** | `jmgpu_background.c` `j9_pastosity` | `j9_settled()` 里只有 `JMM_kASSERT`（发行构建下不生效） | ✅ 已修 |
+
+统一原则：**`.Physical` 必须和同一分配器的 `.Mmap`/`.GetSGT` 一样严格**；
+`jmgpu_throws.c`（`j9mirror_outgambled`）与 `jmgpu_marketing.c`（`j9_gymnurine`）本来就是有界的，
+其余三处属遗漏。
+
+### 10.2 缺陷 1（重点）：XFER_RECT 的整数溢出
+
+原实现：
+
+```c
+if ((args->offset >= size) ||
+    ((size - args->offset) <
+     (args->vstride * (args->height - 1) + args->width)))   /* 32 位运算 */
+        j9_recaution(J9_HANDLE_J9MENU_HOMOGONIES);
+```
+
+`struct drm_jm_gem_xfer_rect` 的 `offset/vstride/mstride/width/height/moffset` **全是 `__u32`**，
+且全部由用户态提供。因此：
+
+1. `args->vstride * (args->height - 1) + args->width` 在 32 位下**回绕** ——
+   例如 `vstride=0x40000000, height=5` 时乘积恰好回绕成 `0`，比较通过，而引擎实际会按
+   `vstride*(height-1)+width` 行走（远超缓冲）；
+2. `height == 0` 时 `height - 1` 下溢成 `0xFFFFFFFF`，旧代码只是"碰巧"靠巨大值把它挡下；
+3. **`mhandle`/`moffset` 分支根本没有任何范围检查** —— `moffset` 直接进入
+   `jmkVIDMEM_NODE_GetSGT()`，而 `mstride/width/height` 会决定该 SGT 上的一次 DMA 传输。
+
+修复：改用 64 位运算、显式拒绝 `height == 0`（其行为与原码一致——原码也必然报错），
+并对第二个缓冲同样做 `moffset + mstride*(height-1) + width ≤ msize` 的校验。
+
+> 刻意**保留 `width == 0` 通过**：旧代码下 `width=0,height=1` 是"成功但无操作"，
+> 若厂商 2D 路径偶发这种调用，收紧会造成回归；而下面的范围公式对 `width=0` 仍偏保守（安全）。
+
+### 10.3 缺陷 2–4：三处 `.Physical` 的越界翻译
+
+调用链：`DRM_JM_GEM_XFER_RECT.offset`（用户态）
+→ `jmkVIDMEM_NODE_GetGPUPhysical()` → `allocator->ops->Physical(Allocator, Mdl, Offset, &phys)`
+→ `xfer.vramphys` → 2D/解码引擎寄存器。
+
+| 分配器 | 修前 | 修后 |
+|---|---|---|
+| Dmabuf（`j9_predeserving`） | `buf_desc->pagearray[Offset / PAGE_SIZE]` **无界** | `index >= npages` → 返回 `J9_HANDLE_J9MENU_HOMOGONIES` |
+| reserved-mem（`j9_handle_j9ma_tongueless`） | `res->start + Offset` | `Offset >= res->size` → 报错（与同文件 `.Mmap` 对齐） |
+| DMA（`j9_pastosity`） | `mdlPriv->dmaHandle + Offset` | `Offset >= Mdl->numPages << PAGE_SHIFT` → 报错 |
+
+三处都不影响合法调用：合法 `Offset` 必然 `< 缓冲区字节数`，检查不会触发。
+
+### 10.4 验证与部署
+
+```bash
+./sync_dkms.sh build     # dkms build(-Werror 通过) + install + update-initramfs + 指纹校验
+# 磁盘模块    srcversion: 0167E828EB8B4BFB60CE487
+# initramfs  srcversion: 0167E828EB8B4BFB60CE487   → 校验通过
+```
+
+- `dkms build` 在 `-Werror` 下**零告警零错误**；
+- initramfs 已含新模块（重启与 `modprobe` 都会用新的）；
+- **重启后复验（2026-09-16）**：
+
+| 检查项 | 结果 |
+|---|---|
+| 模块指纹 | `running = disk = initramfs = 0167E828EB8B4BFB60CE487` ✅ |
+| 桌面 / 会话 | lightdm active、`kwin_x11` 在、`DISPLAY=:0` ✅ |
+| GL | `direct rendering: Yes` / `Jingjia JM9100` / `GL 4.0 V1.7.0` ✅ |
+| 合成器 | `xrender`（§8 既定）✅ |
+| 硬解 | `vainfo` 加载正常，H264 VLD 等 ✅ |
+| VA-API 零拷贝直通 | `直通(vaapi) avg=(255,0,64)` 绿色占比 `0.0%`，`Using hardware decoding (vaapi)` ✅ |
+| **2D/传输路径**（本轮改动作用域） | `va_export_probe`：`vaPutImage`/`vaGetImage` 均 success、**`pattern match=8160 mismatch=0`**、`PRIME_FD_TO_HANDLE rc=0` ✅ |
+| dmabuf 导出→同驱动导入→释放 | 500 次 ×1MB，失败 0；前后最大可分配均 512MB（无泄漏）✅ |
+| 内核日志 | 0 个 `BUG:` / `Call trace` / oops / panic；`jmgpu` 初始化正常 ✅ |
+
+> 说明：2D/传输路径复验很关键 —— 缺陷 1 改的正是该 ioctl 的校验，
+> `pattern match=8160 mismatch=0` 证明**加固没有影响合法调用**。
+>
+> 另注（与本轮无关的既有现象）：`dmesg` 有
+> `jmgpu: module verification failed: signature and/or required key missing - tainting kernel`
+> —— DKMS 已签名（`modinfo` 的 `sig_id: PKCS#7`）但内核未登记对应 MOK 公钥，
+> 仅使内核 taint，不影响加载（Secure Boot 未强制）。
+
+> 说明：缺陷 2–4 的**触发条件是"用户态传入越界 offset"**，正常驱动不会这么做，
+> 因此日常使用不会看到行为变化；它们是"恶意/异常用户态"下的内存安全与
+> 引擎越界防护。缺陷 1 同理——正常矩形全部合法，只是溢出路径被堵死。
+
+### 10.5 本轮**未**修复的项与理由
+
+| 项 | 为什么不动 |
+|---|---|
+| reserved-mem 分配器 `.GetSGT` 仍是空桩 | PCIe BAR 区域**没有 `struct page`**，`dma_map_sgtable()` 无法映射；正确实现需 `devm_memremap_pages`/`ZONE_DEVICE` 级别改造，属厂商设备内存语义范畴（§9.2 已说明当前工作流不需要它） |
+| `DRM_JM_J2D_SEND_CMD` 的 `args->size` 无上界 | 需先审 `j9_handle_insurrecto`→`engine->ops->input_cmds` 的 2D 命令解析器才能定界；盲改会破坏 2D 加速 |
+| `jmgpu_dec: IRQ irq[0] not in use!`（§3.4） | 解码器走轮询/共享 IRQ，硬解实测正常（600 帧 1080p30 仅 0.70s CPU）；补 IRQ 注册风险大于收益，待有负载疑虑时再深查 |
+| gl2 合成 1–11fps、GL vsync 不真正节流 | 在厂商 **GL 用户态**实现内（§8.10），非内核可修 |
+| 解码 surface 池"整块连续申请" | 在厂商 **VA 用户态** `jmgpu_drv_video.so` 内；内核侧已有 `prefer_visible_pool` 系列参数作为缓解 |

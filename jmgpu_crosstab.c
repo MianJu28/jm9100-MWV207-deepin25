@@ -467,6 +467,20 @@ j9_predeserving(IN jmkALLOCATOR Allocator,
 	jmtUINT32 offsetInPage = Offset & ~PAGE_MASK;
 	jmtUINT32 index = Offset / PAGE_SIZE;
 
+	/*
+	 * Bound the page index before touching pagearray[].
+	 *
+	 * pagearray[] holds exactly npages entries, and Offset is user supplied
+	 * (e.g. DRM_JM_GEM_XFER_RECT.offset reaches here through
+	 * jmkVIDMEM_NODE_GetGPUPhysical()).  The vendor code indexed it
+	 * unconditionally, so an out-of-range Offset read past the array and
+	 * handed the resulting garbage to the 2D/decoder engine as a physical
+	 * address.  Every other allocator's .Physical implementation is bounded
+	 * (see j9mirror_outgambled() / j9_gymnurine()); this one now is too.
+	 */
+	if (!buf_desc || !buf_desc->pagearray ||
+	    index >= (jmtUINT32) buf_desc->npages)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	*Physical = buf_desc->pagearray[index] + offsetInPage;
 

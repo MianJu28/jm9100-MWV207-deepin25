@@ -803,6 +803,16 @@ j9_pastosity(IN jmkALLOCATOR Allocator,
 {
 	struct mdl_dma_priv *mdlPriv = (struct mdl_dma_priv *)Mdl->priv;
 
+	/*
+	 * The whole Mdl is one DMA allocation of numPages * PAGE_SIZE, and
+	 * Offset is user supplied (DRM_JM_GEM_XFER_RECT.offset).  j9_settled()
+	 * only guards the equivalent expression with a debug JMM_kASSERT(), so
+	 * enforce it for real here instead of returning an address past the
+	 * allocation.
+	 */
+	if (!mdlPriv || Offset >= (Mdl->numPages << PAGE_SHIFT))
+		return J9_HANDLE_J9MENU_HOMOGONIES;
+
 	*Physical = mdlPriv->dmaHandle + Offset;
 
 	return J9_FLUTTERING;

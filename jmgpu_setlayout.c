@@ -441,6 +441,16 @@ j9_handle_j9ma_tongueless(IN jmkALLOCATOR Allocator,
 			  IN jmtUINT32 Offset, OUT jmtPHYS_ADDR_T *Physical)
 {
 	struct reserved_mem *res = Mdl->priv;
+
+	/*
+	 * Keep .Physical as strict as .Mmap in this same file: j9_pathopsychosis()
+	 * already rejects Offset + Bytes > res->size.  Without this bound a user
+	 * supplied Offset (DRM_JM_GEM_XFER_RECT.offset) was translated into an
+	 * address outside the VRAM pool and handed to the engine.
+	 */
+	if (!res || Offset >= res->size)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
+
 	*Physical = res->start + Offset;
 
 	return J9_FLUTTERING;

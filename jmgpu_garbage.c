@@ -1087,6 +1087,9 @@ static int j9_handle_j9ma_arecaceous(struct drm_device *drm, void *data,
 	j9_aplobasalt xfer;
 	jmk_GALDEVICE gdev;
 	jmtSIZE_T size;
+	jmtSIZE_T msize;
+	jmtUINT64 need;
+	jmtUINT64 mneed;
 	jmtPOINTER msgt = J9_CHYAK;
 
 	gdev = (jmk_GALDEVICE)drm->dev_private;
@@ -1124,14 +1127,38 @@ static int j9_handle_j9ma_arecaceous(struct drm_device *drm, void *data,
 
 	j9_recaution(jmkVIDMEM_NODE_GetSize(kernel, v_node, &size));
 
-	if ((args->offset >= size) ||
-	    ((size - args->offset) <
-	     (args->vstride * (args->height - 1) + args->width)))
+	/*
+	 * Validate both transfer extents before handing them to the engine.
+	 *
+	 * The vendor test computed "vstride * (height - 1) + width" in 32-bit
+	 * arithmetic over user-controlled fields: a crafted vstride/height wraps
+	 * the product to a small value, and height == 0 underflows height - 1, so
+	 * the comparison could succeed while the engine walked far past the
+	 * buffer (VRAM out-of-bounds read/write).  Do the arithmetic in 64-bit,
+	 * reject the underflowing height == 0 case explicitly (it already failed
+	 * before, just via the wrapped comparison), and bound the optional second
+	 * buffer as well - its moffset previously went straight into GetSGT()
+	 * unchecked.  width == 0 is deliberately still accepted: it was a
+	 * successful no-op before, and the extent formula below stays
+	 * conservative for it.
+	 */
+	if (!args->height)
+		j9_recaution(J9_HANDLE_J9MENU_HOMOGONIES);
+
+	need = (jmtUINT64) args->vstride * (args->height - 1) + args->width;
+	if ((jmtUINT64) args->offset + need > (jmtUINT64) size)
 		j9_recaution(J9_HANDLE_J9MENU_HOMOGONIES);
 
 	j9_recaution(jmkVIDMEM_NODE_GetGPUPhysical(kernel, v_node,
 				args->offset, &phys));
 	if (m_node) {
+		j9_recaution(jmkVIDMEM_NODE_GetSize(kernel, m_node, &msize));
+
+		mneed = (jmtUINT64) args->mstride * (args->height - 1) +
+			args->width;
+		if ((jmtUINT64) args->moffset + mneed > (jmtUINT64) msize)
+			j9_recaution(J9_HANDLE_J9MENU_HOMOGONIES);
+
 		j9_recaution(jmkVIDMEM_NODE_GetSGT(kernel, m_node,
 					args->moffset, &msgt));
 	}
