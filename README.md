@@ -2528,3 +2528,83 @@ sudo ./scripts/sync_dkms.sh build
 
 > **先跑 `ldd <厂商库> | grep 'not found'`（坑 1），再确认 `DISPLAY`（坑 2），
 > 最后才碰持久化（坑 3）。** 这三条按顺序做，能省掉本轮 80% 的排查时间。
+
+---
+
+## 15. 2026-09-17 下午：EasyTier 打不开的定位（含一次**失败的自作聪明**）
+
+### 15.1 症状与最终根因
+
+| 项 | 内容 |
+|---|---|
+| **症状** | EasyTier **任务栏图标一闪而过、无窗口**（表现为 C：能弹授权框，输密码后无窗口） |
+| **伴生现象** | `MiniBrowser`（WebKitGTK）**段错误(139)**；`cp`/`update-initramfs` **随机 139** |
+| **最终根因** | **`libglx.so` 被打了"默认 GLX vendor"补丁**（§15.2），导致 jmgpu 显示提交路径等 vblank 超时 ⇒ 内核 `BUG()` ⇒ 依赖显示提交的客户端崩溃 |
+| **修复** | 回退 `libglx.so` + 重启 ⇒ vblank 超时 3 → **0**，EasyTier 恢复 ✅ |
+
+**内核证据链**（本次启动 `dmesg`）：
+
+```
+[CRTC:35:crtc_0] vblank wait timed out
+WARNING at drivers/gpu/drm/drm_atomic_helper.c:1707 drm_atomic_helper_wait_for_vblanks.part.0
+  Call trace: … drm_atomic_helper_wait_for_vblanks … j9_handle_j9m_principium+0x9c/0xc0 [jmgpu] …
+jmgpu 0000:07:00.0: [drm] *ERROR* flip_done timed out
+jmgpu 0000:07:00.0: [drm] *ERROR* [CRTC:35:crtc_0] commit wait timed out
+Code: d42000c0 … (d42000c0)                    ← ARM64 `brk #6` = BUG()
+note: CacheThread_Blo[..] exited with irqs disabled / preempt_count 1
+Fixing recursive fault but reboot is needed!  ← 内核状态已损坏
+```
+
+`j9_handle_j9m_principium` 是 `jmgpu` 的 `.atomic_commit_tail`（`kernel/jmgpu_concurrent.c:141`，注册在同文件 `:166`），
+内部调用 `drm_atomic_helper_wait_for_vblanks()`（`:161`）—— **vblank 中断未送达**即超时。
+
+### 15.2 ⚠️ 失败的自作聪明：改 `libglx.so` 的默认 vendor
+
+**当时的动机**：让 glvnd **不依赖环境变量**也能选到厂商 GL（`__GLX_VENDOR_LIBRARY_NAME` 会被 pkexec 的显式 `env` 白名单丢掉）。
+
+**做了什么**：把 `/usr/lib/xorg/modules/extensions/libglx.so` 的 `"mesa"`（`0x35348`）等长改成 `"mwv207"`。
+
+| 结果 | 说明 |
+|---|---|
+| 打补丁后 +6 秒 | 出现上述 **vblank 超时 + 内核 BUG** |
+| 回退后 | 147 秒内**无新超时**；重启后 **0** 次 ✅ |
+
+**两个错误**：
+
+1. **改错了库**：
+   - `/usr/lib/xorg/modules/extensions/libglx.so` = **Xorg 的 GLX 模块**（server 侧）
+   - `/usr/lib/aarch64-linux-gnu/libGLX.so.0.0.0` = **glvnd 分发器**（客户端侧）
+   - **glvnd 里根本没有 `"mesa"` 默认字符串**（已实测 `mesa@[]`）⇒ vendor 名是**运行时从 X server 取**的
+   ⇒ **改 Xorg 模块对"客户端默认 vendor"毫无作用**，只是单纯打乱了 X server 与 DDX 的既有协作。
+2. **"更彻底"≠更好**：改 server 侧 vendor 会影响 DDX/内核驱动的 vblank 路径，**代价远大于收益**。
+
+### 15.3 结论：这个问题**不存在安全的"驱动级"修法**
+
+| 方案 | 效果 | 结论 |
+|---|---|---|
+| **`/etc/environment` 写 `__GLX_VENDOR_LIBRARY_NAME=mwv207`** | ✅ GL 走硬件；**pkexec 路径也被覆盖**（`/usr/lib/pam.d/polkit-1` 含 `pam_env.so readenv=1`，实测模拟 pkexec 环境 → `Jingjia JM9100`） | ✅ **采用** |
+| 改 `libglx.so`（Xorg 模块） | ❌ 无效（客户端不看它）且**触发 vblank 超时 + 内核 BUG** | ❌ **勿再尝试** |
+| 让 DDX 上报 `GlxVendorName` | 本质同"改 server 侧"，**很可能同样触发 vblank 缺陷** | ⚠️ 需厂商评估 |
+| 改 `libGLX.so.0`（glvnd） | 其内部**无默认 vendor 字符串**（运行时从 server 取）⇒ 无可改之处 | ❌ 不可行 |
+
+> **一句话**：本栈上 `__GLX_VENDOR_LIBRARY_NAME` **只能靠环境变量交付**，`/etc/environment` 是唯一安全且完整的落点。
+
+### 15.4 排查中被误导的几条（记录以免重蹈）
+
+| 误判 | 真相 |
+|---|---|
+| "`pkexec` 的 `env` 白名单丢变量 ⇒ 白屏" | 部分正确（确实是变量问题），但**这次的真实元凶是我自己打的 `libglx.so` 补丁**；变量链路修好后现象仍在 |
+| "`easyetier-gui` PATH 里找不到 `pkexec`（execve ENOENT / exit 127）" | 那是**在终端里跑**时终端 PATH 被 flutter/cargo 等目录污染所致；**图形会话 PATH 正常**（`/usr/local/bin:/usr/bin:…`），图标启动时 `pkexec` PAM session 成功开启 |
+| "`MiniBrowser` 段错误是 WebKit 自身问题" | **不是** —— 同一内核状态下 EasyTier/MiniBrowser/cp 全部崩，**根因是 vblank 超时导致的内核态破坏** |
+| "GL vendor 不对导致 WebKit 崩" | **不是** —— 即便 `glxinfo` 显示 `Jingjia JM9100`，EasyTier 照样崩（因为问题在内核 vblank，不在 GL） |
+
+### 15.5 给后续取证的一条捷径
+
+**看到"任务栏图标一闪而过 / WebKit 应用崩 / cp 随机 139"这类"多处不相关程序同时异常"时，先查内核：**
+
+```bash
+sudo dmesg | grep -E 'vblank wait timed out|commit wait timed out|flip_done|BUG:|recursive fault'
+sudo dmesg | grep -cE 'vblank wait timed out|commit wait timed out'    # 期望 0
+```
+
+**只有在"多个不相关程序同时异常"时，才应该怀疑驱动/内核；单个程序异常优先查它自己。**
