@@ -232,7 +232,31 @@ qdbus org.kde.KWin /Compositor org.kde.kwin.Compositing.compositingType
 
 ## 9. 2026-09-16 下午：两条**相互独立**的新缺陷（含可复现矩阵）
 
-### 9.1 【新】`compression` 与 `fastClear` **同时为默认(开)** ⇒ 卡顿 + **内核任务态被破坏**
+### 9.1 【新】**本条归因已撤回**（2026-09-17 复核，见下）
+
+> **撤回说明**：当初观察到 `compression=15`（默认）时 `cp` 以 139 退出并伴随
+> `note: cp[..] exited with irqs disabled` / `preempt_count 1`，据此怀疑"压缩+fastClear 同开
+> 会破坏内核任务态"。**2026-09-17 在系统还原后复核**（本机改跑**发行版自带 `mwv207`**、
+> 本仓库驱动未加载），**同一现象照旧复现**，且崩溃目标为 `i2c-nforce2.ko` /
+> `hix5hd2_gmac.ko` / `reset-uniphier-glue.ko` 等**与显卡无关的普通内核模块**；
+> 手工批量复现同一 `cp` 命令 100 次为 **0 失败**（间歇性）。
+> ⇒ 该现象**与本驱动及 `compression`/`fastClear` 无因果关系**，原"组合缺陷"结论**撤回**，
+> 仅保留为现象记录。
+>
+> **根因已定位（同日）**：`dmesg` 显示这是**内核 `BUG()`**（ARM64 `brk #6`，指令
+> `d42000c0`，`Unexpected kernel BRK exception at EL1`，`Tainted: G D W OE`），
+> 元凶是 **`deepin-anything` 的 `vfs_monitor.ko`**（`wangrong@uniontech.com`，
+> 挂钩 VFS 层；`cp` 是重 VFS 操作）。**`sudo rmmod vfs_monitor` 后**：100 次复制
+> **0 失败**、`BRK handler` 计数停止增长、`update-initramfs -u` **rc=0 成功**。
+> 与本驱动完全无关。
+>
+> **仍然成立的部分**：`update-initramfs` 在本机会因该缺陷**漏拷文件**，
+> 表现为"磁盘模块与 initramfs 内模块 srcversion 不一致"（该"不一致"另有原因：
+> 本系统 initramfs 本就不收录 `updates/` 下的 DKMS 模块，见 README §13.7.1）。
+>
+> 以下为**原始（已撤回）记录**，供对照。
+
+#### 原始记录：`compression` 与 `fastClear` **同时为默认(开)** ⇒ 卡顿 + 内核任务态被破坏
 
 在本机（JM9100 / aarch64 / 内核 6.6.143）以 boot 期 `modprobe.d` 只改这两个参数做 A/B，
 同一模块、同一环境：

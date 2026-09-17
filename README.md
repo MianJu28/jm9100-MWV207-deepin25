@@ -2212,6 +2212,10 @@ echo 1 | sudo tee /sys/module/jmgpu/parameters/flip_waits_2d_idle
 
 #### 12.7.2 追加证据：`compression=15` 下出现**内核任务态破坏**（2026-09-16）
 
+> ⚠️ **本节因果结论已撤回**（2026-09-17 复核）：该系统级 `cp` 段错误在**发行版自带 `mwv207`**
+> 驱动下**同样复现**，与本仓库驱动及 `compression`/`fastClear` 组合**无因果**。
+> 详见 **§13.6**。以下内容仅作现象记录保留。
+
 在 `compression=15`（默认）的那次启动里执行 `update-initramfs -u`，plymouth hook 中的
 `dracut-install` 调用的 `cp` **以 139（SIGSEGV）退出**，内核同时记录：
 
@@ -2302,3 +2306,164 @@ note: cp[21995] exited with preempt_count 1
 | `enable_wc=0`（CPU 写合并一致性） | 假设很有解释力（`Accel off` 仍复现），但**验证方案导致无法启动**，**未得出结论** ⇒ 若后续验证，**必须用可回退方式**（例如先做"翻页前对该池 flush"的核内补丁，而不是全局关写合并） |
 | 厂商侧根治 | 平面 `.prepare_fb` + fence 导出（§12.4(b)）—— 需要的接口变更已写入 `docs/VENDOR_FEEDBACK_PRESENTATION.md` §9.2 |
 | 仓库源码状态 | 已恢复为 `27537d0`；本轮所有内核开关/诊断**均已移除**；如将来重新启用，宜从"只加诊断"重新开始 |
+
+### 13.6 重要修正：`cp` 段错误(139) **与本仓库驱动无关**（2026-09-17 复核）
+
+系统还原后，本机运行的是**发行版自带 `mwv207`**（in-tree，带 `ttm`/`gpu_sched`），
+**本仓库的 `jmgpu.ko` 并未加载**。在此状态下做 `update-initramfs -u` 仍然复现：
+
+```
+dracut-install: ERROR: 'cp --reflink=auto --sparse=auto --preserve=mode,xattr,timestamps,ownership -fL
+    /lib/modules/6.6.155-.../kernel/drivers/reset/reset-uniphier-glue.ko ...' failed with 139
+E: /usr/share/initramfs-tools/hooks/plymouth failed with return 139.
+```
+
+并且 `dmesg` 中同样出现 §12.7.2 记录的指纹：
+
+```
+note: cp[145220] exited with irqs disabled
+note: cp[145220] exited with preempt_count 1
+```
+
+**复现条件与结论**：
+
+| 观测 | 结果 |
+|---|---|
+| 手工批量复现（同一 `cp` 命令复制内核模块 ×100） | **0 失败** ⇒ 间歇性，与命令本身无关 |
+| 崩溃点 | **不固定**：`i2c-nforce2.ko` / `hix5hd2_gmac.ko` / `reset-uniphier-glue.ko` / `hi6220_reset.ko` 等**普通内核模块**，与显卡无关 |
+| 与 `plymouth` hook 的关系 | 禁用该 hook 后**仍是 139**（只是不再有 `plymouth failed` 行）⇒ 该 hook 只是**最早暴露**问题的位置，不是根因 |
+| 当前驱动 | **发行版自带 `mwv207`**（本仓库驱动未加载） |
+
+⇒ **修正 §12.7.2 的归因**：`cp` 139 / `preempt_count 1` 这一现象**在系统自带驱动下同样出现**，
+**不能归因于本仓库驱动**，更不能归因于 `compression`/`fastClear` 参数组合。
+（§12.7.2 当时观察到"`compression=15` 才出现、`compression=0` 未出现"，
+更可能是**样本不足 + 间歇性**所致；该节的因果结论**应予撤回**，保留为现象记录。）
+
+#### 13.6.1 根因确认：**`deepin-anything` 的 `vfs_monitor.ko`**（2026-09-17 实测）
+
+进一步抓到 `dmesg` 中的**完整故障现场** —— 并非普通用户态段错误，而是**内核主动触发 `BUG()`**：
+
+```
+Unexpected kernel BRK exception at EL1
+Internal error: BRK handler: 00000000f2000006 [#25] PREEMPT SMP
+CPU: 6 PID: 190441 Comm: cp Tainted: G      D W  OE   6.6.155-arm64-desktop-hwe #25.01.00.33
+Code: d42000c0 d503233f d42000c0 d503233f (d42000c0)
+```
+
+| 证据 | 含义 |
+|---|---|
+| 指令 `d42000c0` | ARM64 的 **`brk #6`** ⇒ 即 **`BUG()` 宏** |
+| `Unexpected kernel BRK exception at EL1` | 内核在 EL1 执行到本不该到达的 `BUG()` |
+| `Tainted: G **D** W **OE**` | **D**=已 oops；**W**=有 WARNING；**OE**=外部模块（out-of-tree）⇒ 内核已被污染 |
+| taint 计数 `12928` | 长期累计污染 |
+| 崩溃目标**随机** | `i2c-nforce2.ko` / `hix5hd2_gmac.ko` / `reset-uniphier-glue.ko` / `hi6220_reset.ko` —— **均与显卡无关** |
+
+**锁定目标**：`lsmod` 中唯一与 VFS 相关的外部模块是
+
+```
+vfs_monitor  36864  0
+  filename: /lib/modules/6.6.155-.../updates/vfs_monitor.ko
+  description: VFS change monitor
+  author:  wangrong@uniontech.com
+  signer:  DKMS module signing key
+```
+
+由 `deepin-anything-dkms 7.0.49`（`deepin-anything-server`）提供，**挂钩 VFS 层**；
+而 `cp` 是重 VFS 操作（创建/写入/改属性）⇒ 每次复制都会经过它的钩子。
+
+**验证（决定性）**：
+
+```bash
+sudo rmmod vfs_monitor            # 引用计数 0，可直接卸载（文件保留）
+# 压力复现：同一 cp 命令复制内核模块 ×100
+fail=0; for i in $(seq 1 100); do cp -fL "$KO" /tmp/t_$i.ko 2>/dev/null || fail=$((fail+1)); done
+```
+
+| 指标 | 卸载前 | 卸载后 |
+|---|---|---|
+| 100 次复制失败数 | 间歇失败 | **0** ✅ |
+| `dmesg` 中 `BRK handler` 累计 | 持续增长 | **27（不再增加）** ✅ |
+| `update-initramfs -u` 返回码 | 139 失败（重试 2 次仍失败） | **rc=0 首次成功** ✅ |
+| 日志中 `failed with 139` / `Segmentation fault` 计数 | 1~3 | **0** ✅ |
+
+**结论**：`cp` 段错误（及其引发的 dracut 漏拷、initramfs 校验失败）**根因是 `vfs_monitor.ko`
+在本内核（`6.6.155`）上触发内核 `BUG()`**，与本仓库驱动**无任何因果关系**。
+
+> 处理建议：临时 `sudo rmmod vfs_monitor`（重启会恢复）；
+> 若要持久规避，可 `echo 'blacklist vfs_monitor' | sudo tee /etc/modprobe.d/blacklist-vfs-monitor.conf`
+> —— 代价是 deepin 文件索引/全局搜索失效；根本修复需等 `deepin-anything` 适配该内核。
+
+**对安装流程的影响**：`update-initramfs` 可能因该缺陷**漏拷文件**，
+表现为 `sync_dkms.sh` 的校验失败：
+
+```
+磁盘模块    srcversion: 4F7DF0E62A8B543D743D5F9
+initramfs  srcversion: <initramfs 里没有 jmgpu.ko>
+!! 校验失败: initramfs 里的 jmgpu.ko 与磁盘不一致
+```
+
+⇒ 属**本机系统缺陷**，非驱动构建问题。多试几次 `sudo update-initramfs -u`
+（脚本已内置 2 次重试）或先解决 `cp` 崩溃，再重跑 `./scripts/sync_dkms.sh build` 校验。
+
+### 13.7 2026-09-17 安装记录（提交 `27537d0`）
+
+系统还原导致 **DKMS 注册与源码目录一并丢失**（`dkms status` 已无 `mwv207`、
+`/usr/src/mwv207-1.7.0.uos` 不存在），因此需从零重建：
+
+```bash
+# 1) 重建 DKMS 源码目录（按 sync_dkms.sh 的同一平铺规则）
+sudo mkdir -p /usr/src/mwv207-1.7.0.uos
+cd ~/Desktop/Git/jm9100/kernel
+sudo cp -f *.c *.h Makefile* dkms.conf Kconfig* /usr/src/mwv207-1.7.0.uos/
+
+# 2) 注册
+sudo dkms add mwv207/1.7.0.uos          # 仅 "REMAKE_INITRD is deprecated" 警告，无害
+
+# 3) 构建 + 安装 + initramfs 校验
+cd ~/Desktop/Git/jm9100
+sudo ./scripts/sync_dkms.sh build
+```
+
+**结果**：
+
+| 步骤 | 结果 |
+|---|---|
+| 拷贝源码 | 76 个 `.c` / 147 个 `.h`（`Makefile`/`dkms.conf`/`Kconfig*` 齐备） |
+| `dkms add` | ✓ `mwv207/1.7.0.uos: added` |
+| `dkms build` | ✓ 0 error（签名 `/var/lib/dkms/mok.key`） |
+| `dkms install` | ✓ `/lib/modules/6.6.155-arm64-desktop-hwe/updates/dkms/jmgpu.ko` |
+| 磁盘模块 srcversion | `4F7DF0E62A8B543D743D5F9` |
+| initramfs 校验 | ✗ **失败**（`cp` 139 ⇒ 漏拷 `jmgpu.ko`，见 §13.6） |
+
+**当前内核版本**：`6.6.155-arm64-desktop-hwe`（`/lib/modules/` 下另有旧的 `6.6.143`，未使用）。
+
+**未重启**：因 initramfs 缺模块 + 本机 `cp` 缺陷，故保持现状，等待 §13.6 处理后再重启。
+
+#### 13.7.1 `cp` 修复后的复核（2026-09-17，已解决）
+
+卸载 `vfs_monitor` 后重跑 `update-initramfs -u`：**rc=0、139 计数 0**（见 §13.6.1）。
+
+**关于 `sync_dkms.sh` 的"initramfs 校验失败"——经查属该脚本的误报**：
+
+| 检查项 | 实测 | 说明 |
+|---|---|---|
+| initramfs 内 `updates/` 下的 `.ko` 数量 | **0** | 本系统 initramfs **不收录 `updates/`（DKMS）目录** |
+| initramfs 内 `kernel/drivers/` 下的 `.ko` 数量 | **1636** | 只收录**发行版自带**模块 |
+| initramfs 的 `modules.dep` 提及 `jmgpu` / `vfs_monitor` | **0 / 0** | 印证上述规律 |
+| initramfs 内是否有 `mwv207.ko` | **有**（`kernel/drivers/gpu/drm/mwv207/mwv207.ko`） | 自带驱动在 initramfs 内（属 `kernel/` 而非 `updates/`） |
+| 磁盘 `jmgpu.ko` | `4F7DF0E62A8B543D743D5F9`，`modules.dep` 有条目 | 由 rootfs 阶段的 modalias 自动加载 |
+
+⇒ 该脚本假设"initramfs 里应当有 `jmgpu.ko`"，**在本系统上不成立** ⇒
+校验失败**不代表安装失败**；DKMS 模块会由 rootfs 阶段的 udev/modalias 加载。
+（`sync_dkms.sh` 的该校验逻辑后续可按此系统特性调整，或改为"若 initramfs 不含
+`updates/` 模块则跳过校验"。）
+
+**装好后的实际状态**：
+
+| 项 | 状态 |
+|---|---|
+| `dkms status` | `mwv207/1.7.0.uos, 6.6.155-arm64-desktop-hwe, aarch64: installed` ✅ |
+| 磁盘模块 | `/lib/modules/6.6.155-arm64-desktop-hwe/updates/dkms/jmgpu.ko`（`4F7DF0E62A8B543D743D5F9`）✅ |
+| initramfs | 生成成功（rc=0，137 MB）✅ |
+| `plymouth` hook 权限 | 已恢复 `-rwxr-xr-x` ✅ |
+| 待重启生效 | 是 |
