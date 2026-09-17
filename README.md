@@ -978,6 +978,8 @@ modetest -D /dev/dri/card0 -c                  # 查 connector
 | `jmgpu_crosstab.c`（`_DmabufGetSGT`） | **内核第二处 `.GetSGT` 空桩修复（2026-09-16，§9.2）**：Dmabuf（外部 dmabuf 导入）分配器按 `j9_lactant()` 约定派生子区间 sg_table，缓存于 `j9_camaron->sub_sgt` 并在 Free 时释放 |
 | `docs/应用侧交付与测试清单.md` | **交付给应用侧的说明与测试清单**：测试环境基线、系统层改动清单（含回退）、应用侧三项注意（GL vendor 变量 / vsync 语义 / VA-API 零拷贝接入）、逐项测试项与判据、黑窗问题采集模板、已知限制与问题回报模板 |
 | `tools/patch_xorg_abi.py` | **X 驱动 ABI 补丁**：把 `mwv207_drv.so` 的 `XF86ModuleVersionInfo.abiversion` 从 24.0 补到 25.0（对副本操作，4 字节），使其能被 Xorg 1.21 加载（§3.9） |
+| **`docs/系统还原后重建步骤.md`** | **系统还原后重建整条栈的操作手册**（2026-09-17）：按顺序给出内核 DKMS 模块、厂商 deb、`libdrm.so.2.4.0` 兼容链接、"10-mwv207.conf"、**ABI 24→25 补丁**、**TearFree 2D 同步补丁**、重启验收与一键回退；含本机两个系统级坑（`vfs_monitor` 导致 `cp` 139、initramfs 不收录 DKMS 模块） |
+| `tools/patch_ddx_tearfree_sync.py` | **DDX TearFree 2D 同步补丁**（2026-09-17，§13.8）：把"合成→扫描缓冲"上传后**直接返回**改为先调驱动内已有的"等 2D 空闲"封装（`0x10d78`，原本 0 引用），共 2 处 8 字节，用于消除三角错位 |
 | `tools/drm_gamma_probe.c` | **gamma 契约探针**：读 CRTC 的 `GAMMA_LUT_SIZE` 以及当前 `GAMMA_LUT` blob 的项数与内容（定位灰蒙蒙根因用，§3.2） |
 | `scripts/jmgpu_reload_test.sh` | **卸载/重载 + S3 验证脚本**（须在 SSH/TTY 中跑，自带恢复桌面与回滚，§3.4） |
 | `tools/jm_dmabuf_cycle.c` | dmabuf 导出→同驱动导入→释放 循环压测与泄漏检查（无需 root，§3.3 相关） |
@@ -2288,16 +2290,33 @@ note: cp[21995] exited with preempt_count 1
 | `jmgpu_diag_scanout()` 首版判据把常态值 `tilingMode == 0x00` 误判为"非线性" | 光标 fb 频繁新建 ⇒ **刷屏 571 行** ⇒ 桌面卡顿 | 改为按瓦片位掩码判断（`tiling & 0x0e`）；已在 §12.7.1 留档 |
 | 调用 `jmgpu_fb_get_gem_obj()`（仅 <4.11 声明） | 6.6 上编译失败（`-Werror`） | 改为 `fb->obj[0]`（与既有代码同分支） |
 | 把 `enable_wc=0` 写进 `/etc/modprobe.d/` 并重建 initramfs | **系统无法启动**，用户还原系统 | 已移除；**操作规范见 13.4** |
+| 直接让用户执行 `sync_dkms.sh build`（内含 `update-initramfs -u`），把 `blacklist mwv207` + `modules-load jmgpu` **冻结进 initramfs** | 开机既无 `jmgpu` 又不能回 `mwv207` ⇒ **黑屏**，用户二次还原系统 | 已随还原清除；**操作规范见 13.4** |
 
 ### 13.4 操作规范（本机教训，后续必须遵守）
 
-1. **凡涉及 `modprobe.d` / `update-initramfs` / `reboot` 的改动**：先给**完整回退步骤**
-   （改哪个文件、如何删除、如何进救援/还原），并在用户确认后再执行；
+> **第 0 条（最高优先级）**：**任何会改变"开机行为"的命令，一律先列命令 + 回退步骤，等用户明确说"执行"再做。**
+> 判定标准（满足任一条即属此类）：
+> - 写入 `/etc/modprobe.d/`、`/etc/modules-load.d/`、`/etc/initramfs-tools/`、GRUB 配置；
+> - 执行 `update-initramfs` / `mkinitramfs` / `dracut` / `grub-*`；
+> - `reboot` / `shutdown` / 重启 `lightdm`/显示管理器（**并且重启类操作一律由用户本人执行**；
+>   在图形会话里重启 X 会直接结束会话）。
+>
+> **为什么**：这些操作会把改动**冻结进 initramfs 或开机路径**。一旦新驱动在该内核上跑不起来，
+> 开机时既加载不到新驱动、又因 blacklist 回不到原驱动 ⇒ **黑屏，只能还原系统**。
+> 本仓库已因此**两次**导致用户还原系统（见上表后两行），务必遵守。
+
+1. **凡涉及 `modprobe.d` / `modules-load.d` / `update-initramfs` / `reboot` 的改动**：先给**完整回退步骤**
+   （改哪个文件、如何删除、如何用 `force_mode_test.sh boot-undo`、如何进 tty/救援），并在用户确认后再执行；
 2. **一次只改一个变量**，绝不同时改多项（否则无法归因）；
 3. **能用 sysfs 运行时参数验证的，绝不写加载期参数**（`compression`/`fastClear`/`enable_wc` 等
    加载期选项尤其危险，且部分参数 sysfs 只"部分生效"，会误导结论）；
-4. 内核改动的验证顺序：**先只加诊断（零行为改变）→ 再上策略（参数开关、默认关）**；
-5. 改动前先 `git diff > /tmp/…/work.patch` 备份，便于随时回退。
+4. **优先用"不写持久配置"的运行时手段**：如 `driver_override` 运行时绑定设备、纯 sysfs 切参数，
+   验证完即可撤销，**不触碰 initramfs**；
+5. 内核改动的验证顺序：**先只加诊断（零行为改变）→ 再上策略（参数开关、默认关）**；
+6. **持久化（`blacklist mwv207` + `modules-load jmgpu` + `update-initramfs`）只在
+   `jmgpu` 显示管线在目标内核上"已实测可用"后才做**，且必须先确认回退路径有效
+   （`boot-undo` 或"删配置 + 重建 initramfs"都能在手边执行）；
+7. 改动前先 `git diff > /tmp/…/work.patch` 备份，便于随时回退。
 
 ### 13.5 遗留项（未验证，供后续接手）
 
