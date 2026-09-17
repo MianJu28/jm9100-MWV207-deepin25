@@ -1812,3 +1812,493 @@ GL_EXT_EGL_image_storage advertised = YES
 > **应用侧注意**：本厂商栈上 `eglCreateImageKHR()` 走 dma-buf（`EGL_LINUX_DMA_BUF_EXT`）时
 > **必须传 `EGL_NO_CONTEXT`**；传当前 context 会返回 `EGL_BAD_CONTEXT (0x3006)`
 > （`tools/jm_gl_storage_test.c` 用的正是 `EGL_NO_CONTEXT`）。
+
+---
+
+## 12. 2026-09-16 续：呈现「楔形错位 + 重复之前片段」的根因候选与可选修复
+
+> 对应 `docs/VENDOR_FEEDBACK_PRESENTATION.md` 的原始现象。复测已排除 vblank/撕裂类原因
+> （§8.2：vblank 等待语义完全正确），本轮定位到**平面寄存器更新时机**。
+
+### 12.1 现象指纹与机制
+
+现象：视频窗口内**三角/楔形**错位，且**间歇性**出现"重复之前的画面片段"（不是上下错开的
+水平撕裂线）。
+
+机制：`atomic_update` 把主平面的 **步长 → 尺寸 → 基址** 直接写进显示寄存器
+（`kernel/jmgpu_console.c` 的 `j9_handle__attribute_chalkstone()`，由
+`j9_handle_j9min_dichlorvos()` → `atomic_update` 调用，**无 vblank 同步**）：
+
+```kernel/jmgpu_console.c
+	value = stride >> 4;
+	j9_buttocker(plane, J9_ACCOMPLICESHIP, value);   /* 步长 */
+	...
+	j9_buttocker(plane, J9_VERSIFICATOR, address);   /* 基址 */
+```
+
+若这次提交恰好落在**扫描输出期间**：
+
+- **步长**改变 → 本帧后半段按新步长取行 → 画面横向错切，边界随垂直位置推移 → **楔形/三角**；
+- **基址**改变 → 后半段读到缓冲的另一处 → 呈现**更早的画面片段**；
+- 提交时间相对扫描是随机的 → **间歇出现**，与"有时才有"吻合。
+
+> 说明：`j9_beamer` 里本就有 `scan_state`（待生效状态）字段，设计上留了"延后生效"的位置，
+> 但当前实现是立即写硬件。
+
+### 12.2 可选修复：`update_at_vblank`（默认关闭）
+
+新增模块参数（`kernel/jmgpu_console.c`）：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `update_at_vblank` | **0** | `1` = 主平面基址/步长改到**下一次 vblank** 落地（消隐期改寄存器，本帧扫不到） |
+
+默认 0 完全保持厂商原行为，**风险为零**；置 1 才启用新路径。
+
+**落地与安全机制**（避免"挂起后无人应用导致停更"）：
+
+1. **vblank 中断**：`jmgpu_package.c` 的 vblank IRQ 中先
+   `jmgpu_plane_apply_pending(crtc)` 再 `drm_crtc_handle_vblank()` 与送 flip 事件
+   —— 客户端只有在寄存器确实生效后才收到 flip 完成；
+2. **提交尾部安全网**：`jmgpu_concurrent.c` 的 `atomic_commit_tail` 在
+   `drm_atomic_helper_wait_for_vblanks()`（自带超时）之后补落一次；
+3. **vblank 引用**：挂起时 `drm_crtc_vblank_get()` 持一次引用（落地后 put），
+   既保证下一次 vblank 中断一定到来，也与 flip 事件用同一套引用计数约定；
+   **取不到就退回立即写**，绝不把画面置于"等不到 vblank"的风险里。
+
+### 12.3 部署与 A/B（参数可运行时改写，无需重启即可切换）
+
+```bash
+cd ~/Desktop/Git/jm9100
+sudo ./scripts/sync_dkms.sh build     # 重建（本轮改动：console/package/concurrent 三文件）
+sudo reboot                           # 新模块生效
+
+# 无需再重启即可 A/B：sysfs 写参数（0644，root 可写）
+echo 1 | sudo tee /sys/module/jmgpu/parameters/update_at_vblank   # 开启
+echo 0 | sudo tee /sys/module/jmgpu/parameters/update_at_vblank   # 关闭对照
+```
+
+判读：播放同一 30fps 源，对照 `0/1` 两态下的楔形斑块与"重复片段"是否消失。
+**若开启后画面停更或异常**，改回 `0` 即恢复（新路径只在参数为 1 时生效）。
+
+持久化（确认有效后）：写入 `/etc/modprobe.d/`：
+
+```bash
+echo 'options jmgpu update_at_vblank=1' | sudo tee /etc/modprobe.d/jmgpu-update-at-vblank.conf
+sudo update-initramfs -u
+```
+
+### 12.4 实测反馈与残余部分定位（2026-09-16）
+
+**实测**：置 `update_at_vblank=1` 后错位**减轻但未消除** ⇒ 机制判断正确（扫描中改
+步长/基址确是一因），但还有第二个 contributor。
+
+**已排除**：主平面这批寄存器（`J9_ACCOMPLICESHIP` / `J9_VERSIFICATOR` /
+`J9MIRROR_PREPERFECT` / `j9_stockholdings`）**全库只有一处写入点**（即 §12.1 那处，
+已延后），其余出现处均为读取或另一设备（`jmgpu_buttons.c` 的 eDP 路径）。
+
+**残余方向：缓冲内容"渲染完成 ↔ 扫描输出"之间缺栅栏**。证据（`kernel/` 内）：
+
+| 检查项 | 结果 |
+|---|---|
+| 自建栅栏/时间线 | **有**：`jmgpu_subsets.c` 的 `jm_fence_create()` / `dma_fence_init()` / `dma_fence_signal_locked()` |
+| 2D 引擎等待原语 | **有**：`JM_J2D_WAIT_IDLE` ioctl、`engine->ops->is_idle` |
+| 把作业栅栏挂到缓冲 `dma_resv` | **无**：全库无 `dma_resv_add_fence/_excl_fence` |
+| fence fd 导出（`sync_file`/`drm_syncobj`） | **无**：Makefile 定义了 `-DJMD_LINUX_SYNC_FILE=1`，但**无任何源码使用** |
+| 平面 `.prepare_fb` / `.cleanup_fb` | **未实现** |
+
+⇒ DRM 核心的 `drm_atomic_helper_wait_for_fences()` 在翻转前**无栅栏可等**，于是
+「2D 合成/GL 写完 → 翻页扫出」之间只能靠时序碰运气；**负载越高越容易撞上**，
+表现为**间歇性**的楔形块 + 复现上一帧内容（与实测描述一致）。
+
+**A/B 定位矩阵**（全部可逆、无需重编译内核，逐项单独试）：
+
+| # | 动作 | 若现象消失 ⇒ 指向 |
+|---|---|---|
+| 1 | `Option "Present" "off"` 或 `"DRI3" "off"`（`/usr/share/X11/xorg.conf.d/10-mwv207.conf`） | 客户端↔服务器交接缺栅栏（Present/DRI3 共享 pixmap 路径） |
+| 2 | `Option "EnablePageFlip" "off"` | 翻转（base 切换）时机仍是主因 |
+| 3 | `Option "TearFree" "off"` | DDX 的 TearFree 拷贝路径（拷屏与扫描竞争） |
+| 4 | 关掉合成器（kwin compositing off） | 合成器参与（否则可排除） |
+| 5 | 把 30fps 源换成 60fps 源 | 与"提交/扫描的相对相位"相关程度 |
+
+**可实施的后续内核改动**：
+
+- **(a) `flip_waits_2d_idle`（已实现，默认关）**：翻页前在进程上下文**有界**等待
+  2D 引擎排空，复用驱动自带的 `JM_J2D_WAIT_IDLE` 同源原语
+  （`j9mirror_monosilane()`：内部持 `p2d->enginelock`、可睡眠、超时上限
+  `JMGPU_FLIP_IDLE_TIMEOUT_MS` = 30ms）。实现位置：`jmgpu_console.c`
+  的 `j9_handle__attribute_chalkstone()` 入口 → `jmgpu_2d_wait_idle()`
+  （定义在 `jmgpu_garbage.c`，紧邻 `JM_J2D_WAIT_IDLE` 处理器）。
+  超时即放过，**绝不因等待失败而中断提交**。
+
+  **两个开关可运行时切换（sysfs，0644），本次重建后 A/B 无需再重启**：
+
+  ```bash
+  echo 1 | sudo tee /sys/module/jmgpu/parameters/update_at_vblank     # 平面寄存器改到 vblank 生效
+  echo 1 | sudo tee /sys/module/jmgpu/parameters/flip_waits_2d_idle   # 翻页前等 2D 排空
+  # 四种组合 (0/0, 1/0, 0/1, 1/1) 分别观察，用于分离两个成因的贡献
+  ```
+
+- **(b) 作业栅栏挂载 + `.prepare_fb`（需厂商配合）**：让核心的 `wait_for_fences()`
+  真正等到渲染完成。但 2D 命令是**不透明命令流**（`DRM_JM_J2D_SEND_CMD` 只收
+  `cmd` 指针 + size），内核无法从中得知目标缓冲 ⇒ 需厂商在提交接口上带上目标
+  `dma_buf`/handle，并补 fence fd（`sync_file`/`drm_syncobj`）导出，才能真正打通
+  DRI3/Present 与 EGL 互操作。
+
+### 12.5 第二组嫌疑：**运行时可切**的显示/内存特性门
+
+`update_at_vblank=1` 实测"比较有效但仍有余留" ⇒ 寄存器时机之外还有一因。
+排查驱动参数时发现一组**默认开启、且 sysfs 可运行时切换**的特性门，其中
+**帧缓冲压缩（TS 瓦片状态）** 的失效模式与残余现象高度吻合：
+
+| 参数 | 当前值 | 语义（源自源码注释） |
+|---|---|---|
+| `compression` | **15（开）** | `jmgpu_license.c`: *"Disable compression if set it to 0, enabled by default"* —— 帧缓冲压缩 / **TS（Tile Status）瓦片状态** |
+| `fastClear` | -1（默认开） | *"Disable fast clear if set it to 0"* |
+| `flatMapping` | 1 | *"Flat mapping for reserve memory"* |
+| `sharedPageTable` | 1 | 共享页表（MMU） |
+
+**为什么压缩是头号嫌疑**：瓦片状态记录"该瓦片是否压缩/已被清空"；若 2D 引擎或 CPU
+写入某缓冲后**未正确失效/刷新该瓦片的状态**，显示侧就会读到**上一帧的旧瓦片内容**。
+由于**瓦片在内存中不是按光栅顺序排布**，未更新的瓦片集合在屏幕上呈现为**不规则块、
+阶梯或楔形**，且**只在状态不一致时出现** ⇒ 与"三角状错位 + 有时重复之前片段"高度吻合。
+这与"寄存器时机"是两个独立成因，故 `update_at_vblank` 只能减轻。
+
+驱动侧事实核对：TS 模式由**用户态按缓冲选择**（`tsMode` / `tsCacheMode` /
+`metadata.compressed`，经 `DRM_JM_GEM_SET_TILING` 等 ioctl 下发），驱动提供了
+维护原语（`jmkVIDMEM_NODE_CleanCache` / `InvalidateCache` / `jmkHARDWARE_FlushCache`）。
+**是否在扫描缓冲的写入路径上调用正确，取决于用户态（DDX/GL）与 2D 命令流**。
+
+**A/B（无需重编译内核；改参数后需注销重登，让 X/DDX 重新分配缓冲）**：
+
+```bash
+# ① 关压缩（最高概率）
+echo 0 | sudo tee /sys/module/jmgpu/parameters/compression
+#    然后 注销重登（或 sudo systemctl restart lightdm）
+
+# ② 关快速清除
+echo 0 | sudo tee /sys/module/jmgpu/parameters/fastClear
+
+# ③ 关平坦映射（可能需整机重启才完全生效）
+echo 0 | sudo tee /sys/module/jmgpu/parameters/flatMapping
+
+# ④ 若尚未测：翻页前等 2D 排空
+echo 1 | sudo tee /sys/module/jmgpu/parameters/flip_waits_2d_idle
+```
+
+**判读与后续**：
+
+| 结果 | 结论与下一步 |
+|---|---|
+| ① 关闭后现象消失 | 根因＝TS/压缩状态维护缺失（用户态或 2D 路径未失效瓦片状态）⇒ 定位并修「写扫描缓冲时缺 TS 失效/刷新」；在修好前 `compression=0` 作为可用规避（代价：显存带宽/占用上升） |
+| ② 关闭后消失 | fastClear 标志与内容不一致 ⇒ 同类 TS 维护问题 |
+| ③ 关闭后消失 | MMU/平坦映射与显示读地址不一致 ⇒ 属地址映射缺陷 |
+| ④ 明显进一步改善 | 再叠加 §12.4(a) 的 2D 排空等待（两者可共存） |
+| 都无效 | 回到 §12.3 的"渲染完成 ↔ 扫描输出 无栅栏"主线，按 §12.4 的 A/B 矩阵定位 |
+
+#### 12.5.1 实测（2026-09-16）：**① 有缓解** —— 且运行时写 sysfs **只部分生效**
+
+先确认了参数的生效机制（很重要，决定测试怎么做才有效）：
+
+| 事实 | 证据 |
+|---|---|
+| `compression` 在**初始化时**被解析进 `p->compression`（`jmgpu_license.c`，`-1 → 默认开`） | `p->compression = (compression == -1) ? ... : compression;` |
+| 再锁存到 `Hardware->options.allowCompression` | **全库仅一处写入**：`jmgpu_calendar.c:5450`；仅一处读取：同文件 `:5877` |
+| 运行时写 sysfs **不会**更新该字段（module_param 只改变量本身） | 同上（无 re-resolve 路径） |
+
+⇒ **运行时 `echo 0` 只能"部分生效"**（能被用户态重新读取到的那些路径会变），
+**要得到结论必须写到模块加载期**。实测"① 有缓解"与该机制吻合。
+
+**决定性测试（需 root，改完必须重启）**：
+
+```bash
+echo 'options jmgpu compression=0' | sudo tee /etc/modprobe.d/jmgpu-nocompress.conf
+sudo update-initramfs -u
+sudo reboot
+# 重启后核对参数已生效（值应为 0，而非 15）
+cat /sys/module/jmgpu/parameters/compression
+```
+
+- 若现象**完全消失** ⇒ 根因确认为 TS/压缩状态维护缺失 ✅
+- 若仍**有余留** ⇒ 还有第三个成因，回到 §12.3/§12.4 主线
+
+#### 12.5.2 核内已核查的两处相关缺口（供厂商定位）
+
+| 检查项 | 结论 |
+|---|---|
+| `_dmabuf_ops`（`jmgpu_bullets.c:4223`）的 CPU 访问钩子 | **未实现 `.begin_cpu_access` / `.end_cpu_access`** ⇒ 以 dma-buf 方式导入后做 CPU 访问的路径**没有**任何缓存/TS 维护 |
+| `jmkVIDMEM_NODE_CleanCache` / `InvalidateCache`（`jmgpu_bullets.c`） | 只对 **system-memory 节点做 CPU 缓存**维护（`jmkOS_MemoryBarrier`），**不涉及 TS/压缩元数据** |
+| `jmkHARDWARE_QchannelFlushCache` / `FlushCache` | 用于**时钟/电源切换**与命令流场景，**不是**"每帧显示一致性"原语 |
+| ⇒ 核内**没有**"翻页前刷新 TS"的可用原语 | 故本仓库**无法**在核内做"保压缩的正规修复"；只能：(a) 关压缩规避；(b) 请厂商在 TS 维护/CPU 访问钩子上补齐 |
+
+> 结论：`compression` 是**设备级能力位**、按缓冲的 TS 模式由用户态
+> （`DRM_JM_GEM_SET_TILING` / `ATTACH_AUX` 的 `ts_handle`）下发，是否在
+> **扫描缓冲的 CPU/2D 写入路径**上正确失效瓦片状态，取决于用户态与 2D 命令流
+> ⇒ 这一项**属厂商侧**（已写入反馈文档 §8.3 第 3 条）。
+
+### 12.6 第三组嫌疑：**非线性（瓦片/TS）缓冲被直接送进扫描输出**
+
+用户复报"**有时画面分成几块，然后画面错位**" ⇒ 这两个特征（分块 + 错位）指向
+**显示控制器按线性读了非线性布局的缓冲**，而不是单纯缺同步。
+
+**用户态侧证据**（`/var/log/Xorg.0.log`、`mwv207_drv.so`）：
+
+| 证据 | 位置 |
+|---|---|
+| `TearFree property default: on` | Xorg.0.log:113 |
+| `Present extension enabled` + `KMS Pageflipping for Present extension: enabled` + DRI3 初始化 | Xorg.0.log:269-270, 313 |
+| DDX 含 `jmgpuPresentFlip` / `jmgpu_dri3.c` / `Failed to get FB for **PRIME** flip` | 二进制字符串 |
+
+**内核侧证据**：
+
+| 事实 | 位置 |
+|---|---|
+| 主平面**只**编程 `格式/步长/尺寸/宽/base`，**无任何 tiling/TS 位** | `kernel/jmgpu_console.c` `j9_handle__attribute_chalkstone_raw()` |
+| `fb_create` 只用 `drm_helper_mode_fill_fb_struct()` 原样拷贝，**不校验 modifier/瓦片模式** | `kernel/jmgpu_concurrent.c:76` |
+| 每缓冲的 `tsNode / tilingMode / tsMode` 只**保存/释放/回传用户态**，显示路径**从不使用** | `jmgpu_detect.c:2287`、`jmgpu_garbage.c:668,740` |
+
+⇒ 机制：客户端经 DRI3/PRIME 提交的 GL/解码缓冲若为**瓦片/压缩**布局，被 Present
+直接翻页送进扫描 ⇒ 显示按线性误读 ⇒ **分块 + 错位**，只在特定应用出现 ⇒ "有时"；
+`compression=0` 能缓解（布局接近线性）⇒ 与 §12.5.1 的实测自洽。
+
+**本轮新增：核内诊断 `jmgpu_diag_scanout()`**（`kernel/jmgpu_console.c`，声明在同名 `.h`）
+
+- 调用点：`fb_create`（`jmgpu_concurrent.c`）与主平面 `atomic_update`（`jmgpu_console.c`）；
+- 判据：`tilingMode != DRM_JM_GEM_TILING_LINEAR(0x01)` 或 `tsMode > TS_DISABLED(0x01)`
+  或 `tsNode != NULL` ⇒ **仅此时**打印一行（`pr_warn_ratelimited`）；
+  线性且无 TS 的正常路径**零输出**，默认始终启用、无副作用。
+
+```bash
+# 重建并重启后，复现现象，然后看日志：
+sudo dmesg | grep 'NON-LINEAR scanout fb'
+# 形如：jmgpu: fb_create: NON-LINEAR scanout fb: modifier=0x0 tiling=0x2 ts_mode=3 ts_node=1 pitch=7680 1920x1080 ...
+```
+
+判读：若**每次现象出现时**都有对应输出（尤其 `fb_create` 出现在某应用启动/播放时）
+⇒ 根因锁定"非线性扫描缓冲"；若日志**始终为空** ⇒ 该嫌疑排除，回到 §12.4 的
+"渲染完成 ↔ 扫描输出 缺栅栏"主线。
+
+**三条并行验证（互不依赖）**：
+
+| # | 动作 | 判读 |
+|---|---|---|
+| 1 | DDX 选项 `TearFree off`（`/usr/share/X11/xorg.conf.d/10-mwv207.conf`） | 消失 ⇒ TearFree 的拷屏/翻页路径是主因 |
+| 2 | 再加 `Present off` / `DRI3 off` | 消失 ⇒ **客户端缓冲直翻**（本组最怀疑） |
+| 3 | boot 期 `compression=0`（`modprobe.d` + `update-initramfs` + 重启） | 消失 ⇒ TS/压缩状态维护缺失（§12.5.1 的决定性测试） |
+
+### 12.7 决定性实测（2026-09-16）：**压缩开 = 卡顿＋错位，压缩关 = 正常**
+
+同一模块、同一环境、仅改 `compression` 一个变量（**无需重编译**）：
+
+| 配置 | 桌面表现 | 备注 |
+|---|---|---|
+| `compression=0`（`/etc/modprobe.d/jmgpu-nocompress.conf`，boot 期） | **正常、不再卡** | 初始"卡好一会"实际是本轮新加诊断的刷屏（见 §12.7.1），剔除后确认压缩关时一切正常 |
+| `compression=15`（默认，删掉该文件后重启） | **又卡** | 可复现 |
+
+⇒ 结论：**帧缓冲压缩 / TS 这条路在本机上"开着就坏"** —— 既造成 §12.1 的分块/错位，也造成整机卡顿。
+这与 §12.5.1「① 有缓解」互为印证，并**否证**了"仅仅缺同步"的解释。
+
+**可用规避（已验证）**：boot 期关压缩
+
+```bash
+echo 'options jmgpu compression=0' | sudo tee /etc/modprobe.d/jmgpu-nocompress.conf
+sudo update-initramfs -u && sudo reboot
+cat /sys/module/jmgpu/parameters/compression      # 期望 0
+```
+
+代价：显存带宽/占用上升（无压缩）；换来显示正确与流畅。
+
+**下一步细分（一次重启即可）**：`compression` 与 `fastClear` 是两个独立门
+（`jmgpu_calendar.c` 的 `jmkHARDWARE_SetFastClear()`：`AQ_MEMORY_DEBUG.DISABLE_FAST_CLEAR`
+与 `...DISABLE_ZCOMPRESSION` 分别由参数驱动；`DISABLE_ZCOMPRESSION = (compression == J9_HANDLE_J9MENU_SPAWNEATER)`）
+
+```bash
+echo -e 'options jmgpu compression=15 fastClear=0' | sudo tee /etc/modprobe.d/jmgpu-comp-fc.conf
+sudo update-initramfs -u && sudo reboot
+# 判读：正常 ⇒ 坏的是 fastClear/清空值机制（压缩本身可保留，性能损失更小）
+#       仍卡 ⇒ 坏的是 Z-compression 本体
+```
+
+**实测结果（2026-09-16 15:23 档）**：`compression=15 fastClear=0` ⇒ **桌面不再卡、内核日志零异常**
+（`dmesg` 中无 `segfault` / `preempt_count` / `irqs disabled`）⇒ **卡顿与内核态破坏的元凶是 `fastClear`**
+（`AQ_MEMORY_DEBUG.DISABLE_FAST_CLEAR`，即"清空值放在 TS 里"的那套机制），**Z-compression 本体无罪**。
+
+| 配置 | 卡顿 / 内核破坏 | 画面分块错位 |
+|---|---|---|
+| `compression=0`（fastClear 默认） | 无 ✓ | **仍在** ✗（仅"缓解"） |
+| `compression=15`（fastClear 默认） | **有** ✗（`cp` 139 + `preempt_count 1`） | 仍在 ✗ |
+| `compression=15 fastClear=0` | **无** ✓（日志零异常） | **仍在** ✗ |
+
+⇒ **两件事必须分开归因**：
+1. **卡顿 / 内核状态被破坏** = `fastClear` 缺陷 ⇒ 规避：`fastClear=0`（可保留压缩，代价更小）
+   或 `compression=0`（更保守）；
+2. **画面分块 + 错位 = 另一条独立缺陷**，与压缩/fastClear 均无关，且**已证伪**"非线性(瓦片/TS)
+   缓冲被线性扫描"这一假设 —— `jmgpu_diag_scanout()` 在 `compression=15`（压缩开启）下**零命中**，
+   说明用户态并未给扫描缓冲挂 TS，缓冲区始终线性无 TS。
+   ⇒ 回到 §12.4 主线：**"渲染完成 ↔ 扫描输出"之间缺栅栏**，以及 DDX 的 Present/DRI3/TearFree 路径。
+
+**画面错位下一步（按成本排序）**：
+
+| # | 动作 | 成本 |
+|---|---|---|
+| 1 | 两个已有缓解**同时**打开：`update_at_vblank=1` + `flip_waits_2d_idle=1`（各自单独都只"减轻/有余留"，可共存） | sysfs 即时，**无需重启** |
+| 2 | X 侧 A/B：`TearFree off` → 再加 `Present off` → 再加 `DRI3 off`（`/usr/share/X11/xorg.conf.d/10-mwv207.conf`，注销重登） | 免重编译 |
+| 3 | 若仍不行 ⇒ 需厂商补 `.prepare_fb` + fence 导出（§12.4(b)） | 需厂商 |
+
+**X 侧 A/B 实测（2026-09-16 下午，逐项单独试、每次注销重登）**：
+
+| # | 选项 | 观测结果 | 指向 |
+|---|---|---|---|
+| ① | `EnablePageFlip off` | **仍有三角错位**（无改善） | 三角错位与"是否用 page flip"无关 ⇒ 不是翻页机制本身 |
+| ② | `TearFree off` | **三角错位明显减少**，但出现**撕裂** | ⇒ **三角错位 = DDX 的 TearFree"合成→扫描缓冲"拷贝与扫描输出竞争**（该拷贝由 2D 引擎的 XFER_RECT 完成）；关掉它就没有这种"按行错切"的三角形状，代之以普通撕裂 |
+| ③ | `Present off` | **撕裂减少**，但出现**画面回退**（闪回旧帧） | ⇒ 撕裂/回退 = **缺"渲染完成 ↔ 扫描输出"栅栏**：换一条提交路径只是把同一缺陷换成另一种表现（回退＝扫到更旧的缓冲） |
+| ④ | `DRI3 off` | **仍有三角错位**（无改善） | 三角错位与 DRI3 直翻无关 ⇒ 进一步确认 ② 的结论 |
+
+**推论（收敛）**：
+
+1. **三角错位**（§12.1 的原始症状）根因 = **TearFree 的拷贝 vs 扫描竞争**（用户态路径 + 缺栅栏）；
+   `flip_waits_2d_idle` 正是针对它设计的（翻页前等 2D 排空），此前单开为"比较有效仍有余留"——
+   余留部分应是**拷贝提交发生在翻页之后**的时间窗，单靠翻页前等待无法覆盖。
+2. **撕裂 / 回退** = 全局缺栅栏（§12.4 主线），任何提交路径都只能换表现形式。
+3. 因此**核内无法根治**，能做的只有：
+   (a) 两个缓解参数**同时**打开（`update_at_vblank=1` + `flip_waits_2d_idle=1`，此前未测过该组合）；
+   (b) 二选一的取舍：`TearFree off`（无三角错位、有撕裂）vs 默认（无撕裂、有三角错位）。
+
+**待测（两组对照，各注销重登一次）**：
+
+```bash
+# 第一组：优先"不要三角错位"
+#   X 侧：Option "TearFree" "off"     （见上文 setopt 用法）
+echo 1 | sudo tee /sys/module/jmgpu/parameters/update_at_vblank
+echo 1 | sudo tee /sys/module/jmgpu/parameters/flip_waits_2d_idle
+
+# 第二组：优先"不要撕裂"
+#   X 侧：恢复默认（TearFree on）
+echo 1 | sudo tee /sys/module/jmgpu/parameters/update_at_vblank
+echo 1 | sudo tee /sys/module/jmgpu/parameters/flip_waits_2d_idle
+```
+
+**核内相关事实（供厂商定位）**：
+
+| 事实 | 位置 |
+|---|---|
+| 解压块（DEC）的 TS 读写 ID 是**硬编码常量 4 / 2** | `jmgpu_calendar.c:2818-2827`（`AHBDEC_CONTROL_EX2.TILE_STATUS_READ_ID/WRITE_ID`） |
+| 每缓冲的 TS 却是用户态经 `ATTACH_AUX` 各自挂载（`tsNode`），内核只保存/回传 | `jmgpu_garbage.c:740-856`、`DRM_JM_GEM_ATTACH_AUX` |
+| DEC 压缩门在初始化里被写成 `DISABLE_COMPRESSION = ENABLE`（是否等效"关闭"取决于字段极性） | `jmgpu_calendar.c:2806-2816` |
+| 参数门只作用于 `AQ_MEMORY_DEBUG`（`DEC` 门不由 `compression` 参数驱动） | `jmgpu_calendar.c:5421-5446` |
+
+> 即：**"TS 是谁的、DEC 该读哪一份"** 在核内与用户态之间没有可核对的契约，
+> 硬编码 ID 与实际 `ts_handle` 是否对应无法在本仓库内确认 ⇒ 该项需厂商确认
+> `TILE_STATUS_READ_ID/WRITE_ID` 与用户态 TS 分配 ID 的一致性。**
+
+#### 12.7.1 排查过程中我引入并已修复的问题（留档）
+
+本轮新增的核内诊断 `jmgpu_diag_scanout()` 首版判据写错：把"从未设置过瓦片"的
+常态值 `tilingMode == 0x00` 与 `DRM_JM_GEM_TILING_LINEAR(0x01)` 比较，导致**所有**
+线性 fb 都被判为"非线性"；而光标 fb（64×64、pitch=256）会随光标变化频繁新建 ⇒
+**刷屏 571 行**（限速也只压到 ~2 行/秒）⇒ 内核日志同步写盘 ⇒ **桌面启动/操作卡顿**。
+修正为按瓦片位掩码判断（`tiling & 0x0e`），并保留 `tiling <= LINEAR`：
+
+```c
+	/* 线性 + 无 TS = 显示控制器能正确扫描：正常路径不打印 */
+	if ((tiling & JMGPU_DIAG_TILED_MASK) == 0 &&
+	    tiling <= DRM_JM_GEM_TILING_LINEAR &&
+	    ts_mode <= DRM_JM_GEM_TS_DISABLED && !has_ts)
+		return;
+```
+
+另修一处编译错误：`jmgpu_fb_get_gem_obj()` 在 `jmgpu_concurrent.h` 中**条件声明**
+（仅 <4.11），6.6 上须走 `fb->obj[0]` 分支（本构建开 `-Werror`，故直接失败）。
+
+#### 12.7.2 追加证据：`compression=15` 下出现**内核任务态破坏**（2026-09-16）
+
+在 `compression=15`（默认）的那次启动里执行 `update-initramfs -u`，plymouth hook 中的
+`dracut-install` 调用的 `cp` **以 139（SIGSEGV）退出**，内核同时记录：
+
+```
+note: cp[21995] exited with irqs disabled
+note: cp[21995] exited with preempt_count 1
+```
+
+- 这是**任务在内核态遗留了中断禁用/抢占计数**的指纹（不是 coreutils 自身的问题）；
+- 同一条 `cp` 命令手工复跑（目标改到 `/tmp`）**返回 0、文件正常** ⇒ 与命令本身无关；
+- 而 `compression=0` 生效时（同日 15:01）同一条 `update-initramfs -u` **成功**；
+- `/boot` 中另存 6 个 **0 字节 `initrd.img-*.new.*`** 残留（9月9日～9月11日等，
+  **早于本轮工作**）⇒ 该 hook 的失败在本机是**既有 flakiness**，但本轮的失败伴随
+  上述内核指纹，且与压缩开启状态相关。
+
+⇒ 结论：`compression=15` 的危害不止"画面分块错位 + 卡顿"，还会**破坏内核任务状态**
+（用户态工具随机 SIGSEGV）。**关闭压缩（boot 期 `compression=0`）应视为必需，而非可选**；
+此项建议与 §12.7 的 TS/DEC 一致性问题一并向厂商提交。
+
+> 注意：`update-initramfs` 失败时**不会覆盖**旧 initrd（写临时文件、成功才替换）
+> ⇒ 失败本身不导致无法启动，但会留下空 `.new.*` 残留，且 `compression=0` 的
+> `/etc/modprobe.d/` 改动**不会**进入 initramfs。
+
+---
+
+## 13. 2026-09-16～17 排查全过程纪要（结案）
+
+> 本节为**记录性**内容：把 §12 各节的实测按**时间顺序**串成一条可复盘的线索，
+> 并明确**结论 / 证伪项 / 遗留项**。仓库源码现已恢复为提交 `27537d0`（`chore: 整理仓库文件`）原状，
+> 本轮为排查加入的所有内核开关与诊断代码**均已移除**，仅保留本节与 §12 的文档记录。
+
+### 13.1 时间线与每步结论
+
+| # | 动作 | 结果 | 结论 |
+|---|---|---|---|
+| 1 | 定位「画面分块 + 错位」机制 | 主平面 `atomic_update` 立即写 步长→尺寸→基址，无 vblank 同步 | §12.1 成立：扫描中改寄存器会产生楔形/三角错位 |
+| 2 | 新增 `update_at_vblank`（默认 0） | 实测"**减轻但未消除**" | 机制正确，但存在第二个 contributor（§12.4） |
+| 3 | 排查栅栏 | 全库无 `dma_resv_add_*`、无 fence fd、平面无 `.prepare_fb`；仅 `Present off` 会把"撕裂"换成"回退" | 缺栅栏成立，**但不足以解释全部**（§12.4） |
+| 4 | 排查显示/内存特性门 | 发现 `compression`/`fastClear`/`flatMapping` 等默认开启的可切门 | §12.5：压缩（TS）列为首号嫌疑 |
+| 5 | 运行时 `compression=0` | "**① 有缓解**"，但 sysfs 只部分生效 | §12.5.1：须 boot 期验证 |
+| 6 | boot 期 `compression=0` | 桌面正常；**但画面错位仍在** | §12.7：**压缩不是错位主因** |
+| 7 | `compression=15`（默认） | **卡顿**，且 `update-initramfs` 的 `cp` 以 **139** 退出，内核记录 `preempt_count 1` | §12.7.2：**压缩+fastClear 同开**会破坏内核任务态 |
+| 8 | `compression=15 fastClear=0` | **不卡、日志零异常** | **卡顿/内核破坏的元凶是 `fastClear`**；Z-compression 本体无罪 |
+| 9 | 核内诊断（`fb_create` + 主平面 update 检查 `tilingMode/tsMode/tsNode`） | 在 `compression=15` 下**零命中** | §12.6 的"非线性/TS 缓冲被直线扫描"**被证伪** |
+| 10 | X 侧 A/B：`EnablePageFlip off` | 三角错位**不变** | 与翻页机制本身无关 |
+| 11 | X 侧 A/B：`TearFree off` | 三角错位**明显减少**，出现撕裂 | 三角错位**主要**来自 DDX「合成→扫描缓冲」拷贝与扫描竞争 |
+| 12 | X 侧 A/B：`Present off` | 撕裂减少，出现**画面回退** | 缺栅栏：换提交路径只是换症状 |
+| 13 | X 侧 A/B：`DRI3 off` | 三角错位**不变** | 与 DRI3 直翻无关 |
+| 14 | 换视频源复测 | 两组**都仍有**三角错位，`TearFree off` + 两缓解那组最轻 | ⇒ 写入方**不限于** TearFree 拷贝 |
+| 15 | X 侧 A/B：`Accel off`（纯 CPU 写入） | 三角错位**仍存在** | ⇒ 写入方**包含 CPU 路径** ⇒ 假设转向**写合并/缓存一致性** |
+| 16 | 提出 `enable_wc=0` 验证 | 该改动写进 `/etc/modprobe.d/` 并重建 initramfs | ⇒ **导致无法启动**，已由用户还原系统（见 13.3） |
+
+### 13.2 最终归因
+
+**症状被拆成两条相互独立的缺陷：**
+
+1. **三角错位（含"分块"）** = **"写入扫描缓冲"与"扫描输出"之间缺同步/一致性**，
+   且写入方**覆盖 2D 引擎与 CPU 两条路径**：
+   - `TearFree off` 能显著减少 ⇒ 高频来源是 DDX 的"合成→扫描缓冲"拷贝（2D XFER_RECT）；
+   - `Accel off` 后仍在 ⇒ CPU 写入（写合并映射 `pgprot_writecombine`，posted 写）同样参与；
+   - 因此**用户态路径与缺栅栏**是主因，**核内无法根治**；厂商侧需补
+     平面 `.prepare_fb` + 作业栅栏挂 `dma_resv` + fence fd 导出（§12.4(b)、厂商文档 §9.2）。
+2. **卡顿 + 内核任务态破坏** = **`compression` 与 `fastClear` 同时启用**的驱动缺陷
+   （任一关闭即恢复正常；证据见 §12.7.2）。**Z-compression 本体、TS/非线性扫描均无罪。**
+
+### 13.3 排查过程中我引入的问题（如实记录）
+
+| 问题 | 影响 | 处置 |
+|---|---|---|
+| `jmgpu_diag_scanout()` 首版判据把常态值 `tilingMode == 0x00` 误判为"非线性" | 光标 fb 频繁新建 ⇒ **刷屏 571 行** ⇒ 桌面卡顿 | 改为按瓦片位掩码判断（`tiling & 0x0e`）；已在 §12.7.1 留档 |
+| 调用 `jmgpu_fb_get_gem_obj()`（仅 <4.11 声明） | 6.6 上编译失败（`-Werror`） | 改为 `fb->obj[0]`（与既有代码同分支） |
+| 把 `enable_wc=0` 写进 `/etc/modprobe.d/` 并重建 initramfs | **系统无法启动**，用户还原系统 | 已移除；**操作规范见 13.4** |
+
+### 13.4 操作规范（本机教训，后续必须遵守）
+
+1. **凡涉及 `modprobe.d` / `update-initramfs` / `reboot` 的改动**：先给**完整回退步骤**
+   （改哪个文件、如何删除、如何进救援/还原），并在用户确认后再执行；
+2. **一次只改一个变量**，绝不同时改多项（否则无法归因）；
+3. **能用 sysfs 运行时参数验证的，绝不写加载期参数**（`compression`/`fastClear`/`enable_wc` 等
+   加载期选项尤其危险，且部分参数 sysfs 只"部分生效"，会误导结论）；
+4. 内核改动的验证顺序：**先只加诊断（零行为改变）→ 再上策略（参数开关、默认关）**；
+5. 改动前先 `git diff > /tmp/…/work.patch` 备份，便于随时回退。
+
+### 13.5 遗留项（未验证，供后续接手）
+
+| 项 | 说明 |
+|---|---|
+| `enable_wc=0`（CPU 写合并一致性） | 假设很有解释力（`Accel off` 仍复现），但**验证方案导致无法启动**，**未得出结论** ⇒ 若后续验证，**必须用可回退方式**（例如先做"翻页前对该池 flush"的核内补丁，而不是全局关写合并） |
+| 厂商侧根治 | 平面 `.prepare_fb` + fence 导出（§12.4(b)）—— 需要的接口变更已写入 `docs/VENDOR_FEEDBACK_PRESENTATION.md` §9.2 |
+| 仓库源码状态 | 已恢复为 `27537d0`；本轮所有内核开关/诊断**均已移除**；如将来重新启用，宜从"只加诊断"重新开始 |
