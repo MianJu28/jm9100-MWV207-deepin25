@@ -2486,3 +2486,45 @@ sudo ./scripts/sync_dkms.sh build
 | initramfs | 生成成功（rc=0，137 MB）✅ |
 | `plymouth` hook 权限 | 已恢复 `-rwxr-xr-x` ✅ |
 | 待重启生效 | 是 |
+
+---
+
+## 14. 2026-09-17：系统还原后重建整条栈（含 8 个坑）
+
+> 详细操作手册见 **`docs/系统还原后重建步骤.md`**（含每步命令、验证、回退，以及 §7.9 "踩坑实录"）。
+> 本节只记录**结论**与**代价最大的三个坑**。
+
+### 14.1 结果
+
+| 组件 | 状态 |
+|---|---|
+| 内核 `jmgpu`（本仓库 `27537d0` 源码构建） | ✅ 已加载、PCI 绑定、`/dev/jmgpu` + `card0` + `renderD128` |
+| DKMS | ✅ `installed`（`6.6.143-arm64-desktop-hwe`） |
+| 专有 DDX | ✅ `build-cli/mwv207_drv.so.abi25.fixed3`（md5 `297aee83…`，ABI + 布局双补丁） |
+| 厂商用户态（deb） | ✅ 主包 + VA-API；三库已换 `.glstorage` 版（md5 全部匹配 §9.7） |
+| **GL 硬件加速** | ✅ `OpenGL renderer string: Jingjia JM9100`、`glxgears` **16973–18107 FPS**（对照 §8.1 的 1.3–1.8 万） |
+| 桌面合成 | ✅ kwin `xrender` + `drm-vblank-fix.service`（`vblankoffdelay=0`） |
+| 任务栏 | ✅ `dde-shell` 走 Mesa 包装（**必需**，见 14.3 坑 3） |
+
+### 14.2 代价最大的三个坑
+
+| # | 坑 | 症状 | 根因 | 修正 |
+|---|---|---|---|---|
+| 1 | **`libdrm.so.2.4.0` 只建了一处** | `glxinfo` 显示 `llvmpipe`、`glxgears` 仅 **478 FPS**；日志只有 `glx: failed to create dri3 screen` / `failed to load driver: jmgpu`（**看着像驱动坏了**） | 只有 `mwv207_drv.so` 带 `RUNPATH=.../mwv207`；**`libGLX_mwv207` / `libEGL_mwv207` / `jmgpu_dri.so` 三个库没有 RUNPATH**，按系统默认路径查 `libdrm.so.2.4.0` ⇒ `not found` ⇒ 厂商 GLX 加载失败 ⇒ 回落 Mesa | `ln -sf libdrm.so.2 /usr/lib/aarch64-linux-gnu/libdrm.so.2.4.0`（**系统目录也必须建**）⇒ **478 → 17,000 FPS（35 倍）** |
+| 2 | **`DISPLAY` 拿错** | `DISPLAY=:0 glxinfo -B \| grep renderer` **无输出**（错误被 grep 吞掉），像"命令跑了没结果" | 本机 **Xorg/lightdm 起在 `:1`**，`:0` 不存在 | 先取 `tr '\0' '\n' < /proc/$(pgrep -x kwin_x11\|head -1)/environ \| grep DISPLAY`，再测试 |
+| 3 | **过早持久化 ⇒ 黑屏** | 重启后**黑屏**，只能还原系统（本机**两次**） | 在 `jmgpu` 尚未在本内核验证可用时执行了 `sync_dkms.sh build`（内含 `update-initramfs -u`），把 `blacklist mwv207` + `modules-load jmgpu` **冻结进 initramfs** ⇒ 开机既加载不到新驱动、又回不到原驱动 | **正确顺序**：装模块 → **运行时 `driver_override` 验证** → 确认 `glxinfo` 走硬件 → **最后**才持久化，且**回退命令先在手** |
+
+### 14.3 其余五个坑（要点）
+
+| # | 坑 | 要点 |
+|---|---|---|
+| 4 | `vfs_monitor`（deepin-anything） | 在内核 6.6 上触发内核 `BUG()`（ARM64 `brk #6`，`Tainted: G D W OE`）⇒ `cp` 随机 SIGSEGV(139) ⇒ `update-initramfs` 失败。`sudo rmmod vfs_monitor` 后 100 次复制 **0 失败**、`update-initramfs` **rc=0**（§13.6.1） |
+| 5 | initramfs 不收录 `updates/` | 实测 `updates/*.ko` = **0**、`kernel/drivers/*.ko` = **1636** ⇒ `sync_dkms.sh` 的"initramfs 校验失败"是**误报**（§13.7.1） |
+| 6 | `dkms status` 只到 `added` | 模块文件不在 `/lib/modules/.../updates/dkms/` ⇒ 开机 `modules-load` 加载不到 ⇒ 无 `/dev/dri/`、X 回落 `modesetting`。**必须确认 `installed`** |
+| 7 | DDX 只打 ABI、漏打布局 | Xorg 1.21 删了 `xf86str.h` 的 `Bool flipPixels` ⇒ `ScrnInfoRec` 其后字段 **−8 字节** ⇒ `NULL+0x48` 段错误。**必须用 `abi25.fixed3`**（双补丁） |
+| 8 | 任务栏"流畅"≠驱动修好 | `dde-shell` 走 `fix_dock_mesa.sh` 包装**刻意用 Mesa/CPU**（厂商 GL 在它上面只有 1–11 fps）；**撤销包装后又卡**（2026-09-17 实测）。两件事互不替代 |
+
+### 14.4 给后续接手的一句话
+
+> **先跑 `ldd <厂商库> | grep 'not found'`（坑 1），再确认 `DISPLAY`（坑 2），
+> 最后才碰持久化（坑 3）。** 这三条按顺序做，能省掉本轮 80% 的排查时间。
