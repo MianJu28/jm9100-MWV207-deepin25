@@ -53,6 +53,24 @@ jm9100/
 - 所有脚本用 `HERE` / `REPO`（`REPO = 脚本所在目录/..`）自定位，**可在任意 cwd 下调用**，
   例如 `sudo ./scripts/sync_dkms.sh build`；生成物固定落在仓库根的 `build-cli/`。
 - 内核源码与 DKMS 是**唯一**的路径敏感处；探针与工具之间无交叉引用（探针不 include 驱动头）。
+- **`scripts/switch_stack.sh`**（2026-09-17 新增）：在**厂商栈（`jmgpu`）**与
+  **系统自带驱动（`mwv207`）**之间切换，并统一管理两者期望相反的共享配置
+  （`/etc/environment`、`10-mwv207.conf`、DKMS 注册）。
+
+  ```bash
+  sudo ./scripts/switch_stack.sh status     # 只读：查看当前栈与差异
+  sudo ./scripts/switch_stack.sh system     # 切回系统驱动（**系统升级前**用；需手动重启）
+  sudo ./scripts/switch_stack.sh vendor     # 切回厂商栈（需手动重启）
+  sudo ./scripts/switch_stack.sh backup     # 备份现有配置
+  sudo ./scripts/switch_stack.sh restore    # 从最近一次备份恢复
+  ```
+
+  > **为什么需要它**：两套栈对同一批配置的期望正好相反 ——
+  > 厂商栈要 `MatchDriver "jmgpu"` + `__GLX_VENDOR_LIBRARY_NAME=mwv207` + DKMS 注册；
+  > 系统栈要**都去掉**（`MatchDriver "jmgpu"` 与系统驱动名不符会让 **X 起不来**；
+  > 残留 DKMS 注册会在内核升级时触发重编、**中断系统更新**）。
+  > 脚本**不自动重启**，每次改动**先备份**（默认 `$BAK=/persistent/home/admin/jm9100-xdrv-backup`，
+  > 可用 `JM9100_BAK=` 覆盖），`restore` 可一键回到 `backup` 时的状态。
 
 ---
 
