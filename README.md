@@ -4,6 +4,7 @@
 > 目标：把闭源 **jmgpu 1.7.0** 内核驱动移植到 6.6，**同时**点亮显示与打通 VA-API 硬解。
 >
 > **当前状态：显示 ✅ · GL 硬件加速 ✅ · VA-API 零拷贝直通 ✅**
+> 已在 **内核 6.6.155** 上完整验证（jmgpu 接管 PCI、`Jingjia JM9100` 约 1.7 万 FPS、直通判定"正常"）。
 >
 > 本文档只保留**结论、操作方法、已采用的修复与遗留问题**。
 > 历史排查过程（大量已排除方案与实验数据）见 `backup/README.2026-09-17.md`（本文件重写前的完整版）
@@ -226,6 +227,11 @@ sudo cp -a /etc/environment /etc/environment.bak
 grep -q '__GLX_VENDOR_LIBRARY_NAME' /etc/environment || \
   echo '__GLX_VENDOR_LIBRARY_NAME=mwv207' | sudo tee -a /etc/environment
 
+# 6a-2) ★ 必做：否则 EasyTier 等 WebKitGTK 应用会 SIGSEGV（图标一闪而过、无窗口）
+#       厂商 GL 与 WebKitGTK 不兼容，关掉 WebKit 的加速合成即可（详见 §8.6）
+grep -q '^WEBKIT_DISABLE_COMPOSITING_MODE' /etc/environment || \
+  echo 'WEBKIT_DISABLE_COMPOSITING_MODE=1' | sudo tee -a /etc/environment
+
 # 6b) vblank：内核默认 5s 后关闭 vblank 中断，厂商驱动无法重新使能（否则每帧等 1s）
 sudo tee /etc/tmpfiles.d/drm-vblank.conf >/dev/null <<'EOF'
 w /sys/module/drm/parameters/vblankoffdelay - - - - 0
@@ -273,15 +279,35 @@ DISPLAY=$D ./scripts/test_passthrough.sh -s 360p   # VA-API 直通端到端
 sudo dmesg | grep -cE 'vblank wait timed out|commit wait timed out|BUG:'   # 期望 0
 ```
 
-### 2.9 最后：持久化（可选，**确认上面全绿后再做**）
+### 2.9 最后：持久化（**确认上面全绿后再做**）
+
+**为什么需要**：默认发行版 in-tree `mwv207` 会由 modalias 抢先绑定设备，
+而 `10-mwv207.conf` 的 `MatchDriver "jmgpu"` 匹配不上内核驱动 ⇒ 厂商 DDX 不会被使用。
+持久化 = 「禁掉 `mwv207` + 强制加载 `jmgpu` + 冻结进 initramfs」。
 
 ```bash
 cd ~/Desktop/Git/jm9100
-sudo ./scripts/force_mode_test.sh boot      # blacklist mwv207 + modules-load jmgpu + 进 initramfs
+
+# 方式一（推荐，等价且更易回退）
+sudo ./scripts/switch_stack.sh persist      # 或 sudo ./scripts/switch_stack.sh vendor --persist
 sudo reboot
-# 回滚：
-sudo ./scripts/force_mode_test.sh boot-undo && sudo reboot
+
+# 方式二
+sudo ./scripts/force_mode_test.sh boot      # 与上面等价（blacklist + modules-load + initramfs）
+sudo reboot
 ```
+
+**回退**（三选一，后两者更彻底）：
+
+```bash
+sudo ./scripts/switch_stack.sh system && sudo reboot        # 回系统栈：撤配置+撤持久化+移 DKMS
+sudo ./scripts/force_mode_test.sh boot-undo && sudo reboot   # 仅撤持久化
+sudo ~/rollback-to-system.sh && sudo reboot                  # **紧急**（黑屏时在 TTY/SSH 里用）
+```
+
+> `update-initramfs` 期间若报 **dracut `cp` 139**，先 `sudo rmmod vfs_monitor`
+> （deepin 文件监控在内核 6.6 上触发内核 `BUG()`，与本驱动无关，见 §8.5）。
+> `switch_stack.sh` 的持久化动作已内置这一步。
 
 **验证运行中的模块 = 磁盘模块**（历史上多次"修复无效"的误判都源于此）：
 
@@ -346,6 +372,7 @@ LIBVA_DRIVER_NAME=jmgpu mpv --no-config --vo=gpu --hwdec=vaapi --frames=5 video.
 | 13 | `dconfig org.kde.kwin.compositing:user_type=4` | kwin 用 **XRender** 合成 | 厂商 GL 合成实测仅 8 fps，XRender 47 fps |
 | 14 | `/usr/bin/dde-shell` 包装 | 改走 Mesa（原二进制备份为 `dde-shell.real`） | 任务栏高频重绘，厂商 GL 只有 1–11 fps；`~/fix_dock_mesa.sh` 应用/回退 |
 | 15 | `10-mwv207.conf` | `MatchDriver "jmgpu"` + `Driver "mwv207"` | 让 X 使用厂商 DDX（**切回系统驱动时必须删除**，否则 X 起不来） |
+| 16 | `/etc/environment` | **`WEBKIT_DISABLE_COMPOSITING_MODE=1`** | **厂商 GL 会让 WebKitGTK 应用 SIGSEGV**（EasyTier 图标一闪而过、无窗口）。实测：仅第 11 项的 GLX 变量 ⇒ 必崩（2/2 复现）；加上本行 ⇒ 连跑两次均存活（§8.6） |
 
 ### 3.4 已排除（勿再尝试）
 
@@ -354,6 +381,7 @@ LIBVA_DRIVER_NAME=jmgpu mpv --no-config --vo=gpu --hwdec=vaapi --frames=5 video.
 | 改 `libglx.so`（Xorg 模块）的默认 GLX vendor | ❌ **无效且有害** —— 客户端走的是 glvnd（`libGLX.so.0`，内部无默认 vendor 字符串），改 Xorg 模块不起作用；反而打乱 DDX↔内核协作，**触发 vblank 超时 + 内核 `BUG()`**（详见 §8.3） |
 | 让 EGL 覆盖全部 visual | ❌ 不需要 —— 实测 `eglCreateWindowSurface` 不做 config↔visual 匹配校验，90/90 visual 都能建面渲染 |
 | 全局关压缩 `compression=0` | ⚠️ 可缓解卡顿，但**不是错位主因**（详见 §6） |
+| 给 WebKit 应用加 `__EGL_VENDOR_LIBRARY_FILENAMES=…10_mwv207.json` | ❌ **反而必崩** —— 强制只用厂商 EGL 时 EasyTier SIGSEGV（与只给 GLX 变量同样结果，§8.6） |
 
 ---
 
@@ -365,15 +393,19 @@ LIBVA_DRIVER_NAME=jmgpu mpv --no-config --vo=gpu --hwdec=vaapi --frames=5 video.
 cd ~/Desktop/Git/jm9100
 
 # 厂商栈接管持久化（blacklist mwv207 + modules-load 强制加载 jmgpu + 进 initramfs）
-sudo ./scripts/force_mode_test.sh boot && sudo reboot
+sudo ./scripts/switch_stack.sh persist   # 或 ./scripts/force_mode_test.sh boot（等价）
+sudo reboot
 
 # 回滚到系统自带 mwv207
-sudo ./scripts/force_mode_test.sh boot-undo && sudo reboot
+sudo ./scripts/switch_stack.sh system && sudo reboot
+# 紧急回滚（黑屏时在 TTY/SSH 里执行；只做最小必要动作，不依赖仓库脚本）
+sudo ~/rollback-to-system.sh && sudo reboot
 ```
 
 > ⚠️ **持久化会改写开机路径**：一旦新驱动在该内核上跑不起来，开机既加载不到新驱动、
 > 又因 blacklist 回不到原驱动 ⇒ **黑屏只能还原系统**。
 > **务必先用运行时手段验证**（`driver_override`），确认可用后再持久化，且**回退命令先在手**。
+> 紧急回退脚本 `~/rollback-to-system.sh` 就是为此准备的 —— 建议在持久化**之前**确认它存在。
 
 ### 4.2 改驱动源码后的标准流程
 
@@ -396,12 +428,22 @@ sudo reboot
 ### 4.3 两套栈切换（`scripts/switch_stack.sh`）
 
 ```bash
-sudo ./scripts/switch_stack.sh status     # 只读：查看当前栈与配置差异
-sudo ./scripts/switch_stack.sh vendor     # 切到厂商栈（需手动重启）
-sudo ./scripts/switch_stack.sh system     # 切回系统驱动（**升级系统前**必做；需手动重启）
-sudo ./scripts/switch_stack.sh backup     # 备份现有配置
-sudo ./scripts/switch_stack.sh restore    # 回到上次备份
+sudo ./scripts/switch_stack.sh status                # 只读：当前栈 + 配置差异 + 一致性检查
+sudo ./scripts/switch_stack.sh vendor                # 切到厂商栈：配置 + 装模块（**不动开机路径**）
+sudo ./scripts/switch_stack.sh vendor --persist      # 上一步 + 持久化（**改开机路径**）
+sudo ./scripts/switch_stack.sh persist               # 只做持久化（禁 mwv207 + 强制 jmgpu + initramfs）
+sudo ./scripts/switch_stack.sh system                # 切回系统驱动（撤配置+撤持久化+移 DKMS）
+sudo ./scripts/switch_stack.sh backup                # 备份现有配置
+sudo ./scripts/switch_stack.sh restore               # 回到上次备份
 ```
+
+**设计要点**：
+
+- `vendor` **默认不做持久化** —— 只配置 X/环境/链接/vblank + 装模块，避免"改开机路径"的意外；
+  此时 `status` 会报**不一致**并提示下一步（`persist` 或 `system`）。
+- `system` **同时**撤销持久化与 DKMS 注册。若只撤 DKMS 而不撤黑名单，会出现
+  「jmgpu 未安装 + mwv207 被禁」⇒ **开机无驱动**（这是曾经的隐患）。
+- 持久化前会**先卸 `vfs_monitor`**，避免 dracut `cp` 139 导致 initramfs 生成失败。
 
 **为什么需要它**（两套栈期望**相反**的三处配置，散着改必然漏）：
 
@@ -488,6 +530,13 @@ jm9100/
 | `dump_display_regs.sh` / `dump_full_regs.sh` | 寄存器转储 |
 | `x_test_jmgpu.sh` | X 侧测试 |
 
+**`$HOME` 下的配套脚本（不在仓库内，随环境部署）**：
+
+| 脚本 | 用途 |
+|---|---|
+| `~/fix_dock_mesa.sh` | 任务栏走 Mesa 的包装（apply / revert，§3.3 #14） |
+| **`~/rollback-to-system.sh`** | **紧急回退**到系统自带 mwv207：黑屏时在 **TTY（`Ctrl+Alt+F3`）或 SSH** 执行 `sudo ~/rollback-to-system.sh && sudo reboot`。动作 = 删黑名单 → 删 `jmgpu.conf` → 删 `10-mwv207.conf` → 清 `/etc/environment` 变量 → 重建 initramfs（自动先卸 `vfs_monitor` 避免 139） |
+
 ### 5.2 工具清单（`tools/`）
 
 | 工具 | 用途 |
@@ -519,6 +568,7 @@ jm9100/
 | 7 | `sync_dkms.sh` 报"initramfs 校验失败" | ✅ 属**误报** | 本系统 initramfs **不收录 `updates/`（DKMS）目录**（实测 `updates/*.ko`=0、`kernel/drivers/*.ko`=1636）。DKMS 模块由 rootfs 阶段 udev modalias 加载 ⇒ **校验失败 ≠ 安装失败**，只需确认 `dkms status` 为 `installed` |
 | 8 | GL 兼容层 `libjm_gl_compat.so` | ✅ **已退役** | glstorage 补丁已原生支持，系统级兼容层已卸载（无需 `LD_PRELOAD`） |
 | 9 | 零拷贝依赖 mpv 补丁 | ⚠️ 已知 | 升级 mpv 后需重新应用 `patches/mpv_dmabuf_oes_image.patch`（系统级 `LD_PRELOAD` 兼容层亦可，但已退役） |
+| 10 | **厂商 GL 与 WebKitGTK 不兼容** | ⚠️ 已规避，根因未修 | 启用厂商 GL 后 `EasyTier`/`MiniBrowser` 等 WebKitGTK 程序**启动即 SIGSEGV**；当前用 `WEBKIT_DISABLE_COMPOSITING_MODE=1` 规避（WebKit 不做加速合成，代价是 WebKit 页面渲染走 CPU）。属厂商侧（§7 第 9 条、§8.6） |
 
 ---
 
@@ -530,7 +580,8 @@ jm9100/
 |---|---|---|
 | 1 | **SCDC 签名迁移** | `jmgpu_nicely.c` 的 `drm_scdc_*` 需按 6.5+ 签名适配（`drm_connector*`）；同源代码在所有 6.x 内核上都有该问题，§3.1 的补丁可直接回给厂商 |
 | 2 | **平面缺 `.prepare_fb` / fence 导出** | 需把 2D / GL / 解码作业的栅栏挂到缓冲的 `dma_resv`，并提供 fence fd 导出 ⇒ 让 `drm_atomic_helper_wait_for_fences()` 在翻页前真正等到"渲染完成"。**这是三角错位的根治方向** |
-| 3 | **`GLX_EXT_libglvnd` vendor 名** | X 驱动应通告 libglvnd vendor 名 `mwv207`（当前报 Xorg 默认的 `mesa`），否则凡经 `pkexec`/纯净环境启动的 WebKit/Chromium/GTK 程序都会让 glvnd 回落 Mesa 而崩溃；安装脚本也应把 `__GLX_VENDOR_LIBRARY_NAME` 写入 `/etc/environment` |
+| 3 | **`GLX_EXT_libglvnd` vendor 名** | X 驱动应通告 libglvnd vendor 名 `mwv207`（当前报 Xorg 默认的 `mesa`）⇒ 这样**无需环境变量**客户端就能选到厂商 GL；同时安装脚本应把 `__GLX_VENDOR_LIBRARY_NAME` 写入 `/etc/environment`（`pkexec` 会清环境，只有 `pam_env` 能覆盖提权应用） |
+| 9 | **厂商 GL 与 WebKitGTK 不兼容（SIGSEGV）** | 启用厂商 GL（`__GLX_VENDOR_LIBRARY_NAME=mwv207`，或强制厂商 EGL json）后，**EasyTier / MiniBrowser 等 WebKitGTK 程序启动即段错误**；不给厂商 GL 变量则正常（回落 llvmpipe）。实测矩阵见 §8.6。当前规避是 `WEBKIT_DISABLE_COMPOSITING_MODE=1`（WebKit 不做加速合成），但**根因未修** —— 请确认厂商 `libGLX_mwv207` / `libEGL_mwv207` 在 WebKitGTK 的上下文创建路径上是否缺少必要支持（如 `GLX_ARB_create_context`、core profile、`dma-buf` 导出等） |
 | 4 | **vblank 中断** | 内核默认 5s 后关闭 vblank 中断，驱动无法重新使能 ⇒ 客户端每帧等 1s（已用 `drm.vblankoffdelay=0` 规避，建议驱动侧修复） |
 | 5 | reserved-mem 分配器 `.GetSGT` 空桩 | 已由本仓库补齐，**建议在源码层实现**（当前是仓库补丁） |
 | 6 | 解码 surface 池整块连续申请 | 可见窗口碎片化时整组回退到 CPU 不可见池，建议按需分块或非连续分配 |
@@ -628,3 +679,39 @@ Fixing recursive fault but reboot is needed!   ← 内核状态损坏
 | **`vfs_monitor`（deepin-anything）** | 在内核 6.6 上触发内核 `BUG()` ⇒ `cp`/`update-initramfs` 随机 139。`sudo rmmod vfs_monitor` 即恢复 |
 | **initramfs 不收录 `updates/`** | `sync_dkms.sh` 的"initramfs 校验失败"是**误报** |
 | **`Xorg` 的 `DISPLAY` 每次重启都变** | 所有 X 侧测试前先取当前会话的 `DISPLAY` |
+
+### 8.6 厂商栈下 **WebKitGTK 应用必崩**（EasyTier 打不开的真正原因）
+
+**症状**：切到厂商栈后，EasyTier（Tauri + WebKitGTK）**任务栏图标一闪而过、无窗口**；
+journal 只见 `pkexec[...]: pam_unix(polkit-1:session): session opened for user root` 之后**再无下文**。
+`MiniBrowser` 同样崩溃。
+
+**实测矩阵**（都以 pkexec 等价的纯净环境运行 12 秒，`124`＝存活、`139`＝SIGSEGV）：
+
+| 环境 | 结果 |
+|---|---|
+| 只给 `DISPLAY/XAUTHORITY/HOME`（无 GL 变量） | **124 存活** ✓ |
+| `+ __GLX_VENDOR_LIBRARY_NAME=mwv207` | **139 崩溃**（重复 2/2）✗ |
+| `+ __EGL_VENDOR_LIBRARY_FILENAMES=…10_mwv207.json` | **139 崩溃** ✗ |
+| 只有 `vblank_mode=0` | 124 存活 ✓ |
+| `__GLX_VENDOR_LIBRARY_NAME=mwv207` **+ `WEBKIT_DISABLE_COMPOSITING_MODE=1`** | **124 存活** ✓（连跑两次） |
+| `__GLX_VENDOR_LIBRARY_NAME=mwv207` + `LIBGL_ALWAYS_SOFTWARE=1` | 124 存活 ✓ |
+
+⇒ **根因**：**厂商 GL（GLX 与 EGL 都一样）会让 WebKitGTK 段错误**。
+而 `__GLX_VENDOR_LIBRARY_NAME=mwv207` 是厂商栈的**必需**变量（第 11 项，否则 GL 走 Mesa/llvmpipe），
+它经 `pam_env` 注入到 **pkexec 提权实例** ⇒ **必崩**。
+
+**解法**（已采用，第 16 项）：`/etc/environment` 增加
+
+```bash
+WEBKIT_DISABLE_COMPOSITING_MODE=1     # WebKit 不做加速合成 ⇒ 不创建 GL 上下文 ⇒ 不崩
+```
+
+- 只影响 **WebKitGTK** 系应用，**不影响**其他程序的 GL 硬件加速（`glxinfo`/`glxgears` 仍是 `Jingjia JM9100`）；
+- **无需注销**：`pam_env` 每次 PAM 会话（含 pkexec）都会重读 `/etc/environment`；
+- 回退：`sudo sed -i '/^WEBKIT_DISABLE_COMPOSITING_MODE/d' /etc/environment`。
+
+> **为何 9/17 能用、现在不能**：系统升级（内核 6.6.155 + glvnd/WebKitGTK/Mesa 更新）后行为改变。
+> 另外**不要把** `__EGL_VENDOR_LIBRARY_FILENAMES` 指向厂商 json —— 那会让崩溃**必现**（见上表）。
+>
+> 这属于厂商 GL 与 WebKitGTK 的兼容缺陷，已列入 §7 给厂商的反馈。
