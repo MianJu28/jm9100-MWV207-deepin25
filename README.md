@@ -386,6 +386,7 @@ LIBVA_DRIVER_NAME=jmgpu mpv --no-config --vo=gpu --hwdec=vaapi --frames=5 video.
 | 14 | `/usr/bin/dde-shell` 包装 | 改走 Mesa（原二进制备份为 `dde-shell.real`） | 任务栏高频重绘，厂商 GL 只有 1–11 fps；`~/fix_dock_mesa.sh` 应用/回退 |
 | 15 | `10-mwv207.conf` | `MatchDriver "jmgpu"` + `Driver "mwv207"` | 让 X 使用厂商 DDX（**切回系统驱动时必须删除**，否则 X 起不来） |
 | 16 | `/etc/environment` | **`WEBKIT_DISABLE_COMPOSITING_MODE=1`** | **当前唯一可靠规避**（WebKit 不建 GL 上下文 ⇒ 不触发厂商栈的悬垂 TLS 解引用）。实测：加 `glxguard` 守卫也救不了 WebKit 实际形态（§8.6.3）⇒ 保留本行；厂商修好 EGL 侧（§7 第 9～11 条）后方可移除 |
+| 17 | `/etc/initramfs-tools/modules` | **`jmgpu`** | **让 initramfs 自带并在开机早期加载厂商模块**。不加这一行时：`MODULES=most` 只扫 `kernel/`（不含 `updates/dkms/`），`modules-load.d` 又只对切根后的 systemd 生效 ⇒ 整个 initramfs 阶段**没有任何 DRM 设备**，deepin `/init` 的 `wait_for_gpu_device()` 会白等满 2000×5ms 才超时（实测 **13.67s**，见 §6 #12）。2026-10-08 起由 `switch_stack.sh persist` 自动写入、`system` 自动移除 |
 
 ### 3.4 已排除（勿再尝试）
 
@@ -428,13 +429,16 @@ cd ~/Desktop/Git/jm9100
 sudo reboot
 ```
 
-> **红线（重新表述 2026-10-08）**：`dkms install` 后仍要**重建 initramfs 再重启**，但要区分两件事：
-> - **模块本体**：本系统 initramfs **不收录** `updates/`（见 §6 #7），`jmgpu.ko` 每次都由 rootfs
->   阶段的 udev modalias 从 `/lib/modules/$(uname -r)/updates/dkms/` 加载 ⇒ **"initramfs 里没有
->   jmgpu.ko" 是正常态**，不是新代码不生效的原因（脚本已修正，不再误报失败）。
-> - **开机路径配置**：`blacklist mwv207` / `modules-load jmgpu` 这两份文件是写进 initramfs 的；
->   改了持久化就必须 `update-initramfs -u`，否则重启后早期阶段仍按旧配置走（历史上"修复无效"
->   的误判多源于此）。
+> **红线（2026-10-08 重新表述）**：`dkms install` 后**必须重建 initramfs 再重启**，原因有两层：
+> - **厂商栈已把 `jmgpu` 写进 `/etc/initramfs-tools/modules`**（§3.3 #17，`persist` 自动做）
+>   ⇒ `jmgpu.ko` 现在**就在 initramfs 里**，并由 `/init` 的 `load_modules()` 于开机早期加载。
+>   不重建 initramfs，重启后早期阶段仍旧镜像（旧模块 / 无模块）⇒ 新代码不生效、且白等 GPU
+>   （§6 #12）。**这也意味着 `sync_dkms.sh` 的 initramfs `srcversion` 校验现在是有效判据**。
+> - **开机路径配置**：`blacklist mwv207` / `modules-load jmgpu` 同样是写进 initramfs 的；
+>   改了持久化就必须 `update-initramfs -u`（历史上"修复无效"的误判多源于此）。
+>
+> 注：**未持久化**（`vendor` 不带 `--persist`）时 initramfs 不收录 `updates/dkms/`，
+> `jmgpu.ko` 只能由切根后的 systemd 加载 —— 那时"initramfs 里没有 jmgpu.ko"是正常态（§6 #7）。
 >
 > 验证（模块本体是否为新代码）：
 > ```bash
@@ -493,7 +497,7 @@ sudo ./scripts/switch_stack.sh restore               # 回到上次备份
 4. **DDX**：`build-cli/mwv207_drv.so.abi25.fixed3`（md5 `297aee83…`）
 5. **glstorage 三库**：`build-cli/*.glstorage`
 6. **mpv**：打 `patches/mpv_dmabuf_oes_image.patch` 后重编（见下）
-7. **系统配置**：§3.3 的 11~15 项
+7. **系统配置**：§3.3 的 11~17 项（其中 11/12/15/17 与开机路径相关，`switch_stack.sh vendor --persist` 会一并写好；16 也会被 `vendor` 写入）
 
 完整步骤与回退见 **`docs/系统还原后重建步骤.md`**。
 
@@ -594,6 +598,7 @@ jm9100/
 | 9 | 零拷贝依赖 mpv 补丁 | ⚠️ 已知 | 升级 mpv 后需重新应用 `patches/mpv_dmabuf_oes_image.patch`（系统级 `LD_PRELOAD` 兼容层亦可，但已退役） |
 | 10 | **厂商 EGL 留下悬垂 libglapi TLS ⇒ GLX 销毁段错误**（WebKitGTK 应用打不开） | ⚠️ **部分缓解**，厂商侧根因未修 | 根因链：EGL 解绑/销毁不清 TLS → `jmDestroyContext` 解引用未校验（UAF）。我方 `glxguard` 守卫能修**独立复现器**，但**修不了 WebKit 实际形态**（悬垂指针可能落在**仍映射**的池里 ⇒ 地址类判据不可靠，§8.6.3）。当前仍以 `WEBKIT_DISABLE_COMPOSITING_MODE=1` 为准（§3.3 #16）；确定性复现程序 `tools/glx_egl_tls_uaf_repro.c`、客观判定工具 `tools/wkmin.c` |
 | 11 | **内核 `jmkOS_WaitNativeFence` 等待预算算错**（栅栏提前超时） | ✅ **已修（本仓库 `kernel/jmgpu_symbol.c`）** | `dma_fence_wait_timeout()` 返回的是**剩余**预算，原代码写 `timeout -= ret`（把剩余换成"已用时间"）⇒ 多元素 fence array 必然提前超时，调用方（`jmo_SURF_WaitFence` 等）会拿着**尚未完成**的缓冲继续用 ⇒ 内容不一致（三角/楔形错位一类）。已改为 `timeout = ret`，并逐元素判断 `f` 而非外层 `fence`。**需重建+重启生效**（`sudo ./scripts/sync_dkms.sh build`） |
+| 12 | **开机"桌面卡住一段时间"（厂商栈下 initramfs 白等 GPU 13.7s）** | ✅ **已定位并修（2026-10-08）** | 用**单调时间轴**定位 boot 0 的 initramfs 卡点：`2.0s` 起跑 → `24.696s` `begin wait gpu device` → `38.363s` `No drm device,timeout` = **白等 13.67s**（2000 次 × `sleep 0.005`）。原因：deepin 的 `/init` 里 `wait_for_gpu_device()` 轮询 `/dev/dri/card*`，而**厂商栈下整个 initramfs 阶段没有任何 DRM 设备** —— `MODULES=most` 只扫 `kernel/`、不收 `updates/dkms/*.ko`，`modules-load.d/jmgpu.conf` 又只对切根后的 systemd 生效，同时 `mwv207` 已被 blacklist。系统栈的 `mwv207` 恰好**在 initramfs 里**（`kernel/drivers/gpu/drm/mwv207/mwv207.ko` + udev coldplug）所以从不触发。**修复**：`persist` 往 `/etc/initramfs-tools/modules` 写 `jmgpu` ⇒ initramfs 收进 `updates/dkms/jmgpu.ko`+依赖，并由 `/conf/modules` 在 `~2.4s` 提前 modprobe（早于该等待）。附带发现：`cryptroot`/`crng` 段另有约 10s 发行版侧等待，与驱动无关 |
 
 ---
 
@@ -705,8 +710,10 @@ Fixing recursive fault but reboot is needed!   ← 内核状态损坏
 | 项 | 说明 |
 |---|---|
 | **`vfs_monitor`（deepin-anything）** | 在内核 6.6 上触发内核 `BUG()` ⇒ `cp`/`update-initramfs` 随机 139。`sudo rmmod vfs_monitor` 即恢复 |
-| **initramfs 不收录 `updates/`** | `sync_dkms.sh` 的"initramfs 校验失败"曾是**误报**；脚本已于 2026-10-08 修正（§6 #7） |
+| **initramfs 不收录 `updates/`** | 默认如此（`MODULES=most` 只扫 `kernel/`）。厂商栈 `persist` 会往 `/etc/initramfs-tools/modules` 写 `jmgpu` 把它收进去（§3.3 #17 / §6 #12）；`sync_dkms.sh` 的"initramfs 校验失败"曾是**误报**，脚本已于 2026-10-08 修正（§6 #7） |
+| **initramfs 里 `wait_for_gpu_device()` 白等 13.7s** | deepin 的 `/init` 会轮询 `/dev/dri/card*` 最多 2000×5ms。只要该阶段没有 DRM 设备（厂商栈的默认形态），每次开机都白等 ~13.7s ⇒ 表现为"卡住一段时间"。修法见 §3.3 #17（把 `jmgpu` 放进 initramfs） |
 | **`Xorg` 的 `DISPLAY` 每次重启都变** | 所有 X 侧测试前先取当前会话的 `DISPLAY` |
+| **journal 里早启动阶段的 wall 时间不可信** | journald 导入 kmsg 积压时会把整个 initramfs 的 kernel 消息压到几毫秒内（实测 39s 压成 160ms），**只有单调时间（`-o short-monotonic`）可用于分析开机耗时** |
 
 ### 8.6 厂商栈下 **WebKitGTK 应用必崩**（EasyTier 打不开的真正原因）
 

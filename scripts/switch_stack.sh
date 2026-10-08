@@ -55,6 +55,7 @@ DDX=/usr/lib/xorg/modules/drivers/mwv207_drv.so
 # 持久化（决定开机时哪个驱动抢到设备；**改这三项等于改开机路径**）
 BLACKLIST=/etc/modprobe.d/zz-jmgpu-test-blacklist.conf
 MODLOAD=/etc/modules-load.d/jmgpu.conf
+IR_MODULES=/etc/initramfs-tools/modules
 IR_LOG=/tmp/jmgpu-initramfs.log
 
 die() { echo "!! $*" >&2; exit 1; }
@@ -109,11 +110,19 @@ cmd_status() {
 	[ -f "$BLACKLIST" ] && echo "已设置（开机 jmgpu 抢设备）" || echo "未设置（开机 mwv207 接管）"
 	printf "  modules-load jmgpu: "
 	[ -f "$MODLOAD" ] && echo "已设置" || echo "未设置"
+	printf "  initramfs 内 jmgpu: "
+	if grep -qx 'jmgpu' "$IR_MODULES" 2>/dev/null; then
+		echo "已设置（开机早期即加载，不白等 GPU）"
+	else
+		echo "未设置（initramfs 里没有 DRM 设备 ⇒ 开机白等 ~13.7s，见 persist 注释）"
+	fi
 
 	# 一致性检查：配置与持久化是否配套（不配套时重启会落到"半切"状态）
 	local want=0 have=0
 	[ -f "$XCONF" ] && want=1
-	[ -f "$BLACKLIST" ] && have=1
+	[ -f "$BLACKLIST" ] && [ -f "$MODLOAD" ] && have=1
+	# initramfs 也要自带 jmgpu，否则开机在 initramfs 里白等 ~13.7s（见 cmd_persist 注释）
+	grep -qx 'jmgpu' "$IR_MODULES" 2>/dev/null || have=0
 	echo
 	if [ "$want" = 1 ] && [ "$have" = 0 ]; then
 		echo "  ⚠️ 不一致：X 已配厂商 DDX，但**未持久化** ⇒ 重启将由 mwv207 接管，"
@@ -156,7 +165,7 @@ cmd_backup() {
 	need_root backup
 	ensure_bak
 	say "备份到 $BAK（后缀 .$STAMP.bak）"
-	for f in "$XCONF" "$ENVF" "$VBLANK_SVC" "$VBLANK_TMP" "$PROF_GLX" "$DDX"; do
+	for f in "$XCONF" "$ENVF" "$VBLANK_SVC" "$VBLANK_TMP" "$PROF_GLX" "$DDX" "$IR_MODULES"; do
 		backup_file "$f"
 	done
 	echo "$STAMP" > "$BAK/.last-stamp"
@@ -181,6 +190,7 @@ cmd_restore() {
 			drm-vblank.conf) cp -a "$b" "$VBLANK_TMP" ;;
 			mwv207_glvnd.sh) cp -a "$b" "$PROF_GLX" ;;
 			mwv207_drv.so)   cp -a "$b" "$DDX" ;;
+			modules)         cp -a "$b" "$IR_MODULES" ;;
 			*) echo "    跳过 $b（未知目标）"; continue ;;
 		esac
 		echo "    恢复 $orig"
@@ -208,11 +218,28 @@ _rebuild_initramfs() {
 cmd_persist() {
 	need_root persist
 	say "写入厂商栈持久化（**改开机路径**）"
-	echo "[1/3] blacklist mwv207"
+	echo "[1/4] blacklist mwv207"
 	printf 'blacklist mwv207\n' > "$BLACKLIST" && sed 's/^/    /' "$BLACKLIST"
-	echo "[2/3] modules-load jmgpu"
+	echo "[2/4] modules-load jmgpu（切根后的 systemd 早期加载）"
 	printf 'jmgpu\n' > "$MODLOAD" && sed 's/^/    /' "$MODLOAD"
-	echo "[3/3] 重建 initramfs（把上面两项冻结进开机镜像）"
+	# 2026-10-08: **initramfs 必须自带并提前加载 jmgpu**。
+	# modules-load.d 只对切根后的 systemd 生效；initramfs 阶段既不会收录
+	# updates/dkms/*.ko（MODULES=most 只扫 kernel/），也不读 modules-load.d
+	# ⇒ 那 38 秒的 initramfs 里**没有**任何 DRM 设备，而 deepin 的 /init 里有
+	#     wait_for_gpu_device()   # 2000 次 × sleep 0.005 ≈ 10~14s，超时后放弃
+	# 实测（boot 0，monotonic）：24.696s "begin wait gpu device"
+	#                        → 38.363s "No drm device,timeout" = **白等 13.67s**。
+	# 把 jmgpu 写进 /etc/initramfs-tools/modules 后，initramfs-tools 会把
+	# updates/dkms/jmgpu.ko 连同依赖收进镜像并写入 /conf/modules，由 /init 的
+	# load_modules() 在很早就 modprobe（早于 wait_for_gpu_device）⇒
+	# /dev/dri/card0 提前出现，等待立即返回（系统栈的 mwv207 正是这样做的）。
+	echo "[3/4] 让 initramfs 自带并提前加载 jmgpu（消除开机等 GPU 的 ~13.7s 超时）"
+	if grep -qx 'jmgpu' "$IR_MODULES" 2>/dev/null; then
+		echo "    $IR_MODULES 已含 jmgpu ✓"
+	else
+		printf 'jmgpu\n' >> "$IR_MODULES" && sed 's/^/    /' "$IR_MODULES"
+	fi
+	echo "[4/4] 重建 initramfs（把上面几项冻结进开机镜像）"
 	_rebuild_initramfs || true
 	echo
 	echo "    回退： sudo $0 system   （或紧急时 sudo ~/rollback-to-system.sh）"
@@ -222,6 +249,9 @@ cmd_unpersist() {
 	say "移除厂商栈持久化（恢复 mwv207 可加载）"
 	rm -f "$BLACKLIST" && echo "    已删 $BLACKLIST"
 	rm -f "$MODLOAD" && echo "    已删 $MODLOAD"
+	if grep -qx 'jmgpu' "$IR_MODULES" 2>/dev/null; then
+		sed -i '/^jmgpu$/d' "$IR_MODULES" && echo "    已从 $IR_MODULES 移除 jmgpu"
+	fi
 	_rebuild_initramfs || true
 }
 
