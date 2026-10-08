@@ -292,6 +292,46 @@ EOF
 		echo 'WEBKIT_DISABLE_COMPOSITING_MODE=1' >> "$ENVF"
 	sed 's/^/    /' "$ENVF"
 
+	echo "[2b/5] kwin 合成器（**必须真的在跑**，见 README §3.3 #13 / §6 #13）"
+	# user_type=5 是 NoneCompositor（合成被显式关闭）。此前一直是 5 ⇒ 无合成器
+	# ⇒ 窗口直写扫描缓冲，与"GLX 交换无 vblank 同步"叠加 = 三角/楔形错位。
+	# 注意 kwin-common 6.1.38 包内的 libkwin.so 实为 5.27.2（版本混装），
+	# 运行中的 kwin 读不到 dconfig 的 user_type ⇒ 必须同时写 kwinrc 原生键。
+	# 从运行中的 kwin 取会话 DISPLAY/XAUTHORITY（脚本可能不在会话里执行）
+	_D=$(tr '\0' '\n' < "/proc/$(pgrep -x kwin_x11 | head -1)/environ" 2>/dev/null | sed -n 's/^DISPLAY=//p')
+	_XA=$(tr '\0' '\n' < "/proc/$(pgrep -x kwin_x11 | head -1)/environ" 2>/dev/null | sed -n 's/^XAUTHORITY=//p')
+	_D=${_D:-:0}
+	_XA=${_XA:-$HOME/.Xauthority}
+	_asuser() { sudo -n -u "${SUDO_USER:-$USER}" env DISPLAY="$1" XAUTHORITY="$2" "${@:3}"; }
+	_asuser "$_D" "$_XA" dde-dconfig --set -a org.kde.kwin \
+		-r org.kde.kwin.compositing -k user_type -v 4 >/dev/null 2>&1 \
+		&& echo "    dconfig user_type=4 已设置" \
+		|| echo "    !! dconfig 设置失败（可登录后在会话内手动设置）"
+	# 只在 [Compositing] 段内改键：kwinrc 里别的段也有 Enabled=（如
+	# [Script-*]），用全局 grep/sed 会误改它们。
+	_kwinrc_set() {
+		local f="$HOME/.config/kwinrc" k="$1" v="$2"
+		[ -f "$f" ] || { mkdir -p "$(dirname "$f")"; printf '[Compositing]\n' > "$f"; }
+		awk -v k="$k" -v v="$v" '
+			BEGIN { in_c = 0; seen = 0 }
+			/^\[/ { if (in_c && !seen) { print k "=" v; seen = 1 } ; in_c = ($0 == "[Compositing]") }
+			in_c && $0 ~ ("^" k "=") { if (!seen) { print k "=" v; seen = 1 } ; next }
+			{ print }
+			END {
+				if (!seen) {
+					if (in_c) { print k "=" v }
+					else { print ""; print "[Compositing]"; print k "=" v }
+				}
+			}
+		' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+	}
+	_kwinrc_set Backend XRender
+	_kwinrc_set Enabled true
+	echo "    kwinrc: $(grep -E '^(Backend|Enabled)=' "$HOME/.config/kwinrc" 2>/dev/null | tr '\n' ' ')"
+	_asuser "$_D" "$_XA" dbus-send --session --print-reply \
+		--dest=org.kde.KWin /Compositor org.kde.kwin.Compositing.reinitialize \
+		>/dev/null 2>&1 && echo "    已请求 kwin 重新初始化合成" || true
+
 	echo "[3/5] libdrm.so.2.4.0 兼容链接（两处都要，见 docs/系统还原后重建步骤.md §3）"
 	ln -sf /usr/lib/aarch64-linux-gnu/libdrm.so.2 "$DRM_LINK_SYS"
 	ln -sf /usr/lib/aarch64-linux-gnu/libdrm.so.2 "$DRM_LINK_MWV"
