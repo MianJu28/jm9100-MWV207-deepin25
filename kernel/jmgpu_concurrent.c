@@ -138,6 +138,10 @@ static void drm_fb_helper_output_poll_changed(struct drm_device *dev)
 }
 #endif
 
+/* 2026-09-18: 定义见 jmgpu_package.c —— 有界等待翻转完成
+ * （本板硬件 vblank 事件不产生, 不能等真 vblank） */
+void jmgpu_commit_wait_flip(struct drm_atomic_state *old_state);
+
 static void j9_handle_j9m_principium(struct drm_atomic_state *old_state)
 {
 	struct drm_crtc_state *new_crtc_state;
@@ -158,7 +162,11 @@ static void j9_handle_j9m_principium(struct drm_atomic_state *old_state)
 	}
 
 	drm_atomic_helper_commit_hw_done(old_state);
-	drm_atomic_helper_wait_for_vblanks(dev, old_state);
+	/* 2026-09-18: 原为 drm_atomic_helper_wait_for_vblanks(dev, old_state) ——
+	 * 本板硬件 vblank 事件不产生 ⇒ 只会等满 DRM 超时（客户端偶发 ~1s 卡）.
+	 * 改为有界等待一个帧周期 + 推进 vblank 计数;
+	 * 翻页完成事件已由 j9_handle_j9maths_stringiest() 按需即时交付. */
+	jmgpu_commit_wait_flip(old_state);
 	drm_atomic_helper_cleanup_planes(dev, old_state);
 }
 

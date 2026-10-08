@@ -86,6 +86,7 @@ A/B 说明：客户端同步只作用于 **GLX 交换**；错位依旧说明竞�
 | `gbm_jm_surface_get_free_buffer+0x48` 空指针崩溃（mpv 自建窗口 surface 时） | 调用栈：`libmpv.so.2 → libEGL_mwv207.so(+0x32a68/+0x32af4/+0x23390/+0x23bc4) → libgbm_jm.so(gbm_jm_surface_get_free_buffer)`，`si_addr=0x839` |
 | `libdrm_jmgpu.so` 缺失（`/usr/lib`、`/lib` 均无），libva/GBM 探测逐次 ENOENT | strace 记录 |
 | 进程内先有桌面 GL 上下文后建 EGL 上下文时，桌面 GL 未声明 `GL_EXT_EGL_image_storage` | README §3.6 |
+| **【严重】EGL 销毁上下文未清 libglapi TLS ⇒ 后续 GLX 销毁在 `jmDestroyContext` 段错误（use-after-free，WebKitGTK 应用启动即崩）** | 详见本文 **§10**（含确定性复现程序 `tools/glx_egl_tls_uaf_repro.c`、core 指令级证据、逐阶段 TLS 追踪） |
 
 ## 6. 请厂商提供的支持（按优先级）
 
@@ -316,3 +317,155 @@ echo 1 | sudo tee /sys/module/jmgpu/parameters/update_at_vblank
 echo 1 | sudo tee /sys/module/jmgpu/parameters/flip_waits_2d_idle
 # 3) X 侧：Option "TearFree" "off"（代价：出现普通撕裂）
 ```
+
+---
+
+## 10. 2026-09-18：**用户态栈 use-after-free ⇒ WebKitGTK 应用启动即崩**（含确定性复现程序）
+
+### 10.1 现象
+
+切到厂商栈后，GTK3/WebKit2GTK 应用（EasyTier、MiniBrowser）**窗口一闪即消失**；
+`journal` 只见 `pkexec[...]: pam_unix(polkit-1:session): session opened for user root` 后无下文。
+禁用 WebKit 加速合成（`WEBKIT_DISABLE_COMPOSITING_MODE=1`）后恢复正常。
+
+### 10.2 崩溃现场（core + gdb，指令级）
+
+```
+Program terminated with signal SIGSEGV
+#0  jmDestroyContext+56   jmgpu_dri.so        指令: ldr x0,[x0,#376]
+#1  dri3DestroyContext    libGLX_mwv207.so
+#2  glXDestroyContext     libGLX_mwv207.so
+#3  libgdk-3.so  →  g_object_run_dispose  →  gdk_window_destroy
+    →  gtk_widget_unrealize  →  libwebkit2gtk-4.1.so
+寄存器: x0 = x21 = 0xffffc0481010（= _glapi_get_context() 返回值）
+       该地址 **不在进程任何映射内**（整个 ffffc0… 区段为空）⇒ 悬垂指针 / use-after-free
+库内偏移: 0x69638（函数入口 0x69600，文件 /usr/lib/aarch64-linux-gnu/dri/jmgpu_dri.so）
+```
+
+### 10.3 逐阶段 TLS 追踪（本仓库 `tools/glx_egl_tls_uaf_repro.c`）
+
+| 阶段 | 厂商 libglapi 的 TLS `current` | 判读 |
+| --- | --- | --- |
+| 加载 `libGLX_mwv207` 后 | `(nil)` | 起点正常 |
+| `eglCreateContext` 后 | `(nil)` | — |
+| `eglMakeCurrent` 后 | `0xffff8ae01010` | EGL 绑定时写入（正常） |
+| **`eglMakeCurrent(EGL_NO_CONTEXT)` 后** | `0xffff8ae01010` | ★ 解绑**未清** |
+| **`eglDestroyContext` 后** | `0xffff8ae01010` | ★★ 销毁后**仍保留悬垂值** |
+| `glXCreateContextAttribsARB` 后 | 同上（未变） | — |
+| `glXDestroyContext` | — | **SIGSEGV**（同 10.2） |
+
+### 10.4 三条独立证据（反编译 / 动态绑定）
+
+1. `libEGL_mwv207.so` 全库反汇编中 **没有任何** `_glapi_set_context` /
+   `_glapi_get_context` 引用 ⇒ **EGL 侧从不清理 TLS**；
+2. `LD_DEBUG=bindings`：`jmgpu_dri.so` 的 `_glapi_get/set_context` 绑定到
+   **厂商自带的** `libGLX_mwv207`（`_glapi_*@@VERSION`），**不是**系统 `libglapi.so.0`
+   ⇒ 进程内存在两套 `_glapi` 与两份 TLS；
+3. `jmDestroyContext` 反汇编：同函数内 `[ctx,#376]`、`[ctx,#368]` 访问**都有 `cbz`
+   空指针检查**，唯独 `[current,#376]`（`current = _glapi_get_context()`）
+   **只判 `!= NULL`**，未校验有效性 ⇒ 悬垂即崩。
+
+### 10.5 确定性复现（请直接跑这一条）
+
+```bash
+# 本仓库 tools/glx_egl_tls_uaf_repro.c
+gcc -O2 -o glx_egl_tls_uaf_repro tools/glx_egl_tls_uaf_repro.c -lEGL -lGL -lX11 -ldl
+
+# ① 复现（预期 SIGSEGV，栈与 10.2 完全一致）
+__GLX_VENDOR_LIBRARY_NAME=mwv207 DISPLAY=:0 ./glx_egl_tls_uaf_repro
+# ② 对照：跳过 EGL 阶段 ⇒ 不崩（证明"EGL 先建/销毁"是前置条件）
+__GLX_VENDOR_LIBRARY_NAME=mwv207 DISPLAY=:0 ./glx_egl_tls_uaf_repro --no-egl
+# ③ 对照：EGL 走 Mesa（GLX 仍用厂商）⇒ 不崩
+__GLX_VENDOR_LIBRARY_NAME=mwv207 \
+__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json \
+DISPLAY=:0 ./glx_egl_tls_uaf_repro
+```
+
+补充说明：**单纯 GLX `create+destroy` 不会崩**（此时 TLS 是有效上下文，走正常分支）；
+必须"进程里先有 EGL 建/绑/销毁"才崩 —— 这正是 GTK3/WebKit2GTK 类应用的形态
+（EGL 与 GLX 并存），也解释了为何只有该应用类别受影响。
+
+### 10.5.1 追加：缺陷的**内部精确位置**（2026-09-18 反编译复核）
+
+我们用 gdb 逐条验证了 EGL 路径的调用序列（`libEGL_mwv207` → `jmgpu_dri.so`），
+结论比 §10.4 更具体 —— **EGL 上下文从未维护 DRI 的"current 标志"，
+导致 DRI 内所有"lose/destroy current 时清 TLS"的分支都被跳过**：
+
+| 位置 | 现状 | 应有行为 |
+| --- | --- | --- |
+| `jmgpu_dri.so: veglMakeCurrent_es3` @`0xe40e0` | `0xe414c: cbz x19, 0xe412c` —— 当 ctx == NULL（解绑）时**直接返回，不调用 `_glapi_set_context`**（对比：`libGLX_mwv207: MakeContextCurrent` 在解绑时会置 NULL，两者语义不一致） | 解绑时也应 `_glapi_set_context(NULL)`（或清哑上下文） |
+| `jmgpu_dri.so: veglDestroyContext_es3` @`0xe41b8` | **被 `eglDestroyContext` 调用**（实测 `x1` = 该上下文的 glapi 上下文指针），但函数内**没有任何 `_glapi_set_context` 引用** | 销毁时若该上下文是 current，应清 TLS |
+| DRI 的 "current 标志" `[ctx->[16] + 0xac000 + 11272]` | EGL 路径**从未置位/维护** ⇒ `jmLoseCurrent` @`0x693c4`（`cbnz w0, ...`）与 `jmDestroyContext` @`0x696c0`（`cbz w0, ...`）都走"什么都不做"的早返回 | 由 EGL 路径正确维护，使上述清理生效 |
+| `jmgpu_dri.so: jmDestroyContext` @`0x69638` | `ldr x0,[x0,#376]`，`x0 = _glapi_get_context()` **只判 `!= NULL`**（同函数内 `[ctx,#376]/[ctx,#368]` 访问均有 `cbz`） | 解引用前增加有效性防护（或至少不崩溃） |
+
+补充实测（可供贵方复现"EGL 不通知驱动"）：
+
+```
+gdb 断点统计（本仓库 tools/glx_egl_tls_uaf_repro.c 的 EGL 阶段）：
+  veglMakeCurrent_es3   被调用 1 次（仅绑定那次，x1=有效 ctx）
+  jmLoseCurrent         被调用 0 次
+  veglDestroyContext_es3 被调用 1 次（x1 = 被遗留的那份 glapi 上下文指针）
+```
+
+我方曾尝试在 DRI 内做等价补丁（例如把 `veglMakeCurrent_es3` 的 NULL 分支改为也清 TLS），
+**实测无效且已回退**，因为解绑路径根本不进入该函数 —— 这也从反面证明问题在 EGL 侧的调用缺失。
+
+### 10.5.2 追加：**内核 `jmkOS_WaitNativeFence` 等待预算算错**（我方已修，供参考）
+
+`kernel/jmgpu_symbol.c`（6.6 活动分支）中：
+
+```c
+ret = dma_fence_wait_timeout(f, 1, timeout);
+...
+} else {
+        timeout -= ret;      /* ★ 错 */
+}
+```
+
+`dma_fence_wait_timeout()` 返回的是**剩余**预算（jiffies），正确写法是 `timeout = ret;`。
+原写法把剩余预算替换成"已用时间"⇒ 多元素 fence array 的**后续元素预算被越缩越小 ⇒ 提前超时**，
+`jmkOS_WaitNativeFence` 返回 `J9MATHS_LIBERALIZE` ⇒ 调用方（`jmo_SURF_WaitFence` 等）
+可能带着**尚未完成**的缓冲继续使用，表现为内容不一致（三角/楔形错位一类）。
+
+- 我方修复：`timeout = ret;`，并把判断从外层 `fence` 改为逐元素 `f`（`dma_fence_is_signaled(f)`）；
+- 同一函数的**旧内核分支**（`#else` 之前的版本）有同样写法，建议一并修正；
+- 复现/验证：#11 项（§6）与 `sudo ./scripts/sync_dkms.sh build` 后观察。
+
+### 10.6 诉求（按重要性）
+
+1. **`libEGL_mwv207`（或 DRI 的 EGL 路径）在 `eglMakeCurrent(EGL_NO_CONTEXT)`
+   与 `eglDestroyContext()` 时必须调用自带 libglapi 的 `_glapi_set_context(NULL)`**
+   —— 这是崩溃主因；
+2. `jmgpu_dri.so:jmDestroyContext` 在解引用
+   `current = _glapi_get_context()` 前增加有效性防护（至少"悬垂即跳过"），
+   与同函数内既有 `cbz` 检查保持一致 —— 纵深防御；
+3. 明确 EGL/GLX/DRI 三方共用 libglapi 时 TLS 生命周期的唯一归属，
+   或改为只依赖系统 `libglapi.so.0`。
+
+> 该项属**内存安全缺陷（use-after-free）**，除稳定性外亦建议按安全缺陷处理。
+
+### 10.7 本机可用规避（已验证，非根治）
+
+```bash
+# A 备用：禁用 WebKit 加速合成（pam_env 交付，对 pkexec 提权实例同样生效）
+echo 'WEBKIT_DISABLE_COMPOSITING_MODE=1' | sudo tee -a /etc/environment
+# B 强制 EGL 走 Mesa（代价：EGL 硬件路径全失效，含 VA-API 零拷贝，不推荐全局）
+# C 守卫（当前采用，见 §10.8）
+```
+
+### 10.8 我方现行修复：`glxguard` 守卫（保留 WebKit 加速合成）
+
+`tools/glxguard.c` → `libglapi` TLS 的**悬垂判定**用 `mincore()`（未映射地址返回 -1/ENOMEM），
+**只清"指向已释放内存"的真 UAF**，合法的当前上下文绝不触碰：
+
+```
+悬垂场景  ： [glxguard] 检出悬垂 current=0xffffa20d1010（未映射）→ 清空后再销毁 ⇒ 未崩溃 ✓
+多上下文  ： [glxguard] current 仍在映射内，保持不动 ⇒ 当前上下文不受影响 ✓
+对照组    ： 无守卫时 glXDestroyContext ⇒ 段错误 139
+```
+
+部署（`tools/fix_easytier_glxguard.sh apply`）：编译到 `/usr/local/lib/glxguard.so`，
+并把 `/usr/bin/easytier-gui` 换成包装脚本（原二进制备份为 `.real`），
+包装脚本自行注入 `LD_PRELOAD` —— 这样**经 pkexec 提权的实例也带上守卫**。
+
+> 这是**绕过**（consumer 侧拦下 UAF），不是根治；根治仍需贵方按 §10.6 修正 EGL 侧。

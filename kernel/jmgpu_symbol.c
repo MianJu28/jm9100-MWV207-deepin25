@@ -4562,8 +4562,8 @@ jmkOS_WaitNativeFence(IN jmk_OS Os,
 				fence_put(f);
 				j9_recaution(J9MATHS_LIBERALIZE);
 			} else {
-
-				timeout -= ret;
+				/* 同 6.6 分支的修复：返回值是剩余预算，须赋值而非相减 */
+				timeout = ret;
 			}
 		}
 
@@ -4613,7 +4613,11 @@ jmkOS_WaitNativeFence(IN jmk_OS Os,
 	for (i = 0; i < numFences; i++) {
 		struct dma_fence *f = fences[i];
 
-		if (!dma_fence_is_signaled(fence)) {
+		/*
+		 * 逐元素判断：原来判断的是**外层 fence**（可能是数组本身），
+		 * 对已就绪的元素会做无谓等待；这里按元素自身状态判断。
+		 */
+		if (!dma_fence_is_signaled(f)) {
 			signed long ret;
 
 			ret = dma_fence_wait_timeout(f, 1, timeout);
@@ -4625,8 +4629,16 @@ jmkOS_WaitNativeFence(IN jmk_OS Os,
 				dma_fence_put(fence);
 				j9_recaution(J9MATHS_LIBERALIZE);
 			} else {
-
-				timeout -= ret;
+				/*
+				 * ★ 修复：dma_fence_wait_timeout() 返回的是**剩余**预算
+				 *   （jiffies），必须赋值而不是相减。
+				 *   原来的 `timeout -= ret` 把剩余预算替换成"已用时间"，
+				 *   于是后续元素的等待预算被越缩越小 ⇒ 多元素（fence array）
+				 *   必然提前超时，调用方（如 jmo_SURF_WaitFence）会拿到
+				 *   J9MATHS_LIBERALIZE 而带着"尚未完成"的缓冲继续用，
+				 *   表现为渲染/显示内容不一致（三角/楔形错位一类）。
+				 */
+				timeout = ret;
 			}
 		}
 	}

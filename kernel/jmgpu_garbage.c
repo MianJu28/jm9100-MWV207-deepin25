@@ -55,6 +55,25 @@ static int enable_share_to_ft;
 module_param(enable_share_to_ft, int, 0644);
 MODULE_PARM_DESC(enable_share_to_ft,
 		"Enable sharing pixmap to FT, default<0>, enable with<1>.");
+
+/*
+ * 本仓库新增（治"视频窗口三角/楔形错位"，详见 README §6 #1）：
+ *
+ *   DDX 的呈现链条是「XRender/EXA 把内容合成到影子缓冲（2D 引擎作业）
+ *   → 用 DRM_JM_GEM_XFER_RECT 把影子缓冲上传到扫描缓冲 → 翻页」。
+ *   厂商实现里，**上传与之前排队的 2D 合成作业之间没有任何同步**：
+ *   上传可能读到"只写了一半"的影子缓冲，显示出来就是
+ *   三角/楔形错位 + 重复之前的片段（偶发，集中在视频窗口）。
+ *
+ *   该参数 = 开始搬运前等待「2D 引擎空闲」的超时（毫秒）；
+ *   0 = 关闭（回退到厂商原行为）。默认 30ms：正常情况 2D 队列很短，
+ *   等待只花微秒级；异常时也不会卡死（有界，且失败只告警不阻断）。
+ */
+int xfer_waits_2d_idle = 30;
+module_param(xfer_waits_2d_idle, int, 0644);
+MODULE_PARM_DESC(xfer_waits_2d_idle,
+	"Wait for the 2D engine to become idle before starting a GEM xfer_rect "
+	"(milliseconds; 0 = off = vendor behaviour). Default 30.");
 extern int order_vram_access;
 
 #if KERNEL_VERSION(5, 11, 0) <= LINUX_VERSION_CODE
@@ -1176,6 +1195,20 @@ static int j9_handle_j9ma_arecaceous(struct drm_device *drm, void *data,
 		xfer.dir = J9_HANDLE_J9MENU_SPORICIDAL;
 	else
 		xfer.dir = J9_HANDLE_J9MIRROR_MASTECTOMY;
+
+	/*
+	 * ★ 本仓库修复：开始搬运前先等 2D 引擎排空（有界），
+	 *   保证源缓冲（影子缓冲）已经被前面的合成作业写完，
+	 *   避免把"半成品"上传到扫描缓冲（症状：三角/楔形错位 + 重复旧片段）。
+	 *   超时只告警、不阻断，避免异常情况下卡住应用；0 可关闭（见参数说明）。
+	 */
+	if (xfer_waits_2d_idle > 0 && gdev->p2d) {
+		int wret = j9mirror_monosilane(gdev->p2d, xfer_waits_2d_idle);
+
+		if (wret)
+			pr_warn_ratelimited("jmgpu: 2D not idle before xfer_rect (ret=%d), continue\n",
+					    wret);
+	}
 
 	if (gdev->platform->ops->xfer_rect(gdev->platform, &xfer) !=
 			J9_FLUTTERING)

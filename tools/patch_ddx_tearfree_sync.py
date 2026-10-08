@@ -64,6 +64,12 @@ import sys
 EXPECT_SHA256 = "c58afa9ea948f2a2b0a8993f3b0b33abcc1bc1e45e0664fdd2331599826e6621"
 EXPECT_SIZE = 140464
 
+# ---- 允许的基线白名单 ----
+# 说明：现装机上**已装**的 DDX 是"ABI25 修复版"（不是未改动的原件），
+# 两个补丁点（0x12cb0 / 0x131fc）与等待函数（0x10d78）在 ABI 修复后**完全未变**，
+# 因此可安全地在该版本上继续打本补丁 ⇒ 得到"ABI25 + TearFree 同步"合一版。
+ABI25_SHA256 = "70d02b433d94d15ca86fa7c06ba8a2e963fd7a52c46d4709bcf96ee61830735d"
+
 # ---- 地址（本 ELF 首个 PT_LOAD 的 p_offset == p_vaddr ⇒ 文件偏移 == vaddr）----
 WAIT_IDLE_FN = 0x10D78          # 现成的"等 2D 空闲"封装（0 引用）
 PATCH_SITES = (0x12CB0, 0x131FC)  # ldp x29,x30,[sp,#16] -> bl WAIT_IDLE_FN
@@ -102,13 +108,20 @@ def main():
     print("输入文件 : %s" % args.src)
     print("大小     : %d 字节" % len(data))
     print("SHA-256  : %s" % sha)
-    if sha != EXPECT_SHA256:
-        print("!! 警告：SHA-256 与预期原件不符（预期 %s）" % EXPECT_SHA256)
-        if not args.check:
-            print("!! 已终止，避免在错误文件上打补丁。")
-            return 2
-    else:
-        print("校验     : 与原件 SHA-256 一致 OK")
+    known_bases = {
+        EXPECT_SHA256: "未改动的原件",
+        ABI25_SHA256: "ABI25 修复版（本机已装）",
+    }
+    if sha not in known_bases:
+        print("!! SHA-256 不在已知基线内：%s" % sha)
+        print("   已知基线：")
+        for h, n in known_bases.items():
+            print("     %s  (%s)" % (h, n))
+        print("!! 已终止，避免在错误文件上打补丁。")
+        return 2
+    print("校验     : 基线 = %s OK" % known_bases[sha])
+    if sha == ABI25_SHA256:
+        print("           （在 ABI25 修复版上打本补丁 ⇒ 产出\"ABI25 + TearFree 同步\"合一版）")
 
     # 校验两个插入点都是期望的 ldp
     ok = True

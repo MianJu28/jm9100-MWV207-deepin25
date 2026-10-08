@@ -351,9 +351,20 @@ LIBVA_DRIVER_NAME=jmgpu mpv --no-config --vo=gpu --hwdec=vaapi --frames=5 video.
 | 5 | **`DRM_JM_GEM_XFER_RECT` 整数溢出** + 第二缓冲未校验 | 用户可控 `offset/size` 未做范围检查 | `jmgpu_garbage.c` |
 | 6 | **三处分配器 `.Physical` 缺 `Offset` 越界检查** | 同上 | `jmgpu_crosstab.c` / `jmgpu_setlayout.c` / `jmgpu_background.c` |
 | 7 | **把 `JMM_kASSERT` 当边界检查的 8 处缺陷**（含**用户可控 `ChannelId` 越界写**） | `JMM_kASSERT` 在发行构建（`-DDBG=0`）下**展开为空** ⇒ 检查与 `return` 全部消失 | `jmgpu_register.c`（`channels[ChannelId]`）、`jmgpu_marketing.c`/`jmgpu_crosstab.c`/`jmgpu_background.c`（`.Mmap`/`.GetSGT` 的 `skipPages/numPages/Offset`）、`jmgpu_middleware.c`（`1ull << channelId`） |
+| 8 | **三角/楔形错位**：GEM 搬运行前不等 2D 排空 | DDX 的「2D 合成 → 影子缓冲 → `DRM_JM_GEM_XFER_RECT` 上传 → 翻页」链条里，**上传与之前的 2D 合成无同步** ⇒ 上传可能读到只写了一半的源缓冲 | `jmgpu_garbage.c` `j9_handle_j9ma_arecaceous()`：开始搬运前 `j9mirror_monosilane(p2d, ms)`（有界等待，失败只告警）。开关：`xfer_waits_2d_idle`（毫秒，0=关闭，默认 **30**） |
+| 9 | **`jmkOS_WaitNativeFence` 等待预算算错**（栅栏提前超时） | `dma_fence_wait_timeout()` 返回**剩余**预算，原码写作 `timeout -= ret` ⇒ 多元素 fence array 后续预算越缩越小、提前超时 | `jmgpu_symbol.c`（6.6 分支改为 `timeout = ret` + 逐元素判断；旧内核分支同类写法一并修） |
+| 10 | **GL/EGL 应用送显只有 1~2.5 次/秒**（mpv `vo=gpu`/`vo=gpu-next`、EasyTier 等画面严重卡顿；同机 `vo=x11` 却完全平滑） | 本板**硬件 vblank 中断不产生事件** ⇒ `drm_crtc_send_vblank_event()` 送不出翻页完成事件 ⇒ 客户端（X Present / EGL）只能等自身 **~1s 超时** ⇒ 屏幕 1 次/秒。整屏抓屏实测（60fps 抓 8s）：GL 路径**更新间隔恒为 1000ms**、`vo=x11` 为 **33ms/29.9 次每秒**。驱动内本有完整的**软件 vblank（hrtimer）**实现，但默认不启用；且其周期取自 `crtc->state->mode` 得到失效值（~7Hz，与实测 7.2 次/秒吻合） | `jmgpu_package.c`：① `fake_vblank` 默认改 **1**（启用软件 vblank）；② 新增参数 **`vblank_refresh`**（Hz，默认 **100**＝面板实际刷新率，0=按模式推导，20~240 之外兜底 100）；③ 定时器行为：disable 不 `hrtimer_cancel()`（会被 `drm_crtc_vblank_put()` 在回调内间接调用 ⇒ 自我取消会死等）<br>**最终方案（2026-09-18，已上线）**：**放弃周期性软件 vblank** —— 实测它（无论是否同时保留硬件路径）都会打坏光标平面的行 vblank ⇒ **鼠标指针不动** ✗。改为**按需交付**：在 `j9_handle_j9maths_stringiest()` 里、客户端提交翻页时**立即**补发该次完成事件 + 推进一次 vblank 计数（新增参数 **`flip_event_immediate`**，默认 **1**）；`fake_vblank` 恢复默认 **0**，`enable/disable_vblank` 分发逻辑恢复原实现（把风险面降到零）。<br>**实测**：GL 路径屏幕更新 **1.5~2.4 → 7.3 → 17.3 次/秒**（间隔中位 1000ms → 67ms → 17ms）✓，光标正常 ✓；残留偶发 1s 卡仍在（提交路径里仍有等 vblank 的地方）。<br>**再一层教训**：把提交尾部的 `drm_atomic_helper_wait_for_vblanks()` 换成"有界等待 10ms"（`flip_wait_ms=10`）会让**每一次原子提交**都慢 10ms —— 而**鼠标光标的移动也走提交路径** ⇒ **鼠标非常不跟手** ✗。故 `flip_wait_ms` 默认改 **0**（不等待）：光标跟手、且送显更快（7.3 → 17.3 次/秒）。本机已用 `/etc/modprobe.d/jmgpu-vblank.conf` 固化 `flip_event_immediate=1 / flip_wait_ms=0 / fake_vblank=0`。<br>**2026-09-21 结论：内核侧到此为止**。又试了"只推进 vblank 计数、不发事件/不 put"的软件定时器（新参数 `sw_vblank_counter`，默认 0）：光标确实不受影响 ✓（闸门验证通过），但 **GL 窗口画面反而完全不再更新** ✗ ⇒ **伪造 vblank 解决不了 GL 送显**（问题在用户态 X Present / EGL / 合成器的交互里）。因此：**日常播放用 `vo=x11`**（稳定 30 次/秒 + 颜色正确），内核保持 `flip_event_immediate=1 / flip_wait_ms=0`（把 GL 路径从 1.5~2.4 提到 7.3~17.3 次/秒，光标正常，无内核报错）；彻底回退用 `~/revert-jmgpu.sh`。<br>**本机播放建议**：mpv 用 **`vo=x11`**（31.5 次/秒、33ms 恒定、颜色正确；1080x1920 HEVC 30fps 实测跟得上）。 |
+| 11 | **#7 同类残留（2026-10-08 补齐）**：① 两个分配器 `.Mmap` 仍只用"发行构建下被编译掉"的 `JMM_kASSERT`；② 4 处 extent 检查求和可溢出 | ① `jmgpu_setlayout.c`（reserved-mem）与 `jmgpu_formula.c`（VMEM）的 `.Mmap` 里 `JMM_kASSERT(skipPages + numPages <= Mdl->numPages)` 在 `-DDBG=0` 下展开为空，其后 `remap_pfn_range()` / fault handler 按**用户给定的 mmap 长度**映射；VMEM 的 fault handler 只判 `is_vmalloc_addr()` ⇒ 越界 offset 仍落在 vmalloc 区、会拿到**别的分配**的页并 `get_page()` 交给用户态。② `setlayout`/`formula`/`marketing` 的 `.MapKernel` 与 `jmgpu_through.c` 镜像同步写的是 `Offset + Bytes > size` —— 用户可控 `Offset` 很大时求和回绕 ⇒ 检查被绕过 | `jmgpu_setlayout.c` `j9_pathopsychosis()`（+`res` 空判）、`jmgpu_formula.c` `j9_finale()` 与 `_VMEMFaultLegacy()`（offset 越界 + `vmalloc_to_page()` 空返回）；4 处 extent 一律改为 `Offset > size \|\| Bytes > size - Offset`。**至此 5 个 `.Mmap` 实现、全部 `.Physical`/`.GetSGT` 均已有真实边界检查 —— 该类审计收口** |
+
 
 **同族但有意未改**：`jmgpu_program.c`（MMU/STLB）、`jmgpu_refactor.c`（堆空闲链表）等处的 `JMM_kASSERT`
 属**内部不变量**，值不受用户控制，改运行时检查收益低而回归面大。
+
+**2026-10-08 复核（该类收口）**：5 个 `.Mmap`（`jmgpu_marketing.c`/`jmgpu_background.c`/`jmgpu_crosstab.c`/
+`jmgpu_setlayout.c`/`jmgpu_formula.c`）、全部 `.Physical`、全部 `.GetSGT` 现已都有真实边界检查；
+`jmgpu_middleware.c`/`jmgpu_destroy.c` 里用户可控的 patch `type` 虽只用 `JMM_kASSERT` 断言，但
+两个下游派发器（`j9_handle_j_tactometer()`、`j9mirror_unciferous()`）内已有真实数组边界检查，
+故未重复加。所有改动**已编译通过**，但**尚未在硬件上部署验证**（见 §4.2 标准流程）。
 
 ### 3.2 用户态（厂商闭源库的字节补丁）
 
@@ -361,7 +372,7 @@ LIBVA_DRIVER_NAME=jmgpu mpv --no-config --vo=gpu --hwdec=vaapi --frames=5 video.
 |---|---|---|---|
 | 8 | **专有 X 驱动无法加载**（ABI 24→25 + 清理路径 `NULL+0x48` 段错误） | ① `XF86ModuleVersionInfo.abiversion` 24.0→25.0；② Xorg 1.21 删除了 `xf86str.h` 的 `Bool flipPixels` ⇒ `ScrnInfoRec` 其后字段整体 **−8 字节**，回调槽错位 | `tools/patch_xorg_abi.py` + `build-cli/patch_abi_layout.py` ⇒ 产物 **`build-cli/mwv207_drv.so.abi25.fixed3`**（md5 `297aee83…`） |
 | 9 | **`glEGLImageTargetTexStorageEXT` 未实现**（VA-API 零拷贝必须挂 `LD_PRELOAD`） | 给 `jmgpu_dri.so` 补扩展广告 + `libEGL_mwv207.so`/`libGLX_mwv207.so` 加入口别名（纯字节补丁） | `tools/patch_gl_storage.py` ⇒ 产物 `build-cli/*.glstorage` |
-| 10 | **TearFree 的 2D 上传后不等引擎完成**（画面三角/楔形错位） | 把上传例程返回前的 `ldp x29,x30,[sp,#16]` 改成 `bl 等2D空闲封装`（该封装驱动里本就存在、却 0 引用） | `tools/patch_ddx_tearfree_sync.py`（**未验证效果**，见 §6） |
+| 10 | **TearFree 的 2D 上传后不等引擎完成**（画面三角/楔形错位） | 把上传例程返回前的 `ldp x29,x30,[sp,#16]` 改成 `bl 等2D空闲封装`（该封装驱动里本就存在、却 0 引用） | `tools/patch_ddx_tearfree_sync.py` ⇒ 产物 **`build-cli/mwv207_drv.so.abi25+tearfree-sync`**（sha256 `4c0f96b6…`，仅 8 字节改动）<br>部署/回退：`tools/deploy_ddx_tearfree_sync.sh build\|apply\|revert\|status`<br>**注**：2026-09-18 才把该补丁打到"ABI25 修复版"上（此前只打在未修复的原件上 ⇒ 无法加载 ⇒ 一直没验证） |
 
 ### 3.3 系统配置（非仓库代码）
 
@@ -372,7 +383,7 @@ LIBVA_DRIVER_NAME=jmgpu mpv --no-config --vo=gpu --hwdec=vaapi --frames=5 video.
 | 13 | `dconfig org.kde.kwin.compositing:user_type=4` | kwin 用 **XRender** 合成 | 厂商 GL 合成实测仅 8 fps，XRender 47 fps |
 | 14 | `/usr/bin/dde-shell` 包装 | 改走 Mesa（原二进制备份为 `dde-shell.real`） | 任务栏高频重绘，厂商 GL 只有 1–11 fps；`~/fix_dock_mesa.sh` 应用/回退 |
 | 15 | `10-mwv207.conf` | `MatchDriver "jmgpu"` + `Driver "mwv207"` | 让 X 使用厂商 DDX（**切回系统驱动时必须删除**，否则 X 起不来） |
-| 16 | `/etc/environment` | **`WEBKIT_DISABLE_COMPOSITING_MODE=1`** | **厂商 GL 会让 WebKitGTK 应用 SIGSEGV**（EasyTier 图标一闪而过、无窗口）。实测：仅第 11 项的 GLX 变量 ⇒ 必崩（2/2 复现）；加上本行 ⇒ 连跑两次均存活（§8.6） |
+| 16 | `/etc/environment` | **`WEBKIT_DISABLE_COMPOSITING_MODE=1`** | **当前唯一可靠规避**（WebKit 不建 GL 上下文 ⇒ 不触发厂商栈的悬垂 TLS 解引用）。实测：加 `glxguard` 守卫也救不了 WebKit 实际形态（§8.6.3）⇒ 保留本行；厂商修好 EGL 侧（§7 第 9～11 条）后方可移除 |
 
 ### 3.4 已排除（勿再尝试）
 
@@ -552,6 +563,11 @@ jm9100/
 | `drm_gamma_probe.c` / `bar_probe.c` | 色彩管理 / BAR 探针 |
 | `jm_gl_compat.c` | GL 兼容层源码（**已退役**） |
 | `extract_patch.py` | 补丁提取辅助 |
+| **`glx_egl_tls_uaf_repro.c`** | **崩溃复现/取证程序**（§8.6.1）：厂商 EGL 留下悬垂 libglapi TLS ⇒ GLX 销毁时 `jmDestroyContext` SIGSEGV。`--no-egl` 为对照组 |
+| **`glxguard.c`** | 该崩溃的**守卫库**（§8.6.2）：用 `mincore()` 只清"真悬垂"的 libglapi TLS，合法当前上下文不动 |
+| **`fix_easytier_glxguard.sh`** | 部署守卫（`apply` / `revert` / `status`）：编译到 `/usr/local/lib/` + 包装 `/usr/bin/easytier-gui`（含 pkexec 提权实例） |
+| **`wkmin.c`** | **最小 WebKit 复现器**（§8.6.3）：强制加速合成 + 纯色页面，配 `ffmpeg x11grab` 抓屏可**客观判定**（像素统计）WebKit 在厂商栈上是否崩溃/是否画出内容 |
+| **`deploy_ddx_tearfree_sync.sh`** | 部署/回退"DDX TearFree 同步"补丁（治三角/楔形错位）：`build` / `apply` / `apply-nox` / `revert` / `status`。补丁 = 把 DDX 里"合成→扫描缓冲"上传路径的两处函数尾声换成 `bl <等 2D 空闲封装>`（共 8 字节），使**上传完成前不返回** |
 
 ---
 
@@ -559,7 +575,7 @@ jm9100/
 
 | # | 问题 | 状态 | 说明 |
 |---|---|---|---|
-| 1 | **画面三角/楔形错位**（视频窗口内，偶发） | ⚠️ **未根治** | 已定位为"**写入扫描缓冲 ↔ 扫描输出 之间缺同步/一致性**"，且写入方**覆盖 2D 引擎与 CPU 两条路径**（`TearFree off` 能显著减少；`Accel off` 后仍复现）。**核内无法根治**，需厂商补 `.prepare_fb` + fence 导出（见 §7）。已写补丁 `tools/patch_ddx_tearfree_sync.py` 但**效果未验证** |
+| 1 | **画面三角/楔形错位**（视频窗口内，偶发） | ⚠️ **未根治**（第 3 次修复待验证） | **2026-09-18 新线索（可能就是本行根因）**：本机**硬件 vblank 事件不产生**（详见 §3.1 #10）⇒ 翻转完成/上屏**失去时序基准**：既造成 GL 应用送显 1 秒超时（整屏实测 1~2.5 次/秒 vs `vo=x11` 29.9 次/秒），也可能正是"写入扫描缓冲 ↔ 扫描输出"竞争的直接来源。已改为**软件 vblank + 100Hz 重建时序**，待重启验证。<br>定位：**写入扫描缓冲 ↔ 扫描输出 之间缺同步/一致性**，写入方覆盖 **2D 引擎与 CPU 两条路径**（`TearFree off` 能显著减少；`Accel off` 后仍复现）。<br>**2026-09-18 三次尝试（按顺序）**：<br>① 内核 `jmkOS_WaitNativeFence` 预算 bug（#11）已修 ⇒ **错位仍在**，非主因；<br>② DDX 侧"上传后等 2D 空闲"补丁（§3.2 #10）确认**已在运行中生效**（X 启动时间晚于补丁时间）⇒ **错位仍在**（等待点在 `bo_xfer_to_dev` **之后**，只能保证上传完成，管不到"上传读到的源是否写完"）；<br>③ **新增：内核在搬运**前**等 2D 排空**（§3.1 #8，`xfer_waits_2d_idle` 默认 30ms）⇒ **待重启验证**；<br>④ 若仍不足，下一步给平面补 `.prepare_fb` + 让 2D/GL 作业把 fence 挂到缓冲 `dma_resv`（命令缓冲不透明 ⇒ 需按 UAPI 显式句柄挂栅栏）。<br>**注**：早前的两个运行时缓解 `flip_waits_2d_idle` / `update_at_vblank`（曾"减轻但未消除"）**只存在于未提交的工作区，已在一次还原中丢失** —— 如再需要须重新实现 |
 | 2 | `compression=15`（默认）下**卡顿 + 内核任务态破坏** | ⚠️ 规避可用 | 与 `fastClear` 组合有关；`compression=0` 或 `fastClear=0` 可规避。**但该现象在系统自带驱动下也偶现** ⇒ 不能完全归因于本驱动 |
 | 3 | **CPU 写合并（`enable_wc`）一致性** | ⚠️ **未验证** | `Accel off` 仍错位 ⇒ 怀疑 `pgprot_writecombine` 的 posted 写未被显示读到。验证方案（`enable_wc=0`）**曾导致无法启动**，未得结论。后续验证**必须用可回退方式** |
 | 4 | kwin GL(`gl2`) 合成只有 ~8 fps | ✅ 已规避 | 用 `user_type=4`（XRender）绕过；属厂商侧 |
@@ -568,7 +584,8 @@ jm9100/
 | 7 | `sync_dkms.sh` 报"initramfs 校验失败" | ✅ 属**误报** | 本系统 initramfs **不收录 `updates/`（DKMS）目录**（实测 `updates/*.ko`=0、`kernel/drivers/*.ko`=1636）。DKMS 模块由 rootfs 阶段 udev modalias 加载 ⇒ **校验失败 ≠ 安装失败**，只需确认 `dkms status` 为 `installed` |
 | 8 | GL 兼容层 `libjm_gl_compat.so` | ✅ **已退役** | glstorage 补丁已原生支持，系统级兼容层已卸载（无需 `LD_PRELOAD`） |
 | 9 | 零拷贝依赖 mpv 补丁 | ⚠️ 已知 | 升级 mpv 后需重新应用 `patches/mpv_dmabuf_oes_image.patch`（系统级 `LD_PRELOAD` 兼容层亦可，但已退役） |
-| 10 | **厂商 GL 与 WebKitGTK 不兼容** | ⚠️ 已规避，根因未修 | 启用厂商 GL 后 `EasyTier`/`MiniBrowser` 等 WebKitGTK 程序**启动即 SIGSEGV**；当前用 `WEBKIT_DISABLE_COMPOSITING_MODE=1` 规避（WebKit 不做加速合成，代价是 WebKit 页面渲染走 CPU）。属厂商侧（§7 第 9 条、§8.6） |
+| 10 | **厂商 EGL 留下悬垂 libglapi TLS ⇒ GLX 销毁段错误**（WebKitGTK 应用打不开） | ⚠️ **部分缓解**，厂商侧根因未修 | 根因链：EGL 解绑/销毁不清 TLS → `jmDestroyContext` 解引用未校验（UAF）。我方 `glxguard` 守卫能修**独立复现器**，但**修不了 WebKit 实际形态**（悬垂指针可能落在**仍映射**的池里 ⇒ 地址类判据不可靠，§8.6.3）。当前仍以 `WEBKIT_DISABLE_COMPOSITING_MODE=1` 为准（§3.3 #16）；确定性复现程序 `tools/glx_egl_tls_uaf_repro.c`、客观判定工具 `tools/wkmin.c` |
+| 11 | **内核 `jmkOS_WaitNativeFence` 等待预算算错**（栅栏提前超时） | ✅ **已修（本仓库 `kernel/jmgpu_symbol.c`）** | `dma_fence_wait_timeout()` 返回的是**剩余**预算，原代码写 `timeout -= ret`（把剩余换成"已用时间"）⇒ 多元素 fence array 必然提前超时，调用方（`jmo_SURF_WaitFence` 等）会拿着**尚未完成**的缓冲继续用 ⇒ 内容不一致（三角/楔形错位一类）。已改为 `timeout = ret`，并逐元素判断 `f` 而非外层 `fence`。**需重建+重启生效**（`sudo ./scripts/sync_dkms.sh build`） |
 
 ---
 
@@ -581,7 +598,10 @@ jm9100/
 | 1 | **SCDC 签名迁移** | `jmgpu_nicely.c` 的 `drm_scdc_*` 需按 6.5+ 签名适配（`drm_connector*`）；同源代码在所有 6.x 内核上都有该问题，§3.1 的补丁可直接回给厂商 |
 | 2 | **平面缺 `.prepare_fb` / fence 导出** | 需把 2D / GL / 解码作业的栅栏挂到缓冲的 `dma_resv`，并提供 fence fd 导出 ⇒ 让 `drm_atomic_helper_wait_for_fences()` 在翻页前真正等到"渲染完成"。**这是三角错位的根治方向** |
 | 3 | **`GLX_EXT_libglvnd` vendor 名** | X 驱动应通告 libglvnd vendor 名 `mwv207`（当前报 Xorg 默认的 `mesa`）⇒ 这样**无需环境变量**客户端就能选到厂商 GL；同时安装脚本应把 `__GLX_VENDOR_LIBRARY_NAME` 写入 `/etc/environment`（`pkexec` 会清环境，只有 `pam_env` 能覆盖提权应用） |
-| 9 | **厂商 GL 与 WebKitGTK 不兼容（SIGSEGV）** | 启用厂商 GL（`__GLX_VENDOR_LIBRARY_NAME=mwv207`，或强制厂商 EGL json）后，**EasyTier / MiniBrowser 等 WebKitGTK 程序启动即段错误**；不给厂商 GL 变量则正常（回落 llvmpipe）。实测矩阵见 §8.6。当前规避是 `WEBKIT_DISABLE_COMPOSITING_MODE=1`（WebKit 不做加速合成），但**根因未修** —— 请确认厂商 `libGLX_mwv207` / `libEGL_mwv207` 在 WebKitGTK 的上下文创建路径上是否缺少必要支持（如 `GLX_ARB_create_context`、core profile、`dma-buf` 导出等） |
+| 9 | **EGL 销毁上下文未清 libglapi TLS（use-after-free 之源）** | `eglMakeCurrent(EGL_NO_CONTEXT)` 与 `eglDestroyContext()` 之后，厂商自带 libglapi 的 current context TLS **仍指向已释放的内存**（实测值如 `0xffff8ae01010`，不在进程任何映射内）。反编译证据：`libEGL_mwv207.so` **完全没有** `_glapi_set/get_context` 引用。**诉求**：EGL 解绑与销毁路径必须 `_glapi_set_context(NULL)`。复现：`tools/glx_egl_tls_uaf_repro.c`（§8.6.1） |
+| 10 | **`jmDestroyContext` 解引用未校验（可被 UAF 触发段错误）** | `jmgpu_dri.so: jmDestroyContext+56` （文件偏移 `0x69638`）执行 `ldr x0,[x0,#376]`，其中 `x0 = _glapi_get_context()` **只做了 `!= NULL` 判断**；当该指针悬垂/非法时直接 SIGSEGV（`#1 dri3DestroyContext` ← `libGLX_mwv207`）。**诉求**：解引用前做有效性防护（与同函数内 `[ctx,#376]/[ctx,#368]` 的 `cbz` 检查保持一致）。触发场景：任何 GTK3/WebKit2GTK 应用（EasyTier、MiniBrowser）析构窗口 |
+| 11 | **两套 libglapi / TLS 归属无契约** | 系统 `libglapi.so.0` 与厂商 `libGLX_mwv207` 各带一份 `_glapi_get/set_context`（后者带 `@@VERSION`），`jmgpu_dri.so` 经 `LD_DEBUG=bindings` 绑定到**厂商那份**。请明确 EGL/GLX/DRI 三方共用时 TLS 生命周期的唯一归属，或改为只依赖系统 libglapi |
+| 12 | **内核 `jmkOS_WaitNativeFence` 等待预算算错** | `dma_fence_wait_timeout()` 返回**剩余**预算，原代码 `timeout -= ret`（应为 `timeout = ret`）⇒ 多元素 fence array 后续元素预算越缩越小、**提前超时**，调用方带着未完成的缓冲继续用（内容不一致）。我方已修 6.6 分支，**同一函数的旧内核分支有同样写法，建议一并修**（详见本文档 §10.5.2） |
 | 4 | **vblank 中断** | 内核默认 5s 后关闭 vblank 中断，驱动无法重新使能 ⇒ 客户端每帧等 1s（已用 `drm.vblankoffdelay=0` 规避，建议驱动侧修复） |
 | 5 | reserved-mem 分配器 `.GetSGT` 空桩 | 已由本仓库补齐，**建议在源码层实现**（当前是仓库补丁） |
 | 6 | 解码 surface 池整块连续申请 | 可见窗口碎片化时整组回退到 CPU 不可见池，建议按需分块或非连续分配 |
@@ -697,21 +717,144 @@ journal 只见 `pkexec[...]: pam_unix(polkit-1:session): session opened for user
 | `__GLX_VENDOR_LIBRARY_NAME=mwv207` **+ `WEBKIT_DISABLE_COMPOSITING_MODE=1`** | **124 存活** ✓（连跑两次） |
 | `__GLX_VENDOR_LIBRARY_NAME=mwv207` + `LIBGL_ALWAYS_SOFTWARE=1` | 124 存活 ✓ |
 
-⇒ **根因**：**厂商 GL（GLX 与 EGL 都一样）会让 WebKitGTK 段错误**。
+⇒ 初步结论（已被下面的深挖推翻并细化）：**厂商 GL 会让 WebKitGTK 段错误**。
 而 `__GLX_VENDOR_LIBRARY_NAME=mwv207` 是厂商栈的**必需**变量（第 11 项，否则 GL 走 Mesa/llvmpipe），
 它经 `pam_env` 注入到 **pkexec 提权实例** ⇒ **必崩**。
 
-**解法**（已采用，第 16 项）：`/etc/environment` 增加
+#### 8.6.1 真根因：**厂商 EGL 留下悬垂的 libglapi TLS current ⇒ GLX 销毁时解引用**（2026-09-18）
 
-```bash
-WEBKIT_DISABLE_COMPOSITING_MODE=1     # WebKit 不做加速合成 ⇒ 不创建 GL 上下文 ⇒ 不崩
+用 core + gdb + 反编译把它钉到了指令级：
+
+```
+GTK3/WebKit2GTK 析构窗口
+ → gdk_window_destroy → g_object_run_dispose   (libgdk-3.so)
+ → glXDestroyContext                            (libGLX_mwv207.so)
+ → dri3DestroyContext                           (libGLX_mwv207.so)
+ → jmDestroyContext                             (jmgpu_dri.so)  ← SIGSEGV
+   崩溃指令： jmDestroyContext+56  ldr x0,[x0,#376]
+   x0 = _glapi_get_context() = 0xffffc0481010（**不在进程任何映射内** ⇒ 悬垂/UAF）
 ```
 
-- 只影响 **WebKitGTK** 系应用，**不影响**其他程序的 GL 硬件加速（`glxinfo`/`glxgears` 仍是 `Jingjia JM9100`）；
-- **无需注销**：`pam_env` 每次 PAM 会话（含 pkexec）都会重读 `/etc/environment`；
-- 回退：`sudo sed -i '/^WEBKIT_DISABLE_COMPOSITING_MODE/d' /etc/environment`。
+**逐阶段 TLS 值**（`tools/glx_egl_tls_uaf_repro.c` 输出，厂商栈）：
 
-> **为何 9/17 能用、现在不能**：系统升级（内核 6.6.155 + glvnd/WebKitGTK/Mesa 更新）后行为改变。
-> 另外**不要把** `__EGL_VENDOR_LIBRARY_FILENAMES` 指向厂商 json —— 那会让崩溃**必现**（见上表）。
+| 阶段 | TLS `current` | 判读 |
+|---|---|---|
+| 加载厂商 `libGLX_mwv207` 后 | `(nil)` | 起点正常 |
+| `eglCreateContext` 后 | `(nil)` | — |
+| `eglMakeCurrent` 后 | `0xffff8ae01010` | EGL 绑定时写入（正常） |
+| **`eglMakeCurrent(EGL_NO_CONTEXT)` 后** | `0xffff8ae01010` | ★ **解绑未清** |
+| **`eglDestroyContext` 后** | `0xffff8ae01010` | ★★ **销毁后仍留着悬垂值** |
+| `glXDestroyContext` | — | **SIGSEGV** |
+
+**反编译佐证（三条独立证据）**：
+
+| 证据 | 出处 |
+|---|---|
+| `libEGL_mwv207.so` 中**完全没有** `_glapi_set_context` / `_glapi_get_context` 引用 ⇒ EGL 侧从不清理 TLS | `objdump -d` 全库扫描 |
+| `_glapi_get/set_context` 有**两个提供者**（系统 `libglapi.so.0` 与厂商自带的 `libGLX_mwv207`），且 `jmgpu_dri.so` 经 `LD_DEBUG=bindings` 绑定到**厂商那份**（`@@VERSION`） | `LD_DEBUG=bindings` |
+| 同函数内 `[ctx,#376]` / `[ctx,#368]` 访问**都有 `cbz` 空指针检查**，唯独 `[current,#376]`（`current=_glapi_get_context()`）**只判 `!= NULL`** | `jmDestroyContext` 反汇编 |
+
+⇒ 三个缺陷串成一条链，任一处修好都能消除崩溃：
+1. **EGL 解绑/销毁不清 TLS**（`libEGL_mwv207` / DRI 的 EGL 路径）——**主缺陷**；
+2. **`jmDestroyContext` 解引用前不校验指针有效性**——纵深防御缺失；
+3. 两套 `libglapi`（系统 + 厂商自带）共存，TLS 归属无契约——架构隐患。
+
+**确定性复现（厂商 5 秒可跑）**：`tools/glx_egl_tls_uaf_repro.c`
+
+```bash
+gcc -O2 -o glx_egl_tls_uaf_repro tools/glx_egl_tls_uaf_repro.c -lEGL -lGL -lX11 -ldl
+
+# ① 复现（预期 SIGSEGV）
+__GLX_VENDOR_LIBRARY_NAME=mwv207 DISPLAY=:0 ./glx_egl_tls_uaf_repro
+# ② 对照：跳过 EGL ⇒ 不崩（证明 EGL 阶段是前置条件）
+__GLX_VENDOR_LIBRARY_NAME=mwv207 DISPLAY=:0 ./glx_egl_tls_uaf_repro --no-egl
+# ③ 对照：EGL 走 Mesa（GLX 仍厂商）⇒ 不崩
+__GLX_VENDOR_LIBRARY_NAME=mwv207 \
+__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json \
+DISPLAY=:0 ./glx_egl_tls_uaf_repro
+```
+
+> 注：单纯 GLX `create+destroy` **不崩**（对照组 ② 的 TLS 是**有效**上下文，走正常分支）；
+> 必须"EGL 先用过"才崩 —— 这正是 WebKitGTK 类应用的形态（EGL 与 GLX 并存）。
+
+**三种可用规避（均已实测）**：
+
+| 方案 | 命令/位置 | 代价 | 适用 |
+|---|---|---|---|
+| **A（已采用）** | `/etc/environment`：`WEBKIT_DISABLE_COMPOSITING_MODE=1` | WebKit 不做加速合成 | **最稳**：`pam_env` 交付，**对 pkexec 提权进程同样生效** |
+| B | `/etc/environment`：`__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json` | EGL 硬件路径全失效（**含 VA-API 零拷贝**） | 不推荐全局 |
+| C | `LD_PRELOAD=tools/glxguard.c` 编译出的 `glxguard.so` | 需逐进程注入 | **对提权进程无效**（loader 忽略 setuid 程序 `LD_PRELOAD`） |
+
+**临时守卫** `tools/glxguard.c`（C 方案）：在 `glXDestroyContext` 前把厂商那份 TLS 清空，
+使 `jmDestroyContext` 走其已有安全分支：
+
+```
+无守卫： glXDestroyContext → 段错误
+有守卫： [glxguard] 清除悬垂 current=0xffff80991010 后再销毁 ⇒ 完成 ✓
+```
+
+> **为何 9/17 能用、现在不能**：系统升级（内核 6.6.155 + glvnd/WebKitGTK/Mesa 更新）后，
+> 该应用路径上出现了"EGL 先建/销毁上下文、随后 GLX 销毁"的组合。
 >
-> 这属于厂商 GL 与 WebKitGTK 的兼容缺陷，已列入 §7 给厂商的反馈。
+> 这属于**厂商用户态栈的 use-after-free**（且是安全相关问题），已列入 §7 给厂商的反馈（第 9～11 条）。
+
+#### 8.6.3 守卫的能力边界（**诚实修正**，2026-09-18）
+
+用 `tools/wkmin.c`（最小 WebKit 复现器 + `ffmpeg` 抓屏 + 像素统计）做客观判定：
+
+| 配置 | 是否崩 | 画面（红=页面内容） |
+|---|---|---|
+| 厂商栈 + 加速合成（无规避） | **段错误** | 无内容（93.9% 白） |
+| **+ `glxguard` 守卫** | **仍段错误** ✗ | 无内容 |
+| + `WEBKIT_DISABLE_COMPOSITING_MODE=1` | 不崩 ✓ | **400×966 红块** ⇒ 窗口正常 ✓ |
+
+⇒ **守卫拦不住 WebKit 的真实形态**，原因（已用 gdb 核实）：这次悬垂指针是
+`0xffffd8391010`，落在**仍然映射着的内存池**里（对象已释放、整块 mmap 还在）
+⇒ `mincore()` 判定"已映射" ⇒ v1 的"未映射才清"判据失效；v2 改为"按语义在解绑/销毁当前上下文时清"
+也无效，因为 WebKit 的这条路径**既没走 EGL 解绑、也没走 GLX 解绑**（用户态无从观测到那一跳）。
+
+**结论**：`glxguard` 只对"独立复现器那类 munmap 型悬垂"有效，**对 WebKit 实际形态无效**。
+⇒ 该缺陷仍必须由厂商在 EGL 侧根治（§7 第 9～11 条）；本机继续用
+`WEBKIT_DISABLE_COMPOSITING_MODE=1`（§3.3 #16）。
+
+### 8.6.2 我方修复尝试与最终方案（2026-09-18）
+
+**先试原生补丁（3 处，全部用 gdb/coredump 逐条验证）**：
+
+| # | 补丁点 | 结果 |
+|---|---|---|
+| 1 | `jmgpu_dri.so: veglMakeCurrent_es3+0x6c`：`cbz x19, <早返回>` → `b <调用 _glapi_set_context>` | ❌ **不生效**（已回退）：实测 EGL 解绑/销毁**根本不进 DRI**，此函数全程只被调用 1 次（绑定那次） |
+| 2 | `jmgpu_dri.so: jmDestroyContext` 跳过对 current 的解引用 | ❌ 不安全：会在另一处（`[current+384]`）再次解引用悬垂指针；且会破坏"销毁非当前上下文"时的状态保存 |
+| 3 | `libGLX_mwv207: dri3DestroyContext` 入口插"悬垂即清"桩 | ❌ 不可行：GLX 侧**无法区分**"已释放的悬垂指针"与"仍然存活的当前上下文"，清错会破坏多上下文应用 |
+
+> 结论：**根治必须在厂商 EGL 侧**（我们无法在消费者侧安全地判断指针死活）。
+> 但已定位到三个精确的厂商缺陷点（见 §7 第 9～11 条与本文档 §10.6）：
+> `veglMakeCurrent_es3` 的 NULL 分支不设 TLS、`veglDestroyContext_es3` 不清 TLS、
+> 以及 EGL 上下文从未维护 DRI 的"current 标志"（`[ctx->[16] + 0xac000 + 11272]`）
+> ⇒ 所有"lose/destroy current"清理逻辑（`jmLoseCurrent` @693c4、`jmDestroyContext` @696c0）
+> 全部被跳过。
+
+**最终采用：用户态守卫 `glxguard.so`**（`tools/glxguard.c`，本仓库已实现并验证）
+
+判据用 `mincore()`：**只清"已不在任何映射中"的真悬垂指针**；合法的当前上下文绝不触碰
+（这解决了上面第 3 条"无法区分"的矛盾——在用户态可以用 syscall 判定）。
+
+```
+悬垂场景  ： [glxguard] 检出悬垂 current=0xffffa20d1010（未映射）→ 清空后再销毁 ⇒ 未崩溃 ✓
+多上下文  ： [glxguard] current=0xffff881d0010 仍在映射内，保持不动 ⇒ 当前上下文不受影响 ✓
+对照组(无守卫)： glXDestroyContext ⇒ 段错误 139（证明守卫就是修复）
+```
+
+**部署**（对 EasyTier 生效，且**保留 WebKit 加速合成**）：
+
+```bash
+sudo bash tools/fix_easytier_glxguard.sh apply     # 编译守卫到 /usr/local/lib/ + 包装 /usr/bin/easytier-gui
+sudo bash tools/fix_easytier_glxguard.sh status
+sudo bash tools/fix_easytier_glxguard.sh revert    # 回退（还原原始二进制）
+```
+
+- 为什么用**包装脚本**而不是 `/etc/environment` 里的 `LD_PRELOAD`：EasyTier 会经 **pkexec 提权**
+  再启动一次，pkexec 会清环境且提权进程由 ld.so 忽略 `LD_PRELOAD`；包装脚本自身以普通方式
+  exec 非 setuid 目标，可自行注入 ⇒ **提权实例同样带上守卫**（与 `~/fix_dock_mesa.sh` 的 dde-shell 包装同一套路）。
+- 采用守卫后，`/etc/environment` 里的 `WEBKIT_DISABLE_COMPOSITING_MODE=1`（第 16 项）**已移除**，
+  WebKit 恢复加速合成；若某应用仍表现异常，可把该行加回作为备用规避。

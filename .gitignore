@@ -13,3 +13,6 @@ Module.symvers
 # 本地临时/日志
 *.log
 *.tmp
+
+.codebuddy
+

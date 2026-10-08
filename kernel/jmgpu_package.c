@@ -39,6 +39,14 @@
 
 #define j9_transmittance(crtc) container_of(crtc, j9_raced, base)
 
+/*
+ * 2026-09-18 结论: 默认**保持 0**, 不要用周期性的软件 vblank.
+ *
+ * 实测: 打开周期软件 vblank 后(即使硬件路径同时保留), 屏幕上 GL 窗口的刷新率
+ * 确实上来了, 但**鼠标指针不动** —— 光标平面的行 vblank 中断/时序被这一路
+ * 每秒 100 次的 handle_vblank 干扰. 改用按需交付 flip 完成事件
+ * (见 flip_event_immediate), 不引入周期定时器.
+ */
 static int fake_vblank;
 module_param(fake_vblank, int, 0644);
 MODULE_PARM_DESC(fake_vblank, "use hw or sw to generate vblank, "\
@@ -62,6 +70,89 @@ MODULE_PARM_DESC(fake_vblank, "use hw or sw to generate vblank, "\
  * gamma_norm=0: 完全跳过用户态 gamma (LUT 恒为 reset 时的线性表, 亮度调节失效).
  * gamma_norm=3: 对 ramp 乘 3 归一化, 用于复现/兼容旧的 768 契约.
  */
+/*
+ * 2026-09-18: 软件 vblank 的刷新率（Hz），默认 100 = 本机面板实际刷新率.
+ *
+ * 为什么需要: X 下 GL/EGL 窗口（mpv vo=gpu / vo=gpu-next、EasyTier 等）在屏
+ * 幕上的**实际**刷新率经整屏抓屏实测只有 1~2.5 次/秒（更新间隔恒为 1000ms），
+ * 而 2D 路径（mpv vo=x11）是 29.9 次/秒（33ms 恒定）. 根因: 本板硬件 vblank
+ * 中断不产生事件 ⇒ drm_crtc_send_vblank_event() 送不出 flip 完成事件 ⇒
+ * 客户端（X Present / EGL）只能等自己的 ~1s 超时 ⇒ 送显 1 次/秒.
+ * 打开软件定时器路径（fake_vblank=1）后立刻从 1.5 次/秒 → 7.2 次/秒,
+ * 但定时器周期算错: 回调里 drm_mode_vrefresh(&crtc->state->mode) 拿到的是
+ * 失效模式, 得出 ~7Hz（与实测 7.2 次/秒吻合）. 故改为固定值 + 兜底.
+ *
+ * vblank_refresh > 0 : 使用该刷新率（默认 100）.
+ * vblank_refresh = 0 : 仍尝试从当前模式推导, 不可靠时兜底 100.
+ */
+static int vblank_refresh = 100;
+module_param(vblank_refresh, int, 0644);
+MODULE_PARM_DESC(vblank_refresh, "software vblank refresh rate in Hz "
+		 "(default 100, 0 = derive from current mode)");
+
+/* 软件 vblank 前几次 tick 打印一次诊断（避免刷屏） */
+static int jmgpu_vblank_dbg;
+
+/*
+ * 2026-09-21: **只推进 vblank 计数**的软件定时器（默认 0 = 关闭）.
+ *
+ * 为什么需要: 本板硬件 vblank 事件不产生. 修复一（flip_event_immediate）只在
+ * "客户端提交翻页"时推进一次计数并交付完成事件; 但客户端若在提交之外等下一次
+ * vblank（X Present 的 MSC/节奏等待等），就没有任何东西推进计数 ⇒ 每次等满
+ * 超时（实测 1000ms），而且会**锁死**在这个状态（GL 窗口 1 次/秒）。
+ *
+ * 与"周期性软件 vblank（fake_vblank=1）"的关键区别:
+ *   - 本定时器**只**调用 drm_crtc_handle_vblank() 推进计数;
+ *   - **不**发送 vblank 事件、**不**调用 drm_crtc_vblank_put().
+ * 之前那版正是因为在回调里 put ⇒ 触发驱动的 disable ⇒ 把光标平面的行 vblank
+ * 一起关掉 ⇒ **鼠标指针不动**. 本开关不做这些, 因此不影响光标.
+ *
+ * 频率由 vblank_refresh 决定（默认 100Hz）. 出问题用 echo 0 即时关闭（回调自停）.
+ */
+static int sw_vblank_counter;
+module_param(sw_vblank_counter, int, 0644);
+MODULE_PARM_DESC(sw_vblank_counter, "advance the vblank counter from a software "
+		 "timer, but do NOT send events or drop vblank references "
+		 "(default 0; 1 = on)");
+
+/*
+ * 2026-09-18: 按需交付 flip 完成事件（默认开）.
+ *
+ * 背景: 本板硬件 vblank 事件不产生 ⇒ drm_crtc_send_vblank_event() 发不出翻页
+ * 完成事件 ⇒ 客户端(X Present / EGL)只能等自身 ~1s 超时 ⇒ 屏幕上 GL/EGL 窗口
+ * 只有 1~2.5 次/秒（整屏抓屏实测; 同机 2D 路径 vo=x11 是 29.9 次/秒）.
+ *
+ * 做法: 不引入周期性定时器（那会打坏光标平面的行 vblank ⇒ 鼠标不动）,
+ * 而是**在客户端提交翻页时立即交付该次的完成事件**, 并顺带推进一次 vblank 计数.
+ * 客户端拿到完成事件后即可继续按帧提交 ⇒ 送显恢复满速.
+ *
+ * 1 = 开（默认）; 0 = 恢复原行为（等硬件 vblank, 本板会等 1 秒）.
+ */
+static int flip_event_immediate = 1;
+module_param(flip_event_immediate, int, 0644);
+MODULE_PARM_DESC(flip_event_immediate, "deliver the pending page-flip "
+		 "completion event immediately in the atomic commit "
+		 "(default 1; hardware vblank events are dead on this board)");
+
+/*
+ * 2026-09-18: 提交尾部的"等 vblank"改成有界等待时的时长（毫秒）.
+ *
+ * drm_atomic_helper_wait_for_vblanks() 的本意是"确保翻转已锁存、旧 framebuffer
+ * 不被过早释放"; 本板硬件 vblank 事件不产生 ⇒ 它只会等满 DRM 超时（实测表现为
+ * 偶发 ~1s 卡）.
+ *
+ * **默认 0（不等待）**: 实测 10ms 会把**每一次原子提交**都拖慢 —— 而鼠标光标的
+ * 移动也走提交路径 ⇒ 表现为"鼠标非常不跟手" ✗. 置 0 后光标跟手、GL 送显还更快
+ * （屏幕更新 7.3 → 17.3 次/秒）. 若在个别场景看到旧帧被过早释放的闪动, 可设为
+ * 1~5ms 折中.
+ * flip_event_immediate=0 时本参数无效（走原逻辑）.
+ */
+static int flip_wait_ms;
+module_param(flip_wait_ms, int, 0644);
+MODULE_PARM_DESC(flip_wait_ms, "bounded flip wait in ms in the atomic commit "
+		 "tail (default 0 = no wait; >0 delays every atomic commit, "
+		 "which makes the mouse cursor laggy)");
+
 static int gamma_norm = 1;
 module_param(gamma_norm, int, 0644);
 MODULE_PARM_DESC(gamma_norm, "extra scaling applied to the userspace gamma "\
@@ -142,21 +233,56 @@ static enum hrtimer_restart jmgpu_vkms_crtc_finish_page_flip_func(struct hrtimer
 	int put_vblank = false;
 	unsigned long flags;
 
+	/* 2026-09-18: 运行时紧急开关 —— 把 /sys/module/jmgpu/parameters/fake_vblank
+	 * 置 0 后, 本定时器在一个周期内自行停止, 无需重启即回到"只用硬件 vblank"的
+	 * 原行为（用于排障/快速恢复）. */
+	if (!fake_vblank && !sw_vblank_counter &&
+	    !jmgpu_kms_vdisplay_is_enable(crtc->dev))
+		return HRTIMER_NORESTART;
+
 	drm_crtc_handle_vblank(crtc);
 
-	if (pl->event) {
-		spin_lock_irqsave(&crtc->dev->event_lock, flags);
-		drm_crtc_send_vblank_event(crtc, pl->event);
-		pl->event = NULL;
-		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
-		put_vblank = true;
+	/* 计数-only 模式（sw_vblank_counter=1 且未启用完整周期 vblank）:
+	 * **不**发送事件、**不** vblank_put —— 这两步会触发驱动的 disable,
+	 * 把光标平面的行 vblank 一起关掉 ⇒ 鼠标指针不动. */
+	if (!(sw_vblank_counter && !fake_vblank &&
+	      !jmgpu_kms_vdisplay_is_enable(crtc->dev))) {
+		if (pl->event) {
+			spin_lock_irqsave(&crtc->dev->event_lock, flags);
+			drm_crtc_send_vblank_event(crtc, pl->event);
+			pl->event = NULL;
+			spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+			put_vblank = true;
+		}
+
+		if (put_vblank) {
+			drm_crtc_vblank_put(crtc);
+		}
 	}
 
-	if (put_vblank) {
-		drm_crtc_vblank_put(crtc);
-	}
+	{
+		unsigned int refresh;
 
-	hrtimer_forward_now(timer, ns_to_ktime(1000000000 / drm_mode_vrefresh(&crtc->state->mode)));
+		if (vblank_refresh > 0)
+			refresh = vblank_refresh;
+		else if (crtc->state)
+			refresh = drm_mode_vrefresh(&crtc->state->mode);
+		else
+			refresh = 0;
+
+		/* 2026-09-18: 模式信息不可靠时兜底, 否则周期会退化成几百毫秒
+		 * (实测 crtc->state->mode 推出 ~7Hz ⇒ 送显只有 7.2 次/秒) */
+		if (refresh < 20 || refresh > 240)
+			refresh = 100;
+
+		if (jmgpu_vblank_dbg < 5) {
+			pr_info("jmgpu: sw vblank tick #%d: refresh=%uHz event=%d\n",
+				jmgpu_vblank_dbg, refresh, put_vblank);
+			jmgpu_vblank_dbg++;
+		}
+
+		hrtimer_forward_now(timer, ns_to_ktime(1000000000ULL / refresh));
+	}
 	return HRTIMER_RESTART;
 }
 
@@ -177,11 +303,24 @@ void jmgpu_vkms_crtc_finish_page_flip(struct drm_crtc *crtc)
 static inline s32 jmgpu_vkms_crtc_set_vblank(struct drm_crtc *crtc, bool enable)
 {
 	j9_raced *pl = j9_transmittance(crtc);
+	unsigned int refresh;
+
+	if (vblank_refresh >= 20 && vblank_refresh <= 240)
+		refresh = vblank_refresh;
+	else
+		refresh = 100;
+
 	if (enable) {
-		hrtimer_start(&pl->vblank_timer, ms_to_ktime(0), HRTIMER_MODE_REL);
-	} else {
-		hrtimer_cancel(&pl->vblank_timer);
+		/* 2026-09-18: 定时器只在第一次 enable 时启动, disable 不取消
+		 * (disable 常由 drm_crtc_vblank_put() 在**本回调内**间接调用,
+		 *  hrtimer_cancel() 自我取消会死等, 且会让 vblank 时断时续). */
+		if (!hrtimer_active(&pl->vblank_timer)) {
+			pr_info("jmgpu: start sw vblank timer (%uHz)\n", refresh);
+			hrtimer_start(&pl->vblank_timer, ms_to_ktime(0), HRTIMER_MODE_REL);
+		}
 	}
+	/* disable: 保持定时器继续跑（只调 drm_crtc_handle_vblank, 无人监听时无副作用）;
+	 * 它会在 fake_vblank=0 时自行停止（见回调开头的检查）. */
 
 	return 0;
 }
@@ -201,6 +340,7 @@ void j9_handle_j9maths_stringiest(struct drm_crtc *crtc)
 	struct drm_pending_vblank_event *event = crtc->state->event;
 	j9_raced *jcrtc = j9_transmittance(crtc);
 	unsigned long flags;
+	bool delivered = false;
 
 	if (event) {
 		if (crtc->state->active) {
@@ -208,12 +348,94 @@ void j9_handle_j9maths_stringiest(struct drm_crtc *crtc)
 			spin_lock_irqsave(&crtc->dev->event_lock, flags);
 			jcrtc->event = event;
 			spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+
+			/* 2026-09-18: 本板**硬件 vblank 事件不产生** ⇒ 原实现要等硬件
+			 * vblank 才发这个翻页完成事件, 客户端(X Present / EGL)只能等
+			 * 自身 ~1s 超时 ⇒ 屏幕上 GL/EGL 窗口只有 1~2.5 次/秒
+			 * （整屏抓屏实测; 同机 2D 路径 vo=x11 为 29.9 次/秒）.
+			 *
+			 * 这里**按需即时交付**该次翻页的完成事件, 并顺带推进一次 vblank
+			 * 计数. 不引入周期定时器 —— 实测周期性软件 vblank 会打坏光标
+			 * 平面的行 vblank（鼠标指针不动）. */
+			if (flip_event_immediate) {
+				drm_crtc_handle_vblank(crtc);
+
+				spin_lock_irqsave(&crtc->dev->event_lock, flags);
+				if (jcrtc->event) {
+					drm_crtc_send_vblank_event(crtc,
+								   jcrtc->event);
+					jcrtc->event = NULL;
+					delivered = true;
+				}
+				spin_unlock_irqrestore(&crtc->dev->event_lock,
+						       flags);
+
+				if (delivered)
+					drm_crtc_vblank_put(crtc);
+			}
 		} else {
 			spin_lock_irqsave(&crtc->dev->event_lock, flags);
 			drm_crtc_send_vblank_event(crtc, crtc->state->event);
 			spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
 		}
 		crtc->state->event = NULL;
+	}
+}
+
+/*
+ * 2026-09-18: 原子提交尾部的"等 vblank"改为有界等待（供 jmgpu_concurrent.c 调用）.
+ *
+ * 本板硬件 vblank 事件不产生 ⇒ drm_atomic_helper_wait_for_vblanks() 只能等满
+ * DRM 的超时（实测客户端表现为偶发 ~1s 卡）, 而它真正的目的只是"确保翻转已锁存、
+ * 旧 framebuffer 不被过早释放". 这里只等待一个帧周期（flip_wait_ms, 默认 10ms
+ * = 100Hz）, 并顺带推进一次 vblank 计数; 翻页完成事件已由
+ * j9_handle_j9maths_stringiest() 按需即时交付.
+ *
+ * flip_event_immediate=0 ⇒ 恢复原行为（等硬件 vblank）; flip_wait_ms=0 ⇒ 不等待.
+ */
+void jmgpu_commit_wait_flip(struct drm_atomic_state *old_state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *new_crtc_state;
+	int i;
+
+	if (!flip_event_immediate) {
+		drm_atomic_helper_wait_for_vblanks(old_state->dev, old_state);
+		return;
+	}
+
+	if (flip_wait_ms > 0)
+		msleep(flip_wait_ms);
+
+	for_each_new_crtc_in_state(old_state, crtc, new_crtc_state, i) {
+		j9_raced *jcrtc;
+
+		if (!new_crtc_state->active)
+			continue;
+
+		drm_crtc_handle_vblank(crtc);
+
+		/* sw_vblank_counter=1 时懒启动"只推进计数"的定时器
+		 * （回调会在该开关置 0 后自行停止） */
+		if (!sw_vblank_counter)
+			continue;
+
+		jcrtc = j9_transmittance(crtc);
+		if (jcrtc->vblank_timer.function &&
+		    !hrtimer_active(&jcrtc->vblank_timer)) {
+			unsigned int r;
+
+			if (vblank_refresh >= 20 && vblank_refresh <= 240)
+				r = vblank_refresh;
+			else
+				r = 100;
+
+			pr_info("jmgpu: start sw vblank counter timer (%uHz, "
+				"counter-only)\n", r);
+			hrtimer_start(&jcrtc->vblank_timer,
+				      ns_to_ktime(1000000000ULL / r),
+				      HRTIMER_MODE_REL);
+		}
 	}
 }
 
@@ -360,6 +582,10 @@ static inline s32 j9_handle__cenotaphic(struct drm_crtc *crtc, bool enable)
 
 static s32 j9_handle_j9m_smoothback(struct drm_crtc *crtc)
 {
+	/* 2026-09-18: 保持与原始实现一致（默认 fake_vblank=0 时行为完全相同）.
+	 * 注意: 这里**不要**改成"硬件路径 + 软件定时器同时开" —— 实测光标平面的
+	 * 行 vblank 会被周期性软件 vblank 打坏（鼠标不动）; 翻转完成事件改由
+	 * j9_handle_j9maths_stringiest() 按需即时交付（flip_event_immediate）. */
 	if (jmgpu_kms_vdisplay_is_enable(crtc->dev) || fake_vblank)
 		return jmgpu_vkms_crtc_enable_vblank(crtc);
 
