@@ -145,8 +145,10 @@ ls /lib/modules/$(uname -r)/updates/dkms/jmgpu.ko
 modinfo -F srcversion /lib/modules/$(uname -r)/updates/dkms/jmgpu.ko
 ```
 
-> ⚠️ `sync_dkms.sh` 报"**initramfs 校验失败**"通常是**误报**（本系统 initramfs 不收录
-> `updates/` 目录），只要 `dkms status` 是 `installed` 即算成功（见 §6 遗留问题 7）。
+> ℹ️ 本系统 initramfs **不收录** `updates/` 目录，所以 `jmgpu.ko` 不会出现在 initramfs 里
+> （由 rootfs 阶段 udev modalias 加载）。`sync_dkms.sh` 自 **2026-10-08** 起会识别这一情况并
+> 判为正常；只有"initramfs 里确实存在一个与磁盘**不一致**的 `jmgpu.ko`"时才报失败
+> （见 §6 遗留问题 7）。判成功仍以 `dkms status` 为 `installed` 为准。
 
 ### 2.3 ② 厂商用户态（deb）
 
@@ -426,10 +428,15 @@ cd ~/Desktop/Git/jm9100
 sudo reboot
 ```
 
-> **红线**：`dkms install` 后**必须重建 initramfs 再重启**——开机早期 `modules-load`
-> 加载的是 **initramfs 里冻结的模块副本**，否则新代码永远不生效（历史上多次"修复无效"的误判均源于此）。
+> **红线（重新表述 2026-10-08）**：`dkms install` 后仍要**重建 initramfs 再重启**，但要区分两件事：
+> - **模块本体**：本系统 initramfs **不收录** `updates/`（见 §6 #7），`jmgpu.ko` 每次都由 rootfs
+>   阶段的 udev modalias 从 `/lib/modules/$(uname -r)/updates/dkms/` 加载 ⇒ **"initramfs 里没有
+>   jmgpu.ko" 是正常态**，不是新代码不生效的原因（脚本已修正，不再误报失败）。
+> - **开机路径配置**：`blacklist mwv207` / `modules-load jmgpu` 这两份文件是写进 initramfs 的；
+>   改了持久化就必须 `update-initramfs -u`，否则重启后早期阶段仍按旧配置走（历史上"修复无效"
+>   的误判多源于此）。
 >
-> 验证：
+> 验证（模块本体是否为新代码）：
 > ```bash
 > cat /sys/module/jmgpu/srcversion                                      # 运行中
 > modinfo -F srcversion /lib/modules/$(uname -r)/updates/dkms/jmgpu.ko  # 磁盘
@@ -581,7 +588,7 @@ jm9100/
 | 4 | kwin GL(`gl2`) 合成只有 ~8 fps | ✅ 已规避 | 用 `user_type=4`（XRender）绕过；属厂商侧 |
 | 5 | 任务栏（`dde-shell`）走厂商 GL 掉帧 | ✅ 已规避 | 包装改走 Mesa（§3.3 #14） |
 | 6 | `cp` / `update-initramfs` **随机 139** | ✅ 已定位（**非本驱动**） | 根因是 `deepin-anything` 的 **`vfs_monitor.ko`** 在内核 6.6 上触发 `BUG()`（ARM64 `brk #6`，`Tainted: G D OE`）。`sudo rmmod vfs_monitor` 后 100 次复制 **0 失败**、`update-initramfs` **rc=0**。持久规避：`blacklist vfs_monitor`（代价：deepin 文件索引失效） |
-| 7 | `sync_dkms.sh` 报"initramfs 校验失败" | ✅ 属**误报** | 本系统 initramfs **不收录 `updates/`（DKMS）目录**（实测 `updates/*.ko`=0、`kernel/drivers/*.ko`=1636）。DKMS 模块由 rootfs 阶段 udev modalias 加载 ⇒ **校验失败 ≠ 安装失败**，只需确认 `dkms status` 为 `installed` |
+| 7 | `sync_dkms.sh` 报"initramfs 校验失败" | ✅ **已修（2026-10-08）** | 原脚本把"initramfs 里找不到 `jmgpu.ko`"直接判失败并 `exit 1` —— 而本系统 initramfs **不收录 `updates/`（DKMS）目录**（实测 `updates/*.ko`=0，只有 `kernel/drivers/gpu/drm/mwv207/mwv207.ko`），DKMS 模块由 rootfs 阶段 udev modalias 加载 ⇒ **"找不到"是正常态**，导致这条被文档写成"标准流程"的命令每次都报失败。现改为：解包失败→跳过校验不判失败；initramfs 无 `jmgpu.ko`→判定正常；**只有** initramfs 里确有 `jmgpu.ko` 且与磁盘 `srcversion` 不一致时才 `exit 1` |
 | 8 | GL 兼容层 `libjm_gl_compat.so` | ✅ **已退役** | glstorage 补丁已原生支持，系统级兼容层已卸载（无需 `LD_PRELOAD`） |
 | 9 | 零拷贝依赖 mpv 补丁 | ⚠️ 已知 | 升级 mpv 后需重新应用 `patches/mpv_dmabuf_oes_image.patch`（系统级 `LD_PRELOAD` 兼容层亦可，但已退役） |
 | 10 | **厂商 EGL 留下悬垂 libglapi TLS ⇒ GLX 销毁段错误**（WebKitGTK 应用打不开） | ⚠️ **部分缓解**，厂商侧根因未修 | 根因链：EGL 解绑/销毁不清 TLS → `jmDestroyContext` 解引用未校验（UAF）。我方 `glxguard` 守卫能修**独立复现器**，但**修不了 WebKit 实际形态**（悬垂指针可能落在**仍映射**的池里 ⇒ 地址类判据不可靠，§8.6.3）。当前仍以 `WEBKIT_DISABLE_COMPOSITING_MODE=1` 为准（§3.3 #16）；确定性复现程序 `tools/glx_egl_tls_uaf_repro.c`、客观判定工具 `tools/wkmin.c` |
@@ -697,7 +704,7 @@ Fixing recursive fault but reboot is needed!   ← 内核状态损坏
 | 项 | 说明 |
 |---|---|
 | **`vfs_monitor`（deepin-anything）** | 在内核 6.6 上触发内核 `BUG()` ⇒ `cp`/`update-initramfs` 随机 139。`sudo rmmod vfs_monitor` 即恢复 |
-| **initramfs 不收录 `updates/`** | `sync_dkms.sh` 的"initramfs 校验失败"是**误报** |
+| **initramfs 不收录 `updates/`** | `sync_dkms.sh` 的"initramfs 校验失败"曾是**误报**；脚本已于 2026-10-08 修正（§6 #7） |
 | **`Xorg` 的 `DISPLAY` 每次重启都变** | 所有 X 侧测试前先取当前会话的 `DISPLAY` |
 
 ### 8.6 厂商栈下 **WebKitGTK 应用必崩**（EasyTier 打不开的真正原因）

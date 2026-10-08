@@ -55,13 +55,34 @@ if [ "${1:-}" = "build" ]; then
   disk_sv=$(modinfo -F srcversion "$DISK_KO" 2>/dev/null || true)
   ir_tmp=$(mktemp -d)
   ir_sv=""
+  ir_read=0
+  ir_has_ko=0
   if sudo unmkinitramfs /boot/initrd.img-"$(uname -r)" "$ir_tmp" >/dev/null 2>&1; then
-    ir_sv=$(find "$ir_tmp" -name 'jmgpu.ko' -exec modinfo -F srcversion {} \; 2>/dev/null | head -1)
+    ir_read=1
+    ir_ko=$(find "$ir_tmp" -name 'jmgpu.ko' 2>/dev/null | head -1)
+    if [ -n "$ir_ko" ]; then
+      ir_has_ko=1
+      ir_sv=$(modinfo -F srcversion "$ir_ko" 2>/dev/null || true)
+    fi
   fi
   sudo rm -rf "$ir_tmp"
   echo "    磁盘模块    srcversion: ${disk_sv:-<读不到>}"
   echo "    initramfs  srcversion: ${ir_sv:-<initramfs 里没有 jmgpu.ko>}"
-  if [ -n "${disk_sv:-}" ] && [ "$disk_sv" = "${ir_sv:-}" ]; then
+
+  # 2026-10-08: 本系统的 initramfs **不收录** updates/（DKMS）目录（实测
+  # updates/*.ko = 0，只有 kernel/drivers/gpu/drm/mwv207/mwv207.ko），所以
+  # jmgpu.ko 永远不会出现在 initramfs 里 —— 它由 rootfs 阶段的 udev modalias
+  # 从 /lib/modules/.../updates/dkms/ 加载（README §6 #7）。
+  # 之前这里把"initramfs 里没有 jmgpu.ko"直接判为失败并 `exit 1`，导致这条
+  # 被文档写成"标准流程"的命令**每次都报校验失败**（明明 dkms status 已是
+  # installed）。现在只在"initramfs 里确实有一个与磁盘不一致的 jmgpu.ko"时
+  # 才失败 —— 那才是重启会回退到旧模块的真实场景。
+  if [ "$ir_read" = 0 ]; then
+    echo "!! 无法解包 initramfs，跳过模块一致性校验（不判失败）"
+  elif [ "$ir_has_ko" = 0 ]; then
+    echo "==> 校验：initramfs 不含 jmgpu.ko（本系统不收录 updates/，属正常）"
+    echo "    模块由 rootfs 阶段 udev modalias 加载；只要 dkms status 为 installed 即可"
+  elif [ -n "${disk_sv:-}" ] && [ "$disk_sv" = "$ir_sv" ]; then
     echo "==> 校验通过: initramfs 已含最新模块 (重启与 modprobe 都会用新的)"
   else
     echo "!! 校验失败: initramfs 里的 jmgpu.ko 与磁盘不一致 —— 重启会回退到旧模块!"
