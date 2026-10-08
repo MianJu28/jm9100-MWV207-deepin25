@@ -26,6 +26,14 @@ find "$DST" -maxdepth 1 -name '*.ko' -delete 2>/dev/null || true
 echo "==> 已同步 $(ls "$SRC"/*.c 2>/dev/null | wc -l) 个 .c / $(ls "$SRC"/*.h 2>/dev/null | wc -l) 个 .h"
 
 if [ "${1:-}" = "build" ]; then
+  # 2026-10-08: 重装/还原系统后 /var/lib/dkms/mwv207 会丢失（dkms remove 掉了），
+  # 此时 `dkms build mwv207/1.7.0.uos` 直接报 "Could not find module"，而 README
+  # §4.4 要求用户手工 `dkms add`。这里自动补上，让 §4.2 的标准流程开箱可用。
+  if [ ! -d /var/lib/dkms/mwv207 ]; then
+    echo "==> DKMS 未注册 mwv207/1.7.0.uos，自动执行 dkms add"
+    sudo dkms add mwv207/1.7.0.uos
+  fi
+
   echo "==> dkms build mwv207/1.7.0.uos"
   sudo dkms build mwv207/1.7.0.uos --force
   echo "==> dkms build 完成"

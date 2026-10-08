@@ -477,11 +477,12 @@ sudo ./scripts/switch_stack.sh restore               # 回到上次备份
 ### 4.4 重装系统后需重做
 
 1. **内核模块**：`./scripts/sync_dkms.sh build`（+ `force_mode_test.sh boot` 持久化）；
-   若 DKMS 注册丢失，先建源码目录：
+   **DKMS 注册丢失时脚本会自己 `dkms add`**（2026-10-08 起）。只有**源码目录本身**也没了
+   （重装系统后 `/usr/src/mwv207-1.7.0.uos` 不存在）时才需要手工：
    ```bash
    sudo mkdir -p /usr/src/mwv207-1.7.0.uos
    cd ~/Desktop/Git/jm9100/kernel && sudo cp -f *.c *.h Makefile* dkms.conf Kconfig* /usr/src/mwv207-1.7.0.uos/
-   sudo dkms add mwv207/1.7.0.uos
+   sudo dkms add mwv207/1.7.0.uos     # sync_dkms.sh build 也会自动补
    ```
 2. **厂商 deb**：`vendor/` 下三个包（详见 `vendor/README.md`）。
 3. **libdrm 兼容链接**（**两处都要**，易漏）：
