@@ -374,7 +374,7 @@ LIBVA_DRIVER_NAME=jmgpu mpv --no-config --vo=gpu --hwdec=vaapi --frames=5 video.
 |---|---|---|---|
 | 8 | **专有 X 驱动无法加载**（ABI 24→25 + 清理路径 `NULL+0x48` 段错误） | ① `XF86ModuleVersionInfo.abiversion` 24.0→25.0；② Xorg 1.21 删除了 `xf86str.h` 的 `Bool flipPixels` ⇒ `ScrnInfoRec` 其后字段整体 **−8 字节**，回调槽错位 | `tools/patch_xorg_abi.py` + `build-cli/patch_abi_layout.py` ⇒ 产物 **`build-cli/mwv207_drv.so.abi25.fixed3`**（md5 `297aee83…`） |
 | 9 | **`glEGLImageTargetTexStorageEXT` 未实现**（VA-API 零拷贝必须挂 `LD_PRELOAD`） | 给 `jmgpu_dri.so` 补扩展广告 + `libEGL_mwv207.so`/`libGLX_mwv207.so` 加入口别名（纯字节补丁） | `tools/patch_gl_storage.py` ⇒ 产物 `build-cli/*.glstorage` |
-| 10 | **TearFree 的 2D 上传后不等引擎完成**（画面三角/楔形错位） | 把上传例程返回前的 `ldp x29,x30,[sp,#16]` 改成 `bl 等2D空闲封装`（该封装驱动里本就存在、却 0 引用） | `tools/patch_ddx_tearfree_sync.py` ⇒ 产物 **`build-cli/mwv207_drv.so.abi25+tearfree-sync`**（sha256 `4c0f96b6…`，仅 8 字节改动）<br>部署/回退：`tools/deploy_ddx_tearfree_sync.sh build\|apply\|revert\|status`<br>**注**：2026-09-18 才把该补丁打到"ABI25 修复版"上（此前只打在未修复的原件上 ⇒ 无法加载 ⇒ 一直没验证） |
+| 10 | ~~TearFree 的 2D 上传后不等引擎完成~~ | ❌ **已废弃（2026-10-08）：该补丁是错的** | 它把上传例程**唯一**恢复调用者 LR 的 `ldp x29,x30,[sp,#16]` 覆盖成 `bl`，而函数尾部是 `ret`（用 x30）⇒ 返回地址错乱 ⇒ **直通与软解都出现**画面斜向错位（详见 §6 #1）。产物 `build-cli/mwv207_drv.so.abi25+tearfree-sync` 仅作**反面样本**保留。<br>`tools/patch_ddx_tearfree_sync.py` 与 `tools/deploy_ddx_tearfree_sync.sh` 已加**硬拦截**，任何参数都拒绝执行。<br>**正确做法**：用 `build-cli/mwv207_drv.so.abi25.fixed3`（md5 `297aee83…`）；2D 排空等待由内核 `xfer_waits_2d_idle` 负责 |
 
 ### 3.3 系统配置（非仓库代码）
 
@@ -565,7 +565,7 @@ jm9100/
 | 工具 | 用途 |
 |---|---|
 | `patch_xorg_abi.py` | DDX 的 ABI 24→25 补丁 |
-| `patch_ddx_tearfree_sync.py` | DDX 的 TearFree 2D 同步补丁（§3.2 #10） |
+| `patch_ddx_tearfree_sync.py` | ❌ **已废弃**：DDX 的 TearFree 2D 同步补丁（§3.2 #10）。该补丁覆盖了函数唯一的 `ldp x29,x30,[sp,#16]` ⇒ 返回地址错乱。脚本已加硬拦截，勿再使用 |
 | `patch_gl_storage.py` | glstorage 三库补丁（§3.2 #9） |
 | `test_passthrough.sh` 配套：`passthrough_verify.py` / `ppm_stats.py` | 直通结果与像素统计 |
 | `jm_gl_storage_test.c` / `jm_gl_glx_path_test.c` | GL storage 双路径端到端探针 |
@@ -579,7 +579,7 @@ jm9100/
 | **`glxguard.c`** | 该崩溃的**守卫库**（§8.6.2）：用 `mincore()` 只清"真悬垂"的 libglapi TLS，合法当前上下文不动 |
 | **`fix_easytier_glxguard.sh`** | 部署守卫（`apply` / `revert` / `status`）：编译到 `/usr/local/lib/` + 包装 `/usr/bin/easytier-gui`（含 pkexec 提权实例） |
 | **`wkmin.c`** | **最小 WebKit 复现器**（§8.6.3）：强制加速合成 + 纯色页面，配 `ffmpeg x11grab` 抓屏可**客观判定**（像素统计）WebKit 在厂商栈上是否崩溃/是否画出内容 |
-| **`deploy_ddx_tearfree_sync.sh`** | 部署/回退"DDX TearFree 同步"补丁（治三角/楔形错位）：`build` / `apply` / `apply-nox` / `revert` / `status`。补丁 = 把 DDX 里"合成→扫描缓冲"上传路径的两处函数尾声换成 `bl <等 2D 空闲封装>`（共 8 字节），使**上传完成前不返回** |
+| **`deploy_ddx_tearfree_sync.sh`** | ❌ **已废弃**（同 §3.2 #10）：该补丁会破坏 DDX 返回地址。脚本已加硬拦截，任何参数都拒绝执行并打印回退指引 |
 
 ---
 
@@ -587,7 +587,7 @@ jm9100/
 
 | # | 问题 | 状态 | 说明 |
 |---|---|---|---|
-| 1 | **画面三角/楔形错位**（直播时偶发，截图可见） | ✅ **已定位到指令级（2026-10-08 最终结论）** | **用户提供了带标注的截图**（红线：上/下水平边 + 固定斜率斜边 = **平行四边形**）。这个形状 + "截图里能看到" ⇒ **不是扫描输出撕裂**（截图读的是已写完的缓冲），而是**客户端 pixmap 内容本身就被混合了两个尺寸的帧**。<br>**根因（指令级，全部有代码依据）**：应用 `media_kit_video/linux/texture_gl.cc` 的 `texture_gl_populate_texture()` 用 `GL_TEXTURE_2D` 却**上报了非零 `width/height`**：<br>```c<br>*target = GL_TEXTURE_2D;          /* 2D 用归一化坐标 */<br>*width  = self->current_width;   /* 却上报像素尺寸 */<br>*height = self->current_height;<br>```<br>而 Flutter embedder 契约（`embedder.h`）写明该字段**只用于 `GL_TEXTURE_RECTANGLE`**（"tell the embedder to scale when rendering"）。引擎确实按它建纹理视图：Skia 后端 `embedder_external_texture_gl.cc:98-107`（`if (width&&height) width=texture->width; MakeGL(width,height,...)`）、Impeller 后端同文件 `:155`（`desc.size = ISize(texture->width, texture->height)`）。<br>**触发条件 = 分辨率切换**（直播自适应码率切档）：`texture_gl_check_and_resize()` 在**另一个线程**重建三缓冲（`glTexImage2D` 用新尺寸）并最后写 `current_width/height`；`populate` 线程先查 `resizing` 标志、**之后**才读 `current_*`，两者之间无锁 ⇒ 切换瞬间 populate 可能报出与该 buffer **实际存储不符**的尺寸 ⇒ 引擎按错误尺寸采样 ⇒ 归一化坐标被错误缩放 ⇒ 画面沿垂直方向**线性水平偏移（斜边）**，且只在该帧出现（**上下水平边界**）⇒ **正好是截图里的平行四边形**。点播固定分辨率不触发 resize ⇒ 只在直播出现，与现象吻合。<br>**为什么之前所有假设都错**：这条链在**应用进程内**，既不经过内核 vblank、也不经过 X 呈现，所以内核侧（vblank/搬运/fence）、X 侧（合成器/GLX 同步）的排查全部无效——那些假设已被逐一实测证伪（见 §3.1 #10 与本节"已排除"）。<br>**修复（应用侧，一行级）**：`populate` 里对 `GL_TEXTURE_2D` 上报 `*width = *height = 0`，让引擎用 Flutter 自己算出的尺寸；或改用 `GL_TEXTURE_RECTANGLE`（那样上报尺寸才是契约本意）。另建议 resize 与 populate 之间加锁/原子快照（尺寸与 front_index 一起读）。<br>**已排除（本轮实测）**：内核 vblank（kprobe：IRQ 802 次/4s 全 `IRQ_HANDLED`、`WAIT_VBLANK` 99.2Hz 正常）、`xfer_waits_2d_idle`（0 次超时）、`jmkOS_WaitNativeFence`（已修，无关）、无合成器（已开 `xrender` 接管，错位仍在）、GLX 交换无 vblank 同步（6 万 Hz 属实但开合成器后客户端不再直写扫描缓冲）、`eglWaitSyncKHR` 失效（**我曾误报，实为我探针的 bug，已撤回**：修正后跨上下文同步 25/25 正确）、OES 未预分配纹理（两种用法都成功）、应用三缓冲/邮箱时序（精复刻其"两个不共享 EGL 上下文 + EGLImage + fence"结构，4 种等待模式全 25/25 正确）。<br>**注**：应用侧对应记录见 `purelive_linux_arm64/docs/LINUX_JM9100_HWDECODE_AUDIT.md §10.9`（结论不同，该文归因于 GLX 未同步；本次证明那条不足以解释"截图可见的平行四边形"）。 |
+| 1 | **画面三角/楔形错位**（直通与软解都有，截图可见） | ✅ **已定位并修复（2026-10-08 终局）—— 是我们自己的 DDX 补丁造成的** | **决定性线索**：维护者实测 `vaapi-copy`（拷贝）斜边**消失**，而 `vaapi`（直通）与 `no`（软解）**都有** ⇒ 问题在两条路径**共有**的环节 ⇒ 指向 DDX 的 TearFree「合成→扫描缓冲」上传路径（每帧都走）。<br>**真因（反汇编铁证）**：`tools/patch_ddx_tearfree_sync.py` 把 DDX 里 `0x12CB0`/`0x131FC` 处的<br>`ldp x29, x30, [sp, #16]`（该函数**唯一**恢复调用者 LR 的指令）**替换**成 `bl 0x10D78`，而函数尾部是 `ret`（用 x30）：<br>```asm<br>序言  12ba4: stp x29, x30, [sp,#16]   ; 保存调用者 LR<br>补丁  12cb0: bl  10d78               ; ← x30 被改成 0x12cb4<br>尾部  12ccc: ret                     ; ← 用被破坏的 x30 ⇒ 跳回 0x12cb4（循环）<br>```<br>补丁自述"随后紧跟的原指令 `ldp x29,x30,[sp,#16]` 会恢复真正的 LR"是**错的** —— `bl` 就写在那条 `ldp` 的**位置**上，把它覆盖掉了（`0x12CD8` 那处 `ldp` 属于 `cbnz` 跳转的**错误分支**，不在成功路径上）。<br>**后果**：DDX 每帧都走这段 ⇒ 返回地址错乱 ⇒ 图形栈行为不可预测 ⇒ **直通与软解都出现**斜向错位，形态为"上下水平边 + 固定斜率斜边"的平行四边形（与截图一致）。<br>**功能上也是多余的**：内核侧 `DRM_JM_GEM_XFER_RECT` → `j9_handle_j9ma_arecaceous()` 已有 `xfer_waits_2d_idle`（默认 30ms，`kernel/jmgpu_garbage.c`）在搬运前等 2D 排空 ⇒ DDX 侧无需重复同步。<br>**处置（已执行）**：① 本机 DDX 回退到 `build-cli/mwv207_drv.so.abi25.fixed3`（md5 `297aee83…`），两处补丁点均恢复 `ldp`，重启 lightdm 后 X 已加载新版（X 启动 18:36:44 晚于替换 18:35:49）；② `tools/patch_ddx_tearfree_sync.py` 与 `tools/deploy_ddx_tearfree_sync.sh` 均加**硬拦截**（任何参数都拒绝执行并打印回退指引，实测生效）；③ `build-cli/mwv207_drv.so.abi25+tearfree-sync` 保留为反面样本，**勿再部署**。<br>**本轮被证伪的假设（含我自己的两次误报，均已撤回）**：内核 vblank 机制（kprobe 实测 100Hz 正常）、`xfer_waits_2d_idle`（0 次超时）、`jmkOS_WaitNativeFence`、无合成器（已开 `xrender` 接管仍错位）、GLX 交换无 vblank 同步、`eglWaitSyncKHR` 失效（**我探针的 bug**，修正后 25/25 正确）、应用三缓冲/邮箱时序（精复刻其结构，4 种等待模式全对）、`GL_TEXTURE_2D` 上报像素尺寸（**推导错误**：归一化坐标只缩放、不产生逐行偏移）、软解路径整数除法（`video_output.cc` 竖屏 `width/height` 截断为 0，**确属真实缺陷且已修**，但非本次错位根因）。 |
 | 2 | `compression=15`（默认）下**卡顿 + 内核任务态破坏** | ⚠️ 规避可用 | 与 `fastClear` 组合有关；`compression=0` 或 `fastClear=0` 可规避。**但该现象在系统自带驱动下也偶现** ⇒ 不能完全归因于本驱动 |
 | 3 | **CPU 写合并（`enable_wc`）一致性** | ⚠️ **未验证** | `Accel off` 仍错位 ⇒ 怀疑 `pgprot_writecombine` 的 posted 写未被显示读到。验证方案（`enable_wc=0`）**曾导致无法启动**，未得结论。后续验证**必须用可回退方式** |
 | 4 | kwin GL(`gl2`) 合成只有 ~8 fps | ✅ 已规避 | 用 `user_type=4`（XRender）绕过；属厂商侧 |
