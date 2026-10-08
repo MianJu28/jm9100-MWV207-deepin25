@@ -1012,7 +1012,14 @@ j9_chromonema(IN jmkALLOCATOR Allocator,
 	jmtBOOL free = J9_YARELY;
 	pgprot_t pgprot;
 
-	if (Offset + Bytes > (numPages << PAGE_SHIFT))
+	/*
+	 * Overflow-safe extent check: the vendor compared
+	 * "Offset + Bytes > numPages << PAGE_SHIFT", whose sum wraps for a large
+	 * caller-supplied Offset and then let the page-array walk below run past
+	 * the allocation.  Offset/Bytes reach here from the DRM ioctl paths.
+	 */
+	if (Offset > (numPages << PAGE_SHIFT) ||
+	    Bytes > (numPages << PAGE_SHIFT) - Offset)
 		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 

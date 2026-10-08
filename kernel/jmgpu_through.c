@@ -548,7 +548,12 @@ jmkKERNEL_SyncVideoMemoryMirror(jmk_KERNEL Kernel,
 	}
 
 	jmkVIDMEM_NODE_GetSize(Kernel, Node, &size);
-	if (Offset + Bytes > size) {
+	/*
+	 * Overflow-safe extent check: "Offset + Bytes > size" wraps for a large
+	 * caller-supplied Offset and would let the mirror DMA below run past the
+	 * node.  Offset/Bytes reach here from the DRM ioctl paths.
+	 */
+	if (Offset > size || Bytes > size - Offset) {
 		JMM_kFOOTER();
 		return J9_HANDLE_J9MENU_HOMOGONIES;
 	}

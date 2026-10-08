@@ -44,15 +44,35 @@ static void *j9_blackouts(struct j9_vitta *vmem)
 int _VMEMFaultLegacy(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 	PLINUX_MDL mdl = vma->vm_private_data;
-	struct j9_vitta *vmem = (struct j9_vitta *)mdl->priv;
+	struct j9_vitta *vmem;
 	void *logical;
 	int ret = 0;
 	jmtSIZE_T offset;
+
+	if (unlikely(!mdl || !mdl->priv))
+		return VM_FAULT_SIGBUS;
+
+	vmem = (struct j9_vitta *)mdl->priv;
+
 #if  LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
 	offset = vmf->address - vma->vm_start;
 #else
 	offset = (unsigned long)vmf->virtual_address - vma->vm_start;
 #endif
+
+	/*
+	 * Stay inside the vmalloc()'ed backing store.
+	 *
+	 * "logical + offset" is only checked for being *somewhere* in the
+	 * vmalloc range: an offset past vmem->size still passes
+	 * is_vmalloc_addr() and vmalloc_to_page() then returns a page belonging
+	 * to a different allocation, which get_page() would hand to user space.
+	 * j9_finale() bounds the mapping length; this is the second half of the
+	 * same guard so a stale or oversized VMA cannot walk off either.
+	 */
+	if (unlikely(offset >= vmem->size))
+		return VM_FAULT_SIGBUS;
+
 	logical = j9_blackouts(vmem);
 	if (!logical)
 		return VM_FAULT_OOM;
@@ -61,7 +81,10 @@ int _VMEMFaultLegacy(struct vm_area_struct *vma, struct vm_fault *vmf)
 		ret = VM_FAULT_SIGBUS;
 	} else {
 		vmf->page = vmalloc_to_page(logical + offset);
-		get_page(vmf->page);
+		if (unlikely(!vmf->page))
+			ret = VM_FAULT_SIGBUS;
+		else
+			get_page(vmf->page);
 	}
 
 	mdl->userAccessed = J9_CUPPY;
@@ -155,7 +178,22 @@ j9_finale(IN jmkALLOCATOR Allocator,
 
 	j9_tympanichord("Allocator=%p Mdl=%p vma=%p", Allocator, Mdl, vma);
 
-	JMM_kASSERT(skipPages + numPages <= Mdl->numPages);
+	/*
+	 * Real bounds check - the vendor only had a JMM_kASSERT() here, which is
+	 * compiled out in release builds.  skipPages comes from where this node
+	 * sits inside its parent block and numPages from the mmap() length; the
+	 * VMEM fault handler below serves pages out of vmem->logical, so an
+	 * oversized mapping would let user space fault in vmalloc pages that
+	 * belong to a different allocation.  Subtraction form so the bounds
+	 * cannot overflow.
+	 *
+	 * Same class as j9_pathopsychosis() (jmgpu_setlayout.c), j9_sprod()
+	 * (jmgpu_marketing.c), j9_antic() (jmgpu_background.c) and
+	 * _DmabufMmap() (jmgpu_crosstab.c).
+	 */
+	if (!Mdl->priv || skipPages >= Mdl->numPages ||
+	    numPages > Mdl->numPages - skipPages)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	vma->vm_private_data = Mdl;
 	vma->vm_ops = &vm_ops;
@@ -288,7 +326,12 @@ j9_abstraction(IN jmkALLOCATOR Allocator,
 	struct j9_vitta *vmem = (struct j9_vitta *)Mdl->priv;
 	void *logical;
 
-	if (Offset + Bytes > vmem->size)
+	/*
+	 * Overflow-safe extent check: the vendor tested "Offset + Bytes > size",
+	 * whose sum wraps for a large caller-supplied Offset and would then hand
+	 * out a vmalloc pointer past the allocation.
+	 */
+	if (!vmem || Offset > vmem->size || Bytes > vmem->size - Offset)
 		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	logical = j9_blackouts(vmem);

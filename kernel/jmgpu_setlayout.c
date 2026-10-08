@@ -198,6 +198,9 @@ j9_pathopsychosis(IN jmkALLOCATOR Allocator,
 
 	j9_tympanichord("Allocator=%p Mdl=%p vma=%p", Allocator, Mdl, vma);
 
+	if (!res)
+		return J9_HANDLE_J9M_UNFEMINISE;
+
 	/*
 	 * Refuse to CPU-map the CPU-inaccessible VRAM pool.
 	 *
@@ -229,7 +232,22 @@ j9_pathopsychosis(IN jmkALLOCATOR Allocator,
 		return J9_HANDLE_J9M_UNFEMINISE;
 	}
 
-	JMM_kASSERT(skipPages + numPages <= Mdl->numPages);
+	/*
+	 * Real bounds check - the vendor only had a JMM_kASSERT() here, which is
+	 * compiled out in release builds.  skipPages comes from where this node
+	 * sits inside its parent block and numPages from the mmap() length, and
+	 * the range below is remapped straight into user space with
+	 * remap_pfn_range(): without the check, an out-of-range request maps
+	 * physical pages that do not belong to this reserved pool.  Written as
+	 * "skipPages >= Mdl->numPages || numPages > Mdl->numPages - skipPages"
+	 * so the bounds themselves cannot overflow.
+	 *
+	 * Same class as j9_sprod() (jmgpu_marketing.c), j9_antic()
+	 * (jmgpu_background.c) and _DmabufMmap() (jmgpu_crosstab.c).
+	 */
+	if (skipPages >= Mdl->numPages ||
+	    numPages > Mdl->numPages - skipPages)
+		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	pfn = (res->start >> PAGE_SHIFT) + skipPages;
 
@@ -381,7 +399,14 @@ j9_handle_j9_congruence(IN jmkALLOCATOR Allocator,
 	if (!Mdl->cpuAccessible)
 		return J9_HANDLE_J9M_UNFEMINISE;
 
-	if (Offset + Bytes > res->size)
+	/*
+	 * Overflow-safe extent check: the vendor tested "Offset + Bytes > size",
+	 * whose sum wraps for a large caller-supplied Offset, letting ioremap()
+	 * below run past the reserved region.  Compare against the size with a
+	 * subtraction instead (jmkVIDMEM_NODE_*.Offset/Bytes reach here from the
+	 * DRM ioctl paths).
+	 */
+	if (!res || Offset > res->size || Bytes > res->size - Offset)
 		return J9_HANDLE_J9MENU_HOMOGONIES;
 
 	if (Allocator->os->enableWriteCombine) {
