@@ -1,59 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-patch_ddx_tearfree_sync.py
-    给景嘉微专有 X 驱动 mwv207_drv.so 的 "2D 上传（合成 -> 扫描缓冲）" 路径
-    补上缺失的 **2D 引擎排空等待**，用于消除视频窗口的三角/楔形错位。
+!!! 已废弃（2026-10-08）—— 本补丁是**错的**，会破坏 DDX 函数返回地址，切勿再打 !!!
 
-背景
-    README.md §12/§13：视频窗口内出现"三角/楔形错位 + 重复之前片段"。
-    A/B 已定位（§12.7）：`Option "TearFree" "off"` 后三角错位明显减少 ⇒
-    主因在 DDX 的"合成 -> 扫描缓冲"拷贝路径：该拷贝经
-    `drm_jmgpu_bo_xfer_to_dev()`（内核 DRM_JM_GEM_XFER_RECT，2D 引擎作业）
-    提交后**立即返回**，没有任何"等作业完成"的动作 ⇒ 显示控制器可能在
-    2D 引擎写完之前就扫到该缓冲 ⇒ 按行错切（三角）。
+原始意图
+    给景嘉微专有 X 驱动 mwv207_drv.so 的"2D 上传（合成 -> 扫描缓冲）"路径
+    补上缺失的 2D 引擎排空等待，用于消除视频窗口的三角/楔形错位。
 
-反编译证据（BuildID 912c7bd4bf721ea7c5b6ca44690b0c596500e6bf，sha256 c58afa9e…）
-    上传例程 1（成功路径）：
-        0x12ca4:  bl drm_jmgpu_bo_xfer_to_dev@plt
-        0x12ca8:  mov w5, w0
-        0x12cac:  cbnz w0, 0x12d54
-        0x12cb0:  ldp x29, x30, [sp, #16]   <-- 直接恢复栈返回，无同步
-        ...
-        0x12ccc:  ret
-    上传例程 2：同样结构（0x131f0 bl xfer → 0x131f8 cbnz → 0x131fc ldp → 0x13214 ret）
+为什么错（实测 + 反汇编证据）
+    补丁把 0x12CB0 / 0x131FC 处的
+        ldp x29, x30, [sp, #16]          ← 该函数**唯一**恢复调用者 LR 的指令
+    替换成
+        bl  0x10D78                      ← 写 x30 = 返回地址(0x12CB4/0x13200)
 
-    驱动里**已存在**"等 2D 空闲"的封装函数，却**从未被调用**（全库 0 处引用）：
-        0x10d78:  stp x29,x30,[sp,#-16]! ; mov x29,sp
-                  bl  xf86ScreenToScrn@plt
-                  ldr x0,[x0,#280] ; ldr x0,[x0,#176] ; ldr w0,[x0,#4]
-                  b   drm_jmgpu_j2d_wait_idle@plt      <-- 尾调用，无返回值依赖
+    函数尾部是 `ret`，用的是 x30。替换后 x30 已被 bl 改成 0x12CB4，
+    而 0x12CB0 之后到 0x12CCC 之间**没有任何**恢复 x29/x30 的指令
+    ⇒ ret 跳回 0x12CB4 ⇒ 该函数被调用即陷入循环/返回地址错乱。
 
-补丁（2 处、各 1 条指令，**无需跳板**）
-    0x12cb0:  ldp x29, x30, [sp, #16]   ->   bl 0x10d78
-    0x131fc:  ldp x29, x30, [sp, #16]   ->   bl 0x10d78
+    原脚本注释里"随后紧跟的原指令 ldp x29,x30,[sp,#16] 会恢复真正的 LR"
+    是**错误**的：bl 就写在那条 ldp 的**位置**上，把它覆盖掉了，
+    那条 ldp 已不存在（另一处 0x12CD8 的 ldp 属于 cbnz 跳转的**错误分支**）。
 
-    为什么正确：
-      * `bl` 把返回地址写入 x30(=LR)，随后紧跟的原指令
-        `ldp x29,x30,[sp,#16]` 会从栈中恢复**真正的** LR ⇒ 返回地址不受影响；
-      * `0x10d78` 内部若保存/恢复 x29,x30，返回时二者不变 ⇒ 原逻辑不变；
-      * `0x12cb0` 有 3 处跳转指向它（0x12c10 b.eq / 0x12d7c b.le / 0x12db4 b），
-        `0x131fc` 有 1 处（0x132a4 b.le）⇒ **所有返回路径都会经过等待**，无遗漏。
+    后果：DDX 的 TearFree「合成→扫描缓冲」上传路径每帧都会走这段代码，
+    返回地址错乱导致图形栈行为不可预测 —— 实测表现为**直通与软解都出现**
+    画面斜向错位（三角形/平行四边形）。
 
-风险与回滚
-    * 只对**副本**操作（脚本不修改输入文件）；
-    * `drm_jmgpu_j2d_wait_idle` 内核侧有超时参数（此封装取自 device 内的值），
-      **不会永久阻塞**；
-    * 副作用：每次"合成->扫描"多一次 2D 排空等待 ⇒ 呈现延迟略增（换取正确性）；
-    * 回滚：用原件覆盖回去 + 重启 lightdm。
+功能上也是多余的
+    内核侧 DRM_JM_GEM_XFER_RECT → j9_handle_j9ma_arecaceous() 已有
+    `xfer_waits_2d_idle`（默认 30ms，见 kernel/jmgpu_garbage.c）在搬运前
+    等 2D 引擎排空 ⇒ DDX 侧无需重复同步。
 
-用法
-    python3 tools/patch_ddx_tearfree_sync.py <原件> <输出> [--check]
+正确做法
+    使用未打本补丁的 ABI25 修复版：
+        build-cli/mwv207_drv.so.abi25.fixed3   (md5 297aee83b5db3a3bccf33ff7ac2698fc)
+    部署/回退见 tools/deploy_ddx_tearfree_sync.sh（已加拦截）。
 
-    python3 tools/patch_ddx_tearfree_sync.py \\
-        /persistent/home/admin/jm9100-xdrv-backup/mwv207_drv.so.orig \\
-        build-cli/mwv207_drv.so.tearfree-sync
+若要真正实现"上传后等 2D 空闲"，必须保留 ldp 并另找空间：
+    * 不能占用 ldp 所在指令；
+    * 需要 3 条以上指令（保存 x0/x1 传参、bl、恢复）或跳到函数外的
+      空闲代码洞（cave）里做，且要覆盖**所有**返回路径；
+    * 或直接改内核侧（已实现，推荐）。
+
+本文件保留仅为记录与防止再被打上；脚本主体已加硬拦截。
 """
+
 
 import argparse
 import hashlib
@@ -95,7 +85,24 @@ def wr32(buf, addr, val):
     struct.pack_into("<I", buf, addr, val)
 
 
+DISABLED_REASON = (
+    "本补丁已废弃：它会覆盖函数唯一的 `ldp x29,x30,[sp,#16]`，"
+    "导致 DDX 2D 上传例程 ret 返回到错误地址（实测造成直通/软解都错位）。"
+    "请改用 build-cli/mwv207_drv.so.abi25.fixed3；2D 排空等待由内核 "
+    "xfer_waits_2d_idle 负责。"
+)
+
+
 def main():
+    # 硬拦截：即使有人照旧调用，也绝不写出被破坏的模块。
+    print("!! 本脚本已废弃，拒绝执行。")
+    print("   原因：%s" % DISABLED_REASON)
+    print()
+    print("   正确做法：使用 build-cli/mwv207_drv.so.abi25.fixed3")
+    print("   （md5 297aee83b5db3a3bccf33ff7ac2698fc，未打本补丁的 ABI25 修复版）")
+    print("   2D 排空等待由内核 xfer_waits_2d_idle 负责，无需 DDX 侧重复同步。")
+    return 9
+
     ap = argparse.ArgumentParser()
     ap.add_argument("src", help="输入的 mwv207_drv.so（原件）")
     ap.add_argument("dst", nargs="?", help="输出模块（副本）")

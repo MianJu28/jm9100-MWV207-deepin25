@@ -30,6 +30,39 @@ usage() {
 	exit 1
 }
 
+# ---------------------------------------------------------------------------
+# 2026-10-08：本补丁已废弃，全部动作硬拦截。
+#
+# 该补丁把 DDX 里 0x12CB0 / 0x131FC 的
+#     ldp x29, x30, [sp, #16]      ← 该函数唯一恢复调用者 LR 的指令
+# 替换成 `bl 0x10D78`，而函数尾部是 `ret`（用 x30）。
+# 替换后 x30 被 bl 改成 0x12CB4/0x13200，且其后到 ret 之间没有任何指令
+# 恢复 x29/x30 ⇒ 返回地址错乱（跳回 0x12CB4 形成循环）。
+# 实测后果：TearFree 的「合成→扫描缓冲」上传路径每帧都走这里，
+# 图形栈行为不可预测，表现为**直通与软解都出现**画面斜向错位。
+#
+# 2D 排空等待已由内核侧负责（DRM_JM_GEM_XFER_RECT →
+# j9_handle_j9ma_arecaceous() 的 xfer_waits_2d_idle，默认 30ms），
+# 因此本补丁在功能上也是多余的。
+#
+# 正确做法：用 build-cli/mwv207_drv.so.abi25.fixed3
+#           （md5 297aee83b5db3a3bccf33ff7ac2698fc）。
+# 本脚本保留仅为 revert/status 的历史记录用途。
+# ---------------------------------------------------------------------------
+echo "!! tools/deploy_ddx_tearfree_sync.sh 已废弃，拒绝执行（含 build/apply）。"
+echo
+echo "   原因：该补丁覆盖了 DDX 函数唯一的 ldp x29,x30,[sp,#16]，"
+echo "         导致 2D 上传例程 ret 返回到错误地址 —— 实测造成"
+echo "         硬件直通与软件解码都出现画面斜向错位。"
+echo
+echo "   当前应使用：build-cli/mwv207_drv.so.abi25.fixed3"
+echo "               (md5 297aee83b5db3a3bccf33ff7ac2698fc)"
+echo
+echo "   若 DDX 当前已是打补丁版本，回退："
+echo "     sudo cp -f $REPO/build-cli/mwv207_drv.so.abi25.fixed3 $DDX"
+echo "     sudo systemctl restart lightdm"
+exit 9
+
 do_build() {
 	cd "$REPO"
 	python3 tools/patch_ddx_tearfree_sync.py "$DDX" "$OUT" || exit 1
