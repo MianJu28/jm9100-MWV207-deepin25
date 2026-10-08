@@ -138,8 +138,9 @@ static void drm_fb_helper_output_poll_changed(struct drm_device *dev)
 }
 #endif
 
-/* 2026-09-18: 定义见 jmgpu_package.c —— 有界等待翻转完成
- * （本板硬件 vblank 事件不产生, 不能等真 vblank） */
+/* 定义见 jmgpu_package.c：提交尾部的等 vblank.
+ * 【2026-10-08】其默认行为已恢复为 drm_atomic_helper_wait_for_vblanks()
+ * （kprobe 实测硬件 vblank 100Hz 正常，"事件不产生"的前提是错的，详见彼处注释）。 */
 void jmgpu_commit_wait_flip(struct drm_atomic_state *old_state);
 
 static void j9_handle_j9m_principium(struct drm_atomic_state *old_state)
@@ -162,10 +163,9 @@ static void j9_handle_j9m_principium(struct drm_atomic_state *old_state)
 	}
 
 	drm_atomic_helper_commit_hw_done(old_state);
-	/* 2026-09-18: 原为 drm_atomic_helper_wait_for_vblanks(dev, old_state) ——
-	 * 本板硬件 vblank 事件不产生 ⇒ 只会等满 DRM 超时（客户端偶发 ~1s 卡）.
-	 * 改为有界等待一个帧周期 + 推进 vblank 计数;
-	 * 翻页完成事件已由 j9_handle_j9maths_stringiest() 按需即时交付. */
+	/* 提交尾部的等 vblank。默认（flip_event_immediate=0）就是原实现
+	 * drm_atomic_helper_wait_for_vblanks()：实测硬件 vblank 100Hz 正常，
+	 * 它会立刻返回，且是"旧 framebuffer 不被过早释放"的保障。 */
 	jmgpu_commit_wait_flip(old_state);
 	drm_atomic_helper_cleanup_planes(dev, old_state);
 }

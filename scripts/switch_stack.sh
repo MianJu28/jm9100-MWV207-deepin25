@@ -277,7 +277,15 @@ EOF
 	# 注意：__GLX_VENDOR_LIBRARY_NAME 必须靠 pam_env 交付（pkexec 会清环境，见 README §3.5/§15）
 	grep -q '__GLX_VENDOR_LIBRARY_NAME' "$ENVF" 2>/dev/null || \
 		echo '__GLX_VENDOR_LIBRARY_NAME=mwv207' >> "$ENVF"
-	grep -q '^vblank_mode' "$ENVF" 2>/dev/null || echo 'vblank_mode=0' >> "$ENVF"
+	# 【2026-10-08 删除 vblank_mode=0】
+	# 原来这里写 `vblank_mode=0`（"驱动规避默认值"）。实测它**只有害处**：
+	#   * 它经 pam_env 注入**整个会话**，而应用/其他组件若用 setenv(overwrite=0)
+	#     想开启交换同步，就会被这个已存在的值挡掉（实测 purelive 打印
+	#     "effective __GL_SYNC_TO_VBLANK=1 vblank_mode=0"）；
+	#   * 厂商 GLX 走的是自带的 Mesa 派生 libglx，vblank_mode=1/3 对它**无效**
+	#     （glxswap 实测 6 万+ Hz 不变，vblank_mode=3 甚至让交换永久挂死）。
+	# 即：本变量既不能修同步，又会阻断别人尝试同步 ⇒ 不再写入。
+	# 若将来某应用需要它，请**按进程**设置，不要写进 /etc/environment。
 	# WebKitGTK 在厂商 GL 上会 SIGSEGV（EasyTier 图标一闪而过、无窗口）⇒ 关掉其加速合成。
 	# 实测：仅加 GLX 变量必崩（2/2）；加上本行后连跑两次均存活。详见 README §8.6。
 	grep -q '^WEBKIT_DISABLE_COMPOSITING_MODE' "$ENVF" 2>/dev/null || \

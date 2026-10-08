@@ -94,20 +94,11 @@ MODULE_PARM_DESC(vblank_refresh, "software vblank refresh rate in Hz "
 static int jmgpu_vblank_dbg;
 
 /*
- * 2026-09-21: **只推进 vblank 计数**的软件定时器（默认 0 = 关闭）.
+ * 2026-09-21 引入 / 2026-10-08 一并标记作废（前提错误，见上）.
  *
- * 为什么需要: 本板硬件 vblank 事件不产生. 修复一（flip_event_immediate）只在
- * "客户端提交翻页"时推进一次计数并交付完成事件; 但客户端若在提交之外等下一次
- * vblank（X Present 的 MSC/节奏等待等），就没有任何东西推进计数 ⇒ 每次等满
- * 超时（实测 1000ms），而且会**锁死**在这个状态（GL 窗口 1 次/秒）。
- *
- * 与"周期性软件 vblank（fake_vblank=1）"的关键区别:
- *   - 本定时器**只**调用 drm_crtc_handle_vblank() 推进计数;
- *   - **不**发送 vblank 事件、**不**调用 drm_crtc_vblank_put().
- * 之前那版正是因为在回调里 put ⇒ 触发驱动的 disable ⇒ 把光标平面的行 vblank
- * 一起关掉 ⇒ **鼠标指针不动**. 本开关不做这些, 因此不影响光标.
- *
- * 频率由 vblank_refresh 决定（默认 100Hz）. 出问题用 echo 0 即时关闭（回调自停）.
+ * 原前提: 本板硬件 vblank 事件不产生 —— 已被 kprobe 证伪（真 vblank 100Hz 正常）.
+ * 本开关"只推进计数"同样会提前唤醒 vblank 队列上的 DDX TearFree 等待 ⇒ 撕裂.
+ * 保持默认 0，仅作排障；不要启用.
  */
 static int sw_vblank_counter;
 module_param(sw_vblank_counter, int, 0644);
@@ -116,23 +107,33 @@ MODULE_PARM_DESC(sw_vblank_counter, "advance the vblank counter from a software 
 		 "(default 0; 1 = on)");
 
 /*
- * 2026-09-18: 按需交付 flip 完成事件（默认开）.
+ * 2026-09-18 引入 / 2026-10-08 **推翻并默认关闭**.
  *
- * 背景: 本板硬件 vblank 事件不产生 ⇒ drm_crtc_send_vblank_event() 发不出翻页
- * 完成事件 ⇒ 客户端(X Present / EGL)只能等自身 ~1s 超时 ⇒ 屏幕上 GL/EGL 窗口
- * 只有 1~2.5 次/秒（整屏抓屏实测; 同机 2D 路径 vo=x11 是 29.9 次/秒）.
+ * 原前提「本板硬件 vblank 事件不产生」是**错的** —— 2026-10-08 用 kprobe 直接
+ * 量到：显示 IRQ 处理函数 j9_handle_j9m_luciferase() 每 4 秒被调用 ~800 次、
+ * **全部返回 IRQ_HANDLED**，随后调用 drm_crtc_handle_vblank()；以厂商原始行为
+ * 运行时 DRM_IOCTL_WAIT_VBLANK 实测 99.2Hz（面板 100Hz）。当时之所以"看不到
+ * vblank"，真正原因是内核的 drm.vblankoffdelay（§3.3 #12 已修为 0）会把空闲
+ * 5s 后的 vblank 中断自动关掉，而厂商驱动无法重新使能。
  *
- * 做法: 不引入周期性定时器（那会打坏光标平面的行 vblank ⇒ 鼠标不动）,
- * 而是**在客户端提交翻页时立即交付该次的完成事件**, 并顺带推进一次 vblank 计数.
- * 客户端拿到完成事件后即可继续按帧提交 ⇒ 送显恢复满速.
+ * 开着本开关的代价（2026-10-08 实测）：
+ *   - vblank 计数被推到 ~193Hz（真实 100Hz）⇒ 依赖 MSC 做节奏的客户端全错；
+ *   - 更严重：drm_crtc_handle_vblank() 被从**原子提交路径**调用，会提前唤醒
+ *     所有等在 vblank 队列上的线程 —— 其中就包括厂商 DDX 的 TearFree
+ *     （它用 drmWaitVBlank 定位"该做 shadow→扫描缓冲拷贝"的时刻）。
+ *     ⇒ 拷贝被提前到**显示正在扫描的过程中**做 ⇒ 斜向/楔形撕裂 +
+ *       未覆盖区域残留上一帧片段，也就是一直在查的"三角错位".
  *
- * 1 = 开（默认）; 0 = 恢复原行为（等硬件 vblank, 本板会等 1 秒）.
+ * 因此默认改为 **0**（=厂商原始行为：事件由真 vblank IRQ 交付，提交尾部
+ * 老老实实 drm_atomic_helper_wait_for_vblanks()）。保留参数只为 A/B 排障，
+ * **不要**再默认打开。
  */
-static int flip_event_immediate = 1;
+static int flip_event_immediate;
 module_param(flip_event_immediate, int, 0644);
 MODULE_PARM_DESC(flip_event_immediate, "deliver the pending page-flip "
 		 "completion event immediately in the atomic commit "
-		 "(default 1; hardware vblank events are dead on this board)");
+		 "(default 0 = vendor behaviour; 1 corrupts vblank pacing "
+		 "and tears the scanout — diagnostic only)");
 
 /*
  * 2026-09-18: 提交尾部的"等 vblank"改成有界等待时的时长（毫秒）.
@@ -349,14 +350,11 @@ void j9_handle_j9maths_stringiest(struct drm_crtc *crtc)
 			jcrtc->event = event;
 			spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
 
-			/* 2026-09-18: 本板**硬件 vblank 事件不产生** ⇒ 原实现要等硬件
-			 * vblank 才发这个翻页完成事件, 客户端(X Present / EGL)只能等
-			 * 自身 ~1s 超时 ⇒ 屏幕上 GL/EGL 窗口只有 1~2.5 次/秒
-			 * （整屏抓屏实测; 同机 2D 路径 vo=x11 为 29.9 次/秒）.
-			 *
-			 * 这里**按需即时交付**该次翻页的完成事件, 并顺带推进一次 vblank
-			 * 计数. 不引入周期定时器 —— 实测周期性软件 vblank 会打坏光标
-			 * 平面的行 vblank（鼠标指针不动）. */
+			/* 【2026-10-08 更正】下面这段的前提（硬件 vblank 事件不产生）
+			 * 已被 kprobe 证伪：真 vblank 100Hz 正常。开着它会把计数推到
+			 * ~193Hz，并**提前唤醒** DDX TearFree 的 drmWaitVBlank 等待 ⇒
+			 * 在扫描中途做 shadow→扫描缓冲拷贝 ⇒ 斜向撕裂（三角错位）。
+			 * 故 flip_event_immediate 默认已改 0，本分支仅作排障。 */
 			if (flip_event_immediate) {
 				drm_crtc_handle_vblank(crtc);
 
@@ -383,15 +381,14 @@ void j9_handle_j9maths_stringiest(struct drm_crtc *crtc)
 }
 
 /*
- * 2026-09-18: 原子提交尾部的"等 vblank"改为有界等待（供 jmgpu_concurrent.c 调用）.
+ * 2026-09-18 引入 / 2026-10-08 默认关闭（前提已被证伪）.
  *
- * 本板硬件 vblank 事件不产生 ⇒ drm_atomic_helper_wait_for_vblanks() 只能等满
- * DRM 的超时（实测客户端表现为偶发 ~1s 卡）, 而它真正的目的只是"确保翻转已锁存、
- * 旧 framebuffer 不被过早释放". 这里只等待一个帧周期（flip_wait_ms, 默认 10ms
- * = 100Hz）, 并顺带推进一次 vblank 计数; 翻页完成事件已由
- * j9_handle_j9maths_stringiest() 按需即时交付.
+ * 原写法想绕开 drm_atomic_helper_wait_for_vblanks()，理由是"硬件 vblank 不产生、
+ * 它会等满超时"。实测（kprobe + WAIT_VBLANK）证明硬件 vblank 100Hz 正常，
+ * wait_for_vblanks 会立刻返回，且它是"翻转已锁存、旧 framebuffer 不被过早释放"
+ * 的唯一保障。flip_event_immediate=0 时本函数**直接走原实现**。
  *
- * flip_event_immediate=0 ⇒ 恢复原行为（等硬件 vblank）; flip_wait_ms=0 ⇒ 不等待.
+ * flip_event_immediate=1 时才有下面那套有界等待（诊断用，勿默认开）.
  */
 void jmgpu_commit_wait_flip(struct drm_atomic_state *old_state)
 {
